@@ -99,3 +99,66 @@ func (r outboxRepo) Insert(ctx context.Context, events ...event.Envelope) error 
 	}
 	return nil
 }
+
+// ClaimBatch is the lease claim of ARCHITECTURE §9.
+func (r outboxRepo) ClaimBatch(ctx context.Context, owner string, lease time.Duration, limit int) ([]app.OutboxRecord, error) {
+	if owner == "" || lease <= 0 || limit < 1 {
+		return nil, fmt.Errorf("%w: claim needs an owner, a lease and a limit", app.ErrInvariantViolation)
+	}
+	rows, err := r.tx.Query(ctx, `
+		UPDATE outbox_events
+		SET locked_by = $1, locked_until = now() + ($2 * interval '1 millisecond'), attempts = attempts + 1
+		WHERE event_id IN (
+			SELECT event_id FROM outbox_events
+			WHERE published_at IS NULL AND parked_at IS NULL AND next_attempt_at <= now()
+				AND (locked_until IS NULL OR locked_until < now())
+			ORDER BY next_attempt_at
+			LIMIT $3
+			FOR UPDATE SKIP LOCKED)
+		RETURNING event_id, aggregate_id, event_type, event_version, payload::text, attempts`,
+		owner, lease.Milliseconds(), limit)
+	if err != nil {
+		return nil, classify(err)
+	}
+	defer rows.Close()
+	var out []app.OutboxRecord
+	for rows.Next() {
+		var (
+			rec     app.OutboxRecord
+			payload string
+		)
+		if err := rows.Scan(&rec.EventID, &rec.AggregateID, &rec.EventType, &rec.EventVersion, &payload, &rec.Attempts); err != nil {
+			return nil, classify(err)
+		}
+		rec.Payload = []byte(payload)
+		out = append(out, rec)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, classify(err)
+	}
+	return out, nil
+}
+
+func (r outboxRepo) MarkPublished(ctx context.Context, owner string, eventID uuid.UUID) (bool, error) {
+	tag, err := r.tx.Exec(ctx, `
+		UPDATE outbox_events SET published_at = now(), locked_until = NULL, last_error = NULL
+		WHERE event_id = $1 AND locked_by = $2 AND published_at IS NULL`, eventID, owner)
+	if err != nil {
+		return false, classify(err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+func (r outboxRepo) Reschedule(ctx context.Context, owner string, eventID uuid.UUID, next time.Time, lastError string) error {
+	_, err := r.tx.Exec(ctx, `
+		UPDATE outbox_events SET next_attempt_at = $3, locked_until = NULL, last_error = $4
+		WHERE event_id = $1 AND locked_by = $2 AND published_at IS NULL`, eventID, owner, next, lastError)
+	return classify(err)
+}
+
+func (r outboxRepo) Park(ctx context.Context, owner string, eventID uuid.UUID, lastError string) error {
+	_, err := r.tx.Exec(ctx, `
+		UPDATE outbox_events SET parked_at = now(), locked_until = NULL, last_error = $3
+		WHERE event_id = $1 AND locked_by = $2 AND published_at IS NULL`, eventID, owner, lastError)
+	return classify(err)
+}

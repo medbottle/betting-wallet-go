@@ -182,10 +182,61 @@ type InboxRepository interface {
 	Complete(ctx context.Context, consumerName, messageID string, transactionID uuid.UUID, outcome wager.Status, processedAt time.Time) error
 }
 
+// OutboxRecord is a claimed, unpublished outbox row.
+type OutboxRecord struct {
+	EventID      uuid.UUID
+	AggregateID  uuid.UUID
+	EventType    string
+	EventVersion int
+	// Payload is the frozen envelope, as stored (JSONB: same content, keys
+	// and whitespace normalised by Postgres).
+	Payload []byte
+	// Attempts counts claims, this one included.
+	Attempts int
+}
+
 // OutboxRepository persists integration events for the relay.
 type OutboxRepository interface {
 	// Insert refuses envelopes that are not Valid.
 	Insert(ctx context.Context, events ...event.Envelope) error
+	// ClaimBatch leases up to limit due rows to owner for lease and counts
+	// the attempt (ARCHITECTURE §9). Run it in its own short transaction and
+	// commit before publishing.
+	ClaimBatch(ctx context.Context, owner string, lease time.Duration, limit int) ([]OutboxRecord, error)
+	// MarkPublished sets published_at if owner still holds the row; false
+	// when the lease was lost (another relay took over).
+	MarkPublished(ctx context.Context, owner string, eventID uuid.UUID) (bool, error)
+	// Reschedule releases the lease and sets the next attempt.
+	Reschedule(ctx context.Context, owner string, eventID uuid.UUID, next time.Time, lastError string) error
+	// Park stops retrying a row (attempts exhausted). Rows are never deleted.
+	Park(ctx context.Context, owner string, eventID uuid.UUID, lastError string) error
+}
+
+// OutboundEvent is one message for the events queue.
+type OutboundEvent struct {
+	EventID uuid.UUID
+	// GroupID is the FIFO MessageGroupId: the aggregate (wallet) id.
+	GroupID      string
+	EventType    string
+	EventVersion int
+	Body         []byte
+}
+
+// PublishResult is the outcome of one entry of a batch.
+type PublishResult struct {
+	EventID uuid.UUID
+	// Err is nil when the entry was accepted.
+	Err error
+	// SenderFault reports a rejection caused by the request itself.
+	SenderFault bool
+}
+
+// EventPublisher sends events to the broker. It is called outside any
+// transaction (CLAUDE.md: never publish inside one).
+type EventPublisher interface {
+	// PublishBatch sends up to 10 events. err is a failure of the whole call
+	// (network, 5xx); otherwise every event has a result.
+	PublishBatch(ctx context.Context, events []OutboundEvent) ([]PublishResult, error)
 }
 
 // Clock supplies the current time (UTC).
