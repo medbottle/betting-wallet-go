@@ -50,6 +50,12 @@ func (r walletRepo) Insert(ctx context.Context, w *wallet.Wallet) error {
 	return classify(err)
 }
 
+// GetForUpdate takes the per-wallet lock with FOR NO KEY UPDATE, not FOR
+// UPDATE: writers on the same wallet still queue on it, but it does not
+// conflict with the FOR KEY SHARE lock that the foreign key check of a
+// wager_transactions insert takes on the wallet row. With FOR UPDATE, two
+// operations that each inserted their own row first deadlock on the wallet
+// (ARCHITECTURE §4).
 func (r walletRepo) GetForUpdate(ctx context.Context, walletID uuid.UUID) (*wallet.Wallet, error) {
 	var (
 		s        wallet.Snapshot
@@ -63,7 +69,7 @@ func (r walletRepo) GetForUpdate(ctx context.Context, walletID uuid.UUID) (*wall
 	err := r.tx.QueryRow(ctx, `
 		SELECT player_id, currency, balance_minor, version, created_at, updated_at
 		FROM wallets WHERE id = $1
-		FOR UPDATE`, walletID).Scan(&playerID, &code, &minor, &version, &created, &updated)
+		FOR NO KEY UPDATE`, walletID).Scan(&playerID, &code, &minor, &version, &created, &updated)
 	if err != nil {
 		return nil, notFound(err, "wallet "+walletID.String())
 	}

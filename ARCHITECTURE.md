@@ -81,7 +81,7 @@ flowchart LR
 
 ## 4. Concorrência por carteira
 
-**Decisão**: lock pessimista com `SELECT ... FROM wallets WHERE id=$1 FOR UPDATE` dentro da transação de negócio, com salvaguardas no banco:
+**Decisão**: lock pessimista com `SELECT ... FROM wallets WHERE id=$1 FOR NO KEY UPDATE` dentro da transação de negócio, com salvaguardas no banco:
 - `CHECK (balance_minor >= 0)`;
 - `UPDATE wallets ... WHERE id=$1 AND version=$2`, em que 0 linhas afetadas significa violação de invariante;
 - `UNIQUE (wallet_id, wallet_version)` no ledger.
@@ -97,7 +97,7 @@ flowchart LR
 
    Esses três são erros de entrada não persistidos, retornados no lugar de uma violação de FK. A leitura sem lock é segura porque `player_id` e `currency` são imutáveis (há trigger) e carteiras nunca são removidas (há trigger e o papel da aplicação não tem `DELETE`).
 1. `BEGIN`. No caso do SQS, `INSERT` na inbox. Em seguida, `INSERT` da própria `wager_transaction` em `PENDING` com `ON CONFLICT DO NOTHING`. Se houver conflito, segue o caminho de idempotência da seção 6.
-2. `SELECT wallet FOR UPDATE`.
+2. `SELECT wallet FOR NO KEY UPDATE`.
 3. Resolução da referência com um `SELECT` novo, sem lock, executado depois de obter o lock da carteira.
 4. O domínio aplica a operação. Depois: `UPDATE` da carteira condicionado à versão, `INSERT` no ledger, `UPDATE` da própria linha para estado terminal ou `PENDING_REFERENCE`, `INSERT` dos eventos na outbox, *nudge* dos dependentes (seção 8) e conclusão da inbox.
 5. `COMMIT`.
@@ -113,6 +113,8 @@ flowchart LR
 
   Como cada operação toca uma única carteira, não há ciclo. `40P01` continua classificado como transitório, como rede de segurança.
 
+**Por que `FOR NO KEY UPDATE` e não `FOR UPDATE`** (corrigido no slice 6): o `INSERT` da própria linha no passo 1 verifica a FK `wager_transactions → wallets`, e essa verificação toma `FOR KEY SHARE` na linha da carteira até o fim da transação. `FOR UPDATE` conflita com `FOR KEY SHARE`; `FOR NO KEY UPDATE` não. Com `FOR UPDATE`, duas operações diferentes na mesma carteira inseriam suas linhas (cada uma com `KEY SHARE` na carteira) e depois esperavam uma pela outra no passo 2: deadlock em 35 de 40 disputas medidas, com uma das apostas do caso 100.00 vs. 2 x 80.00 recebendo 503 em vez de `INSUFFICIENT_FUNDS`. O argumento acima, de que inserts antes do lock só disputam índices únicos, ignorava esse lock da FK. `FOR NO KEY UPDATE` continua sendo lock pessimista por carteira (conflita consigo mesmo, então escritores da mesma carteira entram em fila) e é o lock que o próprio Postgres toma num `UPDATE` de colunas que não são chave, como o do saldo. O que `FOR UPDATE` acrescentaria é proteção contra `DELETE` ou alteração de chave da carteira, já proibidos por trigger. O teste `TestNoDeadlockBetweenOperationsOnOneWallet` disputa duas operações na mesma carteira 40 vezes e exige zero `40P01`; ele falha se o lock voltar a ser `FOR UPDATE`.
+
 **Timeouts**: `lock_timeout = 5s`. Os códigos `55P03`, `40P01`, `40001`, erro de conexão e deadline de contexto são tratados como transitórios: rollback e retry.
 
 **Por quê**: o agregado faz a aritmética e produz `balanceBefore`/`balanceAfter`. Com 50 duplicatas em paralelo, o lock enfileira as requisições sem as tempestades de retry do controle otimista. Carteiras distintas não competem entre si.
@@ -123,9 +125,9 @@ flowchart LR
 
 **Caso 100.00 vs. 2 x 80.00**:
 1. T1 e T2 passam pela pré-leitura e inserem suas linhas `PENDING`. Os IDs externos são diferentes, então não há conflito.
-2. Ambas executam `SELECT wallet FOR UPDATE`. T1 obtém o lock e T2 espera.
+2. Ambas executam `SELECT wallet FOR NO KEY UPDATE`. T1 obtém o lock e T2 espera.
 3. T1 debita (100.00 → 20.00), grava o ledger com `DEBIT` na versão 2, marca `PROCESSED` com saldo de resultado 20.00, grava a outbox e faz commit.
-4. T2 desbloqueia. Em `READ COMMITTED`, o `FOR UPDATE` relê a versão mais recente (20.00). O domínio devolve `INSUFFICIENT_FUNDS`, e T2 grava `REJECTED`, o evento `WagerTransactionRejected` e nenhum ledger, depois faz commit.
+4. T2 desbloqueia. Em `READ COMMITTED`, o `FOR NO KEY UPDATE` relê a versão mais recente (20.00). O domínio devolve `INSUFFICIENT_FUNDS`, e T2 grava `REJECTED`, o evento `WagerTransactionRejected` e nenhum ledger, depois faz commit.
 5. Resultado: saldo 20.00, um único débito. Replays devolvem o resultado persistido de cada operação.
 
 ---
@@ -759,7 +761,7 @@ Tudo abaixo segue as seções 3, 4, 6, 8 e 9; os pontos que os documentos não d
 **Classificação de erros**: `40001`, `40P01`, `55P03`, classe `08`, erros de conexão e deadline/cancelamento de contexto → `ErrTransient` (seção 4). `23505` em `wallets_player_currency_key` → `ErrWalletAlreadyExists`. Qualquer outro `23xxx` (CHECKs, FKs, índices únicos de salvaguarda, triggers `23000`) → `ErrInvariantViolation` (seção 5). O resto volta sem classificação, incluindo `57014` (Q2 em aberto).
 
 **Repositórios** (só o que os fluxos de submit, abertura e reconciliação usam):
-- Carteira: `Insert`, `GetForUpdate` (`FOR UPDATE`), `UpdateBalance` com `WHERE version = $esperada` (0 linhas = violação de invariante, seção 4).
+- Carteira: `Insert`, `GetForUpdate` (`FOR NO KEY UPDATE`, seção 4), `UpdateBalance` com `WHERE version = $esperada` (0 linhas = violação de invariante, seção 4).
 - Transação: `InsertPending` com `ON CONFLICT DO NOTHING RETURNING id` (seção 6), `Insert` só para o `OPENING`, buscas por chave e por ID externo sem lock, `HasProcessedReversal`, `Update` do estado mutável (exige exatamente uma linha), `NudgeDependents` com o SQL da seção 8.
 - Ledger: `Insert` recusa entrada não `Valid()`; `Fold` percorre os lançamentos em ordem de versão e soma com `Money.Add`/`Sub` checados (sem `SUM` em SQL, sem `numeric`, sem ponto flutuante).
 - Inbox: `Insert` com `ON CONFLICT DO NOTHING`, `Get`, `Complete` (só uma vez).

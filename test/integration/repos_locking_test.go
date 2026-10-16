@@ -5,6 +5,7 @@ package integration
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -115,6 +116,47 @@ func TestWalletLocking(t *testing.T) {
 			t.Fatalf("err = %v, want SQLSTATE 57014", err)
 		}
 	})
+}
+
+// TestNoDeadlockBetweenOperationsOnOneWallet races two different
+// operations on the same wallet through the §4 flow (insert own row, then
+// lock the wallet) many times. Each insert's foreign key check takes FOR
+// KEY SHARE on the wallet; a FOR UPDATE wallet lock would conflict with it
+// and deadlock (it did in 35 of 40 rounds). FOR NO KEY UPDATE must give
+// zero deadlocks while still serialising the two writers.
+func TestNoDeadlockBetweenOperationsOnOneWallet(t *testing.T) {
+	t.Parallel()
+	env := newRepoEnv(t)
+	const rounds = 40
+	for round := 0; round < rounds; round++ {
+		w := env.openWallet(t, "100.00")
+		start := make(chan struct{})
+		errs := make(chan error, 2)
+		outcomes := make(chan string, 2)
+		for i := 0; i < 2; i++ {
+			go func(i int) {
+				<-start
+				errs <- env.runner.InTx(context.Background(), app.TxOptions{}, func(ctx context.Context, r app.Repos) error {
+					tx, _, err := submit(ctx, r, env.ids, rawFor(w, "BET", "80.00", fmt.Sprintf("dl-%d-%d", round, i), ""), now())
+					if err == nil {
+						outcomes <- string(tx.Status())
+					}
+					return err
+				})
+			}(i)
+		}
+		close(start)
+		for i := 0; i < 2; i++ {
+			if err := <-errs; err != nil {
+				t.Fatalf("round %d: %v (SQLSTATE %s)", round, err, pgCode(err))
+			}
+		}
+		got := map[string]int{<-outcomes: 1}
+		got[<-outcomes]++
+		if got["PROCESSED"] != 1 || got["REJECTED"] != 1 {
+			t.Fatalf("round %d: outcomes %v, want one PROCESSED and one REJECTED", round, got)
+		}
+	}
 }
 
 // TestConcurrentDuplicateInsert: a duplicate InsertPending waits on the

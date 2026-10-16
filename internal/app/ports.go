@@ -74,7 +74,7 @@ type WalletRepository interface {
 	// Insert returns ErrWalletAlreadyExists when the player already has a
 	// wallet in that currency.
 	Insert(ctx context.Context, w *wallet.Wallet) error
-	// GetForUpdate locks the wallet row (SELECT ... FOR UPDATE) for the rest
+	// GetForUpdate locks the wallet row (SELECT ... FOR NO KEY UPDATE) for the rest
 	// of the transaction. ErrNotFound for an unknown wallet.
 	GetForUpdate(ctx context.Context, walletID uuid.UUID) (*wallet.Wallet, error)
 	// UpdateBalance writes balance, version and updated_at, conditioned on
