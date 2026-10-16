@@ -4,12 +4,13 @@ Distributed processing of bets and wallet movements in Go (Uber Fx, PostgreSQL,
 SQS, Keycloak). Spec: [docs/CHALLENGE.md](docs/CHALLENGE.md). Design decisions:
 [ARCHITECTURE.md](ARCHITECTURE.md).
 
-> **Status: slice 5 (authentication).** Infrastructure, health endpoints,
-> migrations, the full schema, the pure-Go domain, the persistence adapter and
-> authentication (Keycloak realm, OIDC token verification, authorization
-> rules, bearer middleware) exist. There are no business endpoints, use cases
-> or SQS consumer yet. Points the documents leave open are tracked in
-> [docs/OPEN-QUESTIONS.md](docs/OPEN-QUESTIONS.md).
+> **Status: slice 6 (HTTP API).** The authenticated HTTP API (wallets,
+> operations with persistent idempotency, reads, reconciliation) runs on the
+> full schema, domain and persistence adapter. The SQS consumer, the outbox
+> relay, the reference worker and metrics are not built yet: operations that
+> wait for a reference stay `PENDING_REFERENCE`, and outbox events are stored
+> but not published. Open points: [docs/OPEN-QUESTIONS.md](docs/OPEN-QUESTIONS.md);
+> parked assumptions: [docs/ASSUMPTIONS.md](docs/ASSUMPTIONS.md).
 
 ## Prerequisites
 
@@ -105,6 +106,9 @@ from the `provider_id` claim. `/health/*` needs no token.
 | `OIDC_JWKS_URL` | — (required) | app | JWKS endpoint (inside compose: `http://keycloak:8080/...`) |
 | `OIDC_AUDIENCE` | `wallet-api` | app | required `aud` value |
 | `OIDC_JWKS_MIN_REFRESH_INTERVAL` | `30s` | app | minimum gap between JWKS fetches for unknown `kid`s |
+| `REFERENCE_TTL` | `10m` | app | how long an operation waits for its reference (ARCHITECTURE §8) |
+| `REFERENCE_BACKOFF_BASE` | `1s` | app | first retry delay for a missing reference |
+| `REFERENCE_BACKOFF_MAX` | `60s` | app | longest retry delay |
 | `HTTP_ADDR` | `:8081` | app | listen address |
 | `HTTP_READ_HEADER_TIMEOUT` | `5s` | app | header read timeout |
 | `HTTP_HANDLER_TIMEOUT` | `10s` | app | per-request handler timeout |
@@ -119,6 +123,44 @@ from the `provider_id` claim. `/health/*` needs no token.
 
 Invalid configuration makes the app exit at startup and lists every problem it
 found.
+
+## API examples
+
+Contracts and status codes: ARCHITECTURE.md §13 and §20. Every business
+route needs a bearer token (see above); `X-Correlation-Id` is optional and
+echoed back.
+
+```sh
+INTERNAL=$(curl -s -d grant_type=client_credentials -d client_id=wallet-internal -d client_secret=wallet-internal-local-secret http://localhost:8080/realms/wagering/protocol/openid-connect/token | jq -r .access_token)
+PROVIDER=$(curl -s -d grant_type=client_credentials -d client_id=provider-a -d client_secret=provider-a-local-secret http://localhost:8080/realms/wagering/protocol/openid-connect/token | jq -r .access_token)
+```
+
+Open a wallet (internal service; 201):
+
+```sh
+curl -s -X POST http://localhost:8081/wallets -H "Authorization: Bearer $INTERNAL" -H 'Content-Type: application/json' -d '{"playerId":"0192f28f-5dc0-7d58-bdb2-814ad6a0f4a1","initialBalance":{"amount":"1000.00","currency":"BRL"}}'
+```
+
+Submit a bet (provider; replace `<walletId>`). Resending the same request
+returns the stored outcome with `"idempotentReplay": true`:
+
+```sh
+curl -s -X POST http://localhost:8081/wagering/transactions -H "Authorization: Bearer $PROVIDER" -H 'Content-Type: application/json' -H 'Idempotency-Key: provider-a:transaction-123' -d '{"providerId":"provider-a","externalTransactionId":"transaction-123","playerId":"0192f28f-5dc0-7d58-bdb2-814ad6a0f4a1","walletId":"<walletId>","roundId":"round-987","gameId":"fortune-chimp","kind":"BET","money":{"amount":"25.00","currency":"BRL"}}'
+```
+
+Reads and reconciliation:
+
+```sh
+curl -s http://localhost:8081/providers/provider-a/wagering/transactions/transaction-123 -H "Authorization: Bearer $PROVIDER"
+```
+
+```sh
+curl -s "http://localhost:8081/wallets/<walletId>/ledger?limit=50" -H "Authorization: Bearer $INTERNAL"
+```
+
+```sh
+curl -s -X POST http://localhost:8081/wallets/<walletId>/reconciliation -H "Authorization: Bearer $INTERNAL"
+```
 
 ## Database migrations
 
@@ -196,7 +238,7 @@ integration tests.
 | `go test -race ./...` | the same with the race detector | Go + gcc (cgo) |
 | `go vet ./...` | vet (add `-tags=integration` to vet integration code too) | Go |
 | `gofmt -l .` | lists unformatted files (should print nothing) | Go |
-| `go test -tags=integration -count=1 ./test/integration/...` | real Postgres via testcontainers: migrations up/down, Fx start/stop with goroutine-leak check, every schema constraint, trigger and grant, the repositories, wallet locking and transaction atomicity, token verification against a real Keycloak (started once per run) | Docker |
+| `go test -tags=integration -count=1 ./test/integration/...` | real Postgres via testcontainers: migrations up/down, Fx start/stop with goroutine-leak check, every schema constraint, trigger and grant, the repositories, wallet locking and transaction atomicity, token verification against a real Keycloak (started once per run), the HTTP API end to end including the concurrency scenarios of CHALLENGE §13 | Docker |
 | `go test -tags=integration -race -count=1 ./test/integration/...` | the same with the race detector | Docker + gcc |
 
 With no local C toolchain (for example, on Windows without gcc), run the race

@@ -486,6 +486,8 @@ stateDiagram-v2
 
 **Autenticação**: `UNAUTHENTICATED` (401), `FORBIDDEN` (403), `PROVIDER_MISMATCH` (403).
 
+**Leitura**: `TRANSACTION_NOT_FOUND` (404): transação inexistente ou de outro provedor, sem revelar qual (seção 20).
+
 **Em Go**: constantes `wager.FailureCode` (pacote `internal/domain/wager`) e erros tipados (`*wager.ValidationError{Code}`, `*wager.RejectionError{Code}`, `*wager.ConflictError{Code}`) ou sentinelas, verificados com `errors.As`/`errors.Is`. O mapeamento para o transporte acontece somente nos adapters.
 
 ---
@@ -811,6 +813,37 @@ Tudo abaixo segue as seções 3, 4, 6, 8 e 9; os pontos que os documentos não d
 - Integração com Keycloak real (testcontainers, mesmo arquivo de realm, um container compartilhado pelo pacote): tokens reais de `client_credentials` dos três clientes; recusa de token ausente, assinatura adulterada, issuer errado, audiência errada e token expirado (o mesmo token real, verificado com o relógio adiantado além de `exp` + 30s); segredo errado não obtém token; middleware com rota protegida e `/health` público; o teste de lifecycle do Fx sobe Keycloak e o app não inicia sem JWKS.
 
 **Em aberto**: Q5 em [docs/OPEN-QUESTIONS.md](docs/OPEN-QUESTIONS.md) (`kid` desconhecido com o IdP fora do ar: hoje 401).
+
+---
+
+## 20. Decisões do slice 6 (casos de uso e API HTTP)
+
+**Respostas às questões em aberto** (aprovadas):
+- **Q3, registro de provedores**: como diz a seção 11, a tabela `providers` é consultada e provedor desconhecido ou inativo é rejeitado. No HTTP, a rejeição é `403 FORBIDDEN` (o código de autorização da seção 12), sem efeitos. A consulta usa o leitor do pool (Q4); o SQS usará o mesmo caso de uso.
+- **Q4, leituras dos GET**: o mesmo leitor do pool da pré-leitura (`postgres.Reader`), com statements únicos em `READ COMMITTED`, sem lock e fora de transação. A reconciliação continua numa transação `REPEATABLE READ READ ONLY` (seção 3).
+- **Q6, correlationId**: o header `X-Correlation-Id` é aceito quando tem de 1 a 255 caracteres ASCII imprimíveis; senão um UUIDv7 é gerado. O valor volta no mesmo header da resposta, vai para os logs e é gravado na transação e nos eventos.
+- **Q7, formato dos GET**: o recurso de transação traz o que a seção 9 do desafio pede para acompanhar pendências e consultar falhas: ids interno e externos, origem, tipo, status, carteira, jogador, `money`, provedor, rodada, jogo, referências, `failureCode`, o resultado devolvido ao provedor (`balance`, `walletVersion`), `referenceDeadlineAt` enquanto pendente e os timestamps. Campos que não se aplicam são omitidos. A carteira usa exatamente o formato do desafio (`id`, `playerId`, `balance`, `version`). O ledger é `{walletId, entries, nextCursor}`, com os campos de lançamento da seção 6.4 do desafio.
+- **Q8, Retry-After**: `2` segundos em todo 503. 1s seria curto: os 503 vêm sobretudo de espera de lock além do `lock_timeout` (5s) ou de falha do banco, que a readiness checa a cada 2s; 2s garante ao menos mais uma checagem antes do retry.
+- **Q9, paginação e corpo**: `limit` padrão 50 (o exemplo do desafio); teto de 200 por página, para limitar o custo de uma requisição (premissa A5 em docs/ASSUMPTIONS.md). Corpo de requisição limitado a 64 KiB.
+
+**Casos de uso**:
+- `wallets.Open`: valida `playerId` e `initialBalance`, roda `wager.OpenWallet` e grava carteira, `OPENING`, lançamento e eventos numa transação. Duplicata → `WALLET_ALREADY_EXISTS`.
+- `wagering.Submit`: o fluxo da seção 4. Fora de transação: `NewRequest`, registro de provedores, pré-leitura. Na transação: `InsertPending`; se não inseriu, busca por chave e depois por ID externo e aplica `CheckReplay` (replay ou conflito); senão lock da carteira, referência, `Apply`, gravação de saldo, ledger, linha e outbox, e nudge dos dependentes quando terminal. Erro de invariante → rollback e `FAILED` numa transação separada com lock da carteira (seção 5); se outra chamada já gravou a operação, essa é reproduzida.
+- O `NextAttemptAt` usado ao entrar em `PENDING_REFERENCE` segue o backoff da seção 8 (`REFERENCE_BACKOFF_BASE=1s`, `REFERENCE_BACKOFF_MAX=60s`, jitter total); o TTL é `REFERENCE_TTL=10m`.
+- `wallets.Reconcile`: carteira e fold do ledger no mesmo snapshot; `difference = armazenado − calculado`; divergência vai na resposta e num log de erro com os valores (a métrica chega com o slice de métricas).
+
+**HTTP** (seção 13):
+- Ordem no `POST /wagering/transactions`: corpo JSON → `providerId` do corpo contra a claim (403 sem efeitos) → `money` como strings → caso de uso (validação, registro de provedores, pré-leitura, idempotência). Status: 200 `PROCESSED`, 422 `REJECTED` (com o saldo observado), 202 `PENDING_REFERENCE` com `Location` para o GET do provedor, 500 `FAILED`; o replay devolve o mesmo status com `idempotentReplay: true`.
+- Corpo JSON estrito: campos desconhecidos, dados após o objeto e corpos acima de 64 KiB são `INVALID_REQUEST`. `amount` como número JSON é `INVALID_MONEY` (seção 2).
+- Mapeamento de erros: categoria A → 400 (`WALLET_NOT_FOUND` → 404); C → 409; `PROVIDER_MISMATCH`/`FORBIDDEN` → 403; transação ausente ou de outro provedor → 404 `TRANSACTION_NOT_FOUND`; invariante não gravável → 500; transitório → 503 com `retryable: true` e `Retry-After: 2`.
+- Rotas de carteira (`POST /wallets`, `GET /wallets/*`, ledger, reconciliação) só para `wallet-internal`. Rotas de negócio só existem atrás do `RequireAuth`; sem verificador, o router registra apenas `/health/*`.
+
+**Testes** (Postgres e Keycloak reais, tokens reais, pilha HTTP completa):
+- Concorrência (itens 1 a 3 da seção 13 do desafio): a mesma aposta 50 vezes em paralelo gera uma resposta nova, 49 replays e um único débito; duas apostas de 80.00 sobre 100.00 dão uma processada e uma `INSUFFICIENT_FUNDS` com saldo 20.00 e um débito, e reenvios não mudam nada; com uma carteira travada, outra carteira responde em menos de 1s.
+- Autenticação e autorização: 401 em todas as rotas de negócio sem token ou com token forjado; isolamento entre provedores em leituras e em replays (a mesma chave de outro provedor é outra operação); `providerId` divergente, serviço interno submetendo e provedor inativo → 403 sem nenhuma linha gravada; provedores sem acesso às rotas de carteira.
+- Contrato: todas as linhas da tabela de status, os dois conflitos, replay com o saldo original após outras movimentações, `PENDING_REFERENCE` com `Location` navegável, paginação do ledger em ordem estável e cursores inválidos, reconciliação consistente e divergente (saldo adulterado como owner; nada é alterado), 503 com `Retry-After` por `lock_timeout` sem persistir nada, e `FAILED` (injetado na gravação do ledger, o único jeito de chegar lá) com replay e bloqueio do ID externo.
+- Cada cenário termina conferindo o saldo armazenado contra o ledger pela reconciliação.
+- Os testes foram conferidos por mutação: perder a flag de replay e pular a checagem de `providerId` fazem testes falharem.
 
 ---
 
