@@ -7,7 +7,11 @@ import (
 )
 
 func validVars() map[string]string {
-	return map[string]string{"DATABASE_URL": "postgres://wallet_app:x@localhost:5432/wallet"}
+	return map[string]string{
+		"DATABASE_URL":  "postgres://wallet_app:x@localhost:5432/wallet",
+		"OIDC_ISSUER":   "http://localhost:8080/realms/wagering",
+		"OIDC_JWKS_URL": "http://keycloak:8080/realms/wagering/protocol/openid-connect/certs",
+	}
 }
 
 func TestLoadFromDefaults(t *testing.T) {
@@ -20,6 +24,9 @@ func TestLoadFromDefaults(t *testing.T) {
 	}
 	if c.DBLockTimeout != 5*time.Second {
 		t.Errorf("DBLockTimeout = %v, want 5s", c.DBLockTimeout)
+	}
+	if c.OIDCAudience != "wallet-api" || c.OIDCJWKSMinRefreshInterval != 30*time.Second {
+		t.Errorf("OIDC defaults = %q/%v, want wallet-api/30s", c.OIDCAudience, c.OIDCJWKSMinRefreshInterval)
 	}
 	if c.HTTPHandlerTimeout != 10*time.Second {
 		t.Errorf("HTTPHandlerTimeout = %v, want 10s", c.HTTPHandlerTimeout)
@@ -59,6 +66,10 @@ func TestLoadFromRejectsInvalid(t *testing.T) {
 		{"check timeout above interval", func(m map[string]string) { m["READINESS_CHECK_TIMEOUT"] = "5s" }, "READINESS_CHECK_TIMEOUT"},
 		{"bad log level", func(m map[string]string) { m["LOG_LEVEL"] = "verbose" }, "LOG_LEVEL"},
 		{"zero lock timeout", func(m map[string]string) { m["DB_LOCK_TIMEOUT"] = "0s" }, "DB_LOCK_TIMEOUT"},
+		{"missing issuer", func(m map[string]string) { delete(m, "OIDC_ISSUER") }, "OIDC_ISSUER"},
+		{"relative jwks url", func(m map[string]string) { m["OIDC_JWKS_URL"] = "/certs" }, "OIDC_JWKS_URL"},
+		{"empty audience", func(m map[string]string) { m["OIDC_AUDIENCE"] = " " }, "OIDC_AUDIENCE"},
+		{"zero jwks interval", func(m map[string]string) { m["OIDC_JWKS_MIN_REFRESH_INTERVAL"] = "0s" }, "OIDC_JWKS_MIN_REFRESH_INTERVAL"},
 		{"zero pool size", func(m map[string]string) { m["DB_MAX_CONNS"] = "0" }, "DB_MAX_CONNS"},
 		{"bad bool", func(m map[string]string) { m["RUN_HTTP"] = "maybe" }, "RUN_HTTP"},
 		{"empty listen address", func(m map[string]string) { m["HTTP_ADDR"] = " " }, "HTTP_ADDR"},

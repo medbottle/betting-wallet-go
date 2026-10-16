@@ -21,6 +21,9 @@ import (
 
 func setAppEnv(t *testing.T, databaseURL string) {
 	t.Setenv("DATABASE_URL", databaseURL)
+	// Required since the OIDC settings; nothing fetches the JWKS yet.
+	t.Setenv("OIDC_ISSUER", "http://127.0.0.1:1/realms/wagering")
+	t.Setenv("OIDC_JWKS_URL", "http://127.0.0.1:1/realms/wagering/protocol/openid-connect/certs")
 	t.Setenv("HTTP_ADDR", "127.0.0.1:0")
 	t.Setenv("READINESS_INTERVAL", "200ms")
 	t.Setenv("READINESS_CHECK_TIMEOUT", "200ms")

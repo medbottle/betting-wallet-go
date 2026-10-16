@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"reflect"
 	"strings"
@@ -28,6 +29,17 @@ type Config struct {
 	// DBLockTimeout is the default lock_timeout of business transactions
 	// (ARCHITECTURE §4).
 	DBLockTimeout time.Duration `env:"DB_LOCK_TIMEOUT" envDefault:"5s"`
+
+	// OIDCIssuer is the exact expected iss claim (ARCHITECTURE §11).
+	OIDCIssuer string `env:"OIDC_ISSUER,required,notEmpty"`
+	// OIDCJWKSURL is where signing keys are fetched; independent of the
+	// issuer so the internal network can be used (ARCHITECTURE §11).
+	OIDCJWKSURL string `env:"OIDC_JWKS_URL,required,notEmpty"`
+	// OIDCAudience must be contained in the aud claim.
+	OIDCAudience string `env:"OIDC_AUDIENCE" envDefault:"wallet-api"`
+	// OIDCJWKSMinRefreshInterval is the minimum gap between JWKS fetches
+	// triggered by an unknown kid (rate limit, ARCHITECTURE §11/§19).
+	OIDCJWKSMinRefreshInterval time.Duration `env:"OIDC_JWKS_MIN_REFRESH_INTERVAL" envDefault:"30s"`
 
 	// HTTPAddr is the listen address of the HTTP server.
 	HTTPAddr string `env:"HTTP_ADDR" envDefault:":8081"`
@@ -78,6 +90,14 @@ func (c Config) Validate() error {
 	if c.DBMaxConns < 1 {
 		errs = append(errs, errors.New("DB_MAX_CONNS must be >= 1"))
 	}
+	for _, u := range []struct{ name, value string }{{"OIDC_ISSUER", c.OIDCIssuer}, {"OIDC_JWKS_URL", c.OIDCJWKSURL}} {
+		if parsed, err := url.Parse(u.value); err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+			errs = append(errs, fmt.Errorf("%s must be an absolute http(s) URL", u.name))
+		}
+	}
+	if strings.TrimSpace(c.OIDCAudience) == "" {
+		errs = append(errs, errors.New("OIDC_AUDIENCE must not be empty"))
+	}
 	if strings.TrimSpace(c.HTTPAddr) == "" {
 		errs = append(errs, errors.New("HTTP_ADDR must not be empty"))
 	}
@@ -87,6 +107,7 @@ func (c Config) Validate() error {
 	}{
 		{"DB_STARTUP_TIMEOUT", c.DBStartupTimeout},
 		{"DB_LOCK_TIMEOUT", c.DBLockTimeout},
+		{"OIDC_JWKS_MIN_REFRESH_INTERVAL", c.OIDCJWKSMinRefreshInterval},
 		{"HTTP_READ_HEADER_TIMEOUT", c.HTTPReadHeaderTimeout},
 		{"HTTP_HANDLER_TIMEOUT", c.HTTPHandlerTimeout},
 		{"READINESS_INTERVAL", c.ReadinessInterval},
