@@ -13,6 +13,10 @@ var (
 	// ErrProviderNotAllowed means the provider is unknown or inactive in the
 	// registry (ARCHITECTURE §11): rejected with no effects.
 	ErrProviderNotAllowed = errors.New("app: provider unknown or inactive")
+	// ErrInboxHashMismatch means an SQS messageId was already consumed with
+	// a different payload (ARCHITECTURE §9): an invalid message, sent to the
+	// DLQ with nothing persisted.
+	ErrInboxHashMismatch = errors.New("app: inbox message id reused with a different payload")
 	// ErrTransient means the operation may succeed if retried: rolled back,
 	// nothing persisted (category E: HTTP 503, SQS redelivery; ARCHITECTURE
 	// §4/§5).

@@ -47,6 +47,16 @@ type SubmitCommand struct {
 	CorrelationID string
 	// CausationID is the SQS messageId for consumer submissions.
 	CausationID *string
+	// Inbox, set by the SQS consumer, records the message in the inbox in
+	// the same transaction (ARCHITECTURE §9). Nil for HTTP.
+	Inbox *InboxEntry
+}
+
+// InboxEntry identifies one consumed message.
+type InboxEntry struct {
+	ConsumerName string
+	MessageID    string
+	ReceivedAt   time.Time
 }
 
 // SubmitResult is the persisted transaction: the outcome of this call, or
@@ -54,19 +64,24 @@ type SubmitCommand struct {
 type SubmitResult struct {
 	Transaction *wager.WagerTransaction
 	Replay      bool
+	// Duplicate reports a redelivered inbox message that was already
+	// handled: nothing was done (ARCHITECTURE §9).
+	Duplicate bool
 }
 
 // Submit runs the synchronous flow of ARCHITECTURE §4:
 //
 //	validate -> provider registry -> wallet pre-read (no transaction)
 //	BEGIN
+//	  insert inbox row (SQS only; a redelivery is a duplicate, §9)
 //	  insert own row (ON CONFLICT DO NOTHING; a duplicate replays or conflicts, §6)
 //	  lock wallet -> read reference -> apply -> persist balance, ledger, row, outbox -> nudge
+//	  complete inbox row
 //	COMMIT
 //
 // Errors: *wager.ValidationError (category A, nothing persisted),
 // *wager.ConflictError (category C), app.ErrProviderNotAllowed,
-// app.ErrTransient (rolled back, retry). An invariant violation rolls back
+// app.ErrInboxHashMismatch, app.ErrTransient (rolled back, retry). An invariant violation rolls back
 // and is recorded as FAILED in a separate transaction (§5); the FAILED
 // transaction is then the result.
 func (s *Service) Submit(ctx context.Context, cmd SubmitCommand) (SubmitResult, error) {
@@ -92,20 +107,27 @@ func (s *Service) Submit(ctx context.Context, cmd SubmitCommand) (SubmitResult, 
 	}
 	var res SubmitResult
 	err = s.tx.InTx(ctx, app.TxOptions{}, func(ctx context.Context, r app.Repos) error {
+		if dup, ok, err := claimInbox(ctx, r, req, cmd); ok || err != nil {
+			res = dup
+			return err
+		}
 		inserted, err := r.Transactions().InsertPending(ctx, t)
 		if err != nil {
 			return err
 		}
 		if !inserted {
 			existing, err := replay(ctx, r, req)
+			if err != nil {
+				return err
+			}
 			res = SubmitResult{Transaction: existing, Replay: true}
-			return err
+			return completeInbox(ctx, r, cmd, existing, now)
 		}
 		if err := s.process(ctx, r, t, req, cmd, now); err != nil {
 			return err
 		}
 		res = SubmitResult{Transaction: t}
-		return nil
+		return completeInbox(ctx, r, cmd, t, now)
 	})
 	if errors.Is(err, app.ErrInvariantViolation) {
 		return s.recordFailure(ctx, req, cmd, err)
@@ -132,6 +154,57 @@ func (s *Service) preRead(ctx context.Context, req wager.Request) error {
 		return &wager.ValidationError{Code: wager.CodeCurrencyMismatch, Field: "money.currency", Msg: "wallet is " + id.Currency.String()}
 	}
 	return nil
+}
+
+// claimInbox inserts the inbox row first, before any lock (ARCHITECTURE
+// §4 step 1). A messageId seen before is a duplicate when its hash matches
+// (the original call's transaction is returned, nothing changes) and
+// ErrInboxHashMismatch otherwise. ok reports a duplicate.
+func claimInbox(ctx context.Context, r app.Repos, req wager.Request, cmd SubmitCommand) (dup SubmitResult, ok bool, err error) {
+	if cmd.Inbox == nil {
+		return SubmitResult{}, false, nil
+	}
+	hash, err := req.MessageHash()
+	if err != nil {
+		return SubmitResult{}, false, err
+	}
+	inserted, err := r.Inbox().Insert(ctx, app.InboxMessage{
+		ConsumerName: cmd.Inbox.ConsumerName, MessageID: cmd.Inbox.MessageID, PayloadHash: hash, ReceivedAt: cmd.Inbox.ReceivedAt,
+	})
+	if err != nil || inserted {
+		return SubmitResult{}, false, err
+	}
+	m, err := r.Inbox().Get(ctx, cmd.Inbox.ConsumerName, cmd.Inbox.MessageID)
+	if err != nil {
+		return SubmitResult{}, false, err
+	}
+	if m.PayloadHash != hash {
+		return SubmitResult{}, false, fmt.Errorf("%w: %s", app.ErrInboxHashMismatch, cmd.Inbox.MessageID)
+	}
+	// Insert and completion share one transaction, and the insert waited
+	// for any concurrent holder of the key, so a committed row is complete.
+	if m.ProcessedAt == nil {
+		return SubmitResult{}, false, fmt.Errorf("inbox message %s committed without completion", cmd.Inbox.MessageID)
+	}
+	existing, err := replay(ctx, r, req)
+	if err != nil {
+		return SubmitResult{}, false, err
+	}
+	return SubmitResult{Transaction: existing, Replay: true, Duplicate: true}, true, nil
+}
+
+// completeInbox records the outcome in the same commit as the domain
+// changes. A PENDING_REFERENCE completes it: the worker takes over (§9).
+func completeInbox(ctx context.Context, r app.Repos, cmd SubmitCommand, t *wager.WagerTransaction, now time.Time) error {
+	if cmd.Inbox == nil {
+		return nil
+	}
+	if t.Status() == wager.StatusPending {
+		// Only a stale row left for the worker can be PENDING (ARCHITECTURE
+		// §5); retry the message once the worker has moved it on.
+		return fmt.Errorf("%w: transaction %s is still PENDING", app.ErrTransient, t.ID())
+	}
+	return r.Inbox().Complete(ctx, cmd.Inbox.ConsumerName, cmd.Inbox.MessageID, t.ID(), t.Status(), now)
 }
 
 // replay finds the row that made InsertPending a no-op, by key and then by
@@ -247,14 +320,21 @@ func (s *Service) recordFailure(ctx context.Context, req wager.Request, cmd Subm
 	}
 	var res SubmitResult
 	err = s.tx.InTx(ctx, app.TxOptions{}, func(ctx context.Context, r app.Repos) error {
+		if dup, ok, err := claimInbox(ctx, r, req, cmd); ok || err != nil {
+			res = dup
+			return err
+		}
 		inserted, err := r.Transactions().InsertPending(ctx, t)
 		if err != nil {
 			return err
 		}
 		if !inserted {
 			existing, err := replay(ctx, r, req)
+			if err != nil {
+				return err
+			}
 			res = SubmitResult{Transaction: existing, Replay: true}
-			return err
+			return completeInbox(ctx, r, cmd, existing, now)
 		}
 		if _, err := r.Wallets().GetForUpdate(ctx, req.WalletID()); err != nil {
 			return err
@@ -266,7 +346,7 @@ func (s *Service) recordFailure(ctx context.Context, req wager.Request, cmd Subm
 			return err
 		}
 		res = SubmitResult{Transaction: t}
-		return nil
+		return completeInbox(ctx, r, cmd, t, now)
 	})
 	if err != nil {
 		return SubmitResult{}, fmt.Errorf("recording FAILED: %w (original: %w)", err, cause)
@@ -281,6 +361,9 @@ func (s *Service) logOutcome(res SubmitResult, cmd SubmitCommand) {
 		slog.String("transactionId", t.ID().String()), slog.String("walletId", t.WalletID().String()),
 		slog.String("providerId", t.ProviderID()), slog.String("correlationId", cmd.CorrelationID),
 		slog.String("status", string(t.Status())), slog.Bool("idempotentReplay", res.Replay),
+	}
+	if cmd.Inbox != nil {
+		attrs = append(attrs, slog.Bool("duplicateMessage", res.Duplicate))
 	}
 	if t.FailureCode() != "" {
 		attrs = append(attrs, slog.String("failureCode", string(t.FailureCode())))
