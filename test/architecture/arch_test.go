@@ -20,10 +20,33 @@ var forbiddenInDomain = []string{
 	"database/sql",
 }
 
+// uuidOnlySQL are database/sql subpackages tolerated in the domain's
+// dependency closure only because google/uuid (allowed by ARCHITECTURE §1)
+// imports database/sql/driver for its Value/Scan methods. They hold
+// interfaces only; no domain package may import them (ARCHITECTURE §17).
+var uuidOnlySQL = map[string]bool{"database/sql/driver": true, "database/sql/internal": true}
+
 func TestDomainHasNoInfrastructureDependencies(t *testing.T) {
 	deps := goList(t, "-deps", "-f", "{{.ImportPath}}", "./internal/domain/...")
 	for _, v := range violations(deps, forbiddenInDomain) {
+		if uuidOnlySQL[v] {
+			continue
+		}
 		t.Errorf("internal/domain depends on forbidden package %s", v)
+	}
+
+	// The tolerated packages must be reached through google/uuid only:
+	// nothing else in the closure, and no domain package, may import them.
+	for _, line := range goList(t, "-deps", "-f", `{{.ImportPath}} {{join .Imports " "}}`, "./internal/domain/...") {
+		pkg, imports, _ := strings.Cut(line, " ")
+		if pkg == "github.com/google/uuid" || strings.HasPrefix(pkg, "database/sql") {
+			continue
+		}
+		for _, imp := range strings.Fields(imports) {
+			if strings.HasPrefix(imp, "database/sql") {
+				t.Errorf("%s imports %s; only google/uuid may bring database/sql/driver into the domain", pkg, imp)
+			}
+		}
 	}
 }
 
