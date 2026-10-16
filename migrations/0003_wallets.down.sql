@@ -1,0 +1,2 @@
+DROP TABLE IF EXISTS wallets;
+DROP FUNCTION IF EXISTS wallets_guard();
