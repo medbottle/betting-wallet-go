@@ -742,6 +742,38 @@ Versão do Go: a última estável no momento da implementação, fixada em `go.m
 
 ---
 
+## 18. Decisões do slice 4 (adapter de persistência)
+
+Tudo abaixo segue as seções 3, 4, 6, 8 e 9; os pontos que os documentos não decidem estão em [docs/OPEN-QUESTIONS.md](docs/OPEN-QUESTIONS.md) e **não** foram decididos no código.
+
+**Ports** (`internal/app`, só depende do domínio): `TxRunner.InTx(ctx, TxOptions, func(ctx, Repos) error)` como na seção 3; `Repos` com `Wallets()`, `Transactions()`, `Ledger()`, `Inbox()` e `Outbox()`; `WalletReader` para a pré-leitura; `Clock`; `IDGenerator`. Sentinelas: `ErrNotFound`, `ErrWalletAlreadyExists`, `ErrTransient` (categoria E), `ErrInvariantViolation` (categoria D). O erro original continua embrulhado, para os logs.
+
+**Pré-leitura fora da transação**: a seção 4 coloca o passo 0 antes do `BEGIN`, então `WalletReader.GetIdentity` usa o pool diretamente, sem lock.
+
+**`InTx`**:
+- `READ COMMITTED` leitura-escrita por padrão; `RepeatableReadReadOnly` para a reconciliação (seção 3).
+- `SET LOCAL lock_timeout` sempre (padrão `DB_LOCK_TIMEOUT=5s`, seção 4); `statement_timeout` só quando `TxOptions.StatementTimeout > 0` (Q1 em aberto). `SET` não aceita parâmetros, então o valor vai como milissegundos inteiros formatados pelo código.
+- Retorno `nil` faz commit; erro ou panic faz rollback (o panic é relançado). O rollback usa um contexto sem cancelamento, para funcionar mesmo com o contexto do chamador já cancelado.
+- Sem retry interno: um erro transitório faz rollback e volta como `ErrTransient`; quem repete é o transporte (HTTP 503, reentrega do SQS; seção 5). Um commit cuja conexão caiu tem resultado desconhecido e também é `ErrTransient`; repetir é seguro pela idempotência.
+
+**Classificação de erros**: `40001`, `40P01`, `55P03`, classe `08`, erros de conexão e deadline/cancelamento de contexto → `ErrTransient` (seção 4). `23505` em `wallets_player_currency_key` → `ErrWalletAlreadyExists`. Qualquer outro `23xxx` (CHECKs, FKs, índices únicos de salvaguarda, triggers `23000`) → `ErrInvariantViolation` (seção 5). O resto volta sem classificação, incluindo `57014` (Q2 em aberto).
+
+**Repositórios** (só o que os fluxos de submit, abertura e reconciliação usam):
+- Carteira: `Insert`, `GetForUpdate` (`FOR UPDATE`), `UpdateBalance` com `WHERE version = $esperada` (0 linhas = violação de invariante, seção 4).
+- Transação: `InsertPending` com `ON CONFLICT DO NOTHING RETURNING id` (seção 6), `Insert` só para o `OPENING`, buscas por chave e por ID externo sem lock, `HasProcessedReversal`, `Update` do estado mutável (exige exatamente uma linha), `NudgeDependents` com o SQL da seção 8.
+- Ledger: `Insert` recusa entrada não `Valid()`; `Fold` percorre os lançamentos em ordem de versão e soma com `Money.Add`/`Sub` checados (sem `SUM` em SQL, sem `numeric`, sem ponto flutuante).
+- Inbox: `Insert` com `ON CONFLICT DO NOTHING`, `Get`, `Complete` (só uma vez).
+- Outbox: `Insert` recusa envelope não `Valid()`. Como a coluna é `JSONB` (seção 9), o conteúdo do payload é preservado, mas não a ordem das chaves nem os espaços; os testes comparam o JSON semanticamente.
+- Linhas só voltam ao domínio pelos `Rehydrate`; uma linha que não reidrata é `ErrInvariantViolation`.
+
+**Fora deste slice** (com seus workers): o claim do worker de referências (`ClaimDue`) e as consultas do relay da outbox (claim por lease, publicado, reagendar, estacionar). Também ficam para depois as leituras dos endpoints GET (Q4) e o registro de provedores (Q3).
+
+**Relógios**: timestamps do domínio vêm do `Clock` da aplicação; o nudge usa o `now()` do banco, como no SQL da seção 8. `idgen.UUIDv7` gera os IDs (seção 9); uma falha da fonte aleatória do sistema encerra o processo, porque nada mais pode funcionar sem ela.
+
+**Testes** (`integration`, Postgres real, conectado como `wallet_app`): commit, rollback por erro e por panic, transação somente leitura recusando escrita, snapshot único em `REPEATABLE READ`; o mesmo lock de carteira serializa, carteiras diferentes não esperam, `lock_timeout` vira `ErrTransient`; o insert duplicado concorrente espera o índice único e vê o resultado do primeiro (commit ou rollback); o nudge pula linhas travadas sem bloquear; ida e volta de cada repositório pelo domínio; atomicidade (falha depois de todas as escritas não deixa nada) e saldo armazenado igual ao ledger no cenário 100.00 vs 2 × 80.00 sequencial.
+
+---
+
 ## Esboço do schema
 
 > O schema implementado está em `migrations/`; a seção 16 registra onde ele refina este esboço.

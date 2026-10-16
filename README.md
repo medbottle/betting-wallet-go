@@ -4,10 +4,12 @@ Distributed processing of bets and wallet movements in Go (Uber Fx, PostgreSQL,
 SQS, Keycloak). Spec: [docs/CHALLENGE.md](docs/CHALLENGE.md). Design decisions:
 [ARCHITECTURE.md](ARCHITECTURE.md).
 
-> **Status: slice 3 (domain).** The infrastructure, health endpoints, migration
-> tooling, the full database schema and the pure-Go domain (Money, Wallet,
-> ledger, WagerTransaction rules, events, payload hashes) exist. There is no
-> persistence adapter, business API or SQS consumer yet.
+> **Status: slice 4 (persistence adapter).** Infrastructure, health
+> endpoints, migrations, the full schema, the pure-Go domain and the pgx
+> persistence adapter (transaction runner, repositories, error
+> classification) exist. There are no use cases, business API, auth or SQS
+> consumer yet. Points the documents leave open are tracked in
+> [docs/OPEN-QUESTIONS.md](docs/OPEN-QUESTIONS.md).
 
 ## Prerequisites
 
@@ -81,6 +83,7 @@ are provisioned in the auth slice.
 | `MIGRATE_DATABASE_URL` | — (required) | migrate | Postgres URL for the `wallet_owner` role |
 | `DB_MAX_CONNS` | `10` | app | pgxpool size |
 | `DB_STARTUP_TIMEOUT` | `10s` | app | bound on the startup ping and schema check |
+| `DB_LOCK_TIMEOUT` | `5s` | app | default `lock_timeout` of business transactions (ARCHITECTURE §4) |
 | `HTTP_ADDR` | `:8081` | app | listen address |
 | `HTTP_READ_HEADER_TIMEOUT` | `5s` | app | header read timeout |
 | `HTTP_HANDLER_TIMEOUT` | `10s` | app | per-request handler timeout |
@@ -172,7 +175,7 @@ integration tests.
 | `go test -race ./...` | the same with the race detector | Go + gcc (cgo) |
 | `go vet ./...` | vet (add `-tags=integration` to vet integration code too) | Go |
 | `gofmt -l .` | lists unformatted files (should print nothing) | Go |
-| `go test -tags=integration -count=1 ./test/integration/...` | real Postgres via testcontainers: migrations up/down, Fx start/stop with goroutine-leak check, every schema constraint, trigger and grant | Docker |
+| `go test -tags=integration -count=1 ./test/integration/...` | real Postgres via testcontainers: migrations up/down, Fx start/stop with goroutine-leak check, every schema constraint, trigger and grant, the repositories, wallet locking and transaction atomicity | Docker |
 | `go test -tags=integration -race -count=1 ./test/integration/...` | the same with the race detector | Docker + gcc |
 
 With no local C toolchain (for example, on Windows without gcc), run the race
