@@ -141,7 +141,10 @@ func (r Request) ReferenceExternalTransactionID() (string, bool) {
 }
 
 // valid reports whether r was built by NewRequest.
-func (r Request) valid() bool { return r.kind.External() && r.money.Valid() }
+func (r Request) valid() bool {
+	return r.kind.External() && r.money.Valid() && r.providerID != "" && r.idempotencyKey != "" &&
+		r.playerID != uuid.Nil && r.walletID != uuid.Nil
+}
 
 // isIdentifier accepts 1-255 printable ASCII characters without spaces
 // (0x21-0x7E).

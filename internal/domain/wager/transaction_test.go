@@ -34,7 +34,7 @@ func TestNewExternal(t *testing.T) {
 	}
 	ref, _ := tx.ReferenceExternalTransactionID()
 	if tx.ID() != id || tx.Status() != StatusPending || tx.Origin() != OriginExternal || tx.Kind() != KindRefund ||
-		tx.PayloadHash() != req.PayloadHash() || tx.HashVersion() != HashVersion || ref != "bet-1" ||
+		tx.PayloadHash() != req.payloadHash() || tx.HashVersion() != HashVersion || ref != "bet-1" ||
 		!tx.NextAttemptAt().Equal(t0) || tx.Attempts() != 0 {
 		t.Errorf("unexpected transaction %+v", tx.Snapshot())
 	}

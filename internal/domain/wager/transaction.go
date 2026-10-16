@@ -82,7 +82,7 @@ func NewExternal(req Request, id uuid.UUID, correlationID string, now time.Time)
 		providerID:            req.providerID,
 		externalTransactionID: req.externalTransactionID,
 		idempotencyKey:        req.idempotencyKey,
-		payloadHash:           req.PayloadHash(),
+		payloadHash:           req.payloadHash(),
 		hashVersion:           HashVersion,
 		roundID:               req.roundID,
 		gameID:                req.gameID,

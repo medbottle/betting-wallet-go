@@ -24,7 +24,7 @@ func CheckReplay(existing *WagerTransaction, req Request) error {
 		if existing.hashVersion != HashVersion {
 			return invalidTx("stored hash version %d is not comparable with %d", existing.hashVersion, HashVersion)
 		}
-		if existing.payloadHash != req.PayloadHash() {
+		if existing.payloadHash != req.payloadHash() {
 			return &ConflictError{Code: CodeIdempotencyKeyConflict, Msg: "idempotency key reused with a different payload"}
 		}
 		return nil

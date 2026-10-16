@@ -63,19 +63,56 @@ func (r Request) canonicalPayload() canonicalPayload {
 	}
 }
 
+// errUninitialisedRequest guards the exported hash methods: a zero Request
+// must not hash to a value that could be stored or compared.
+func errUninitialisedRequest() error {
+	return invalidTx("request was not built by NewRequest")
+}
+
 // CanonicalPayload returns the canonical JSON hashed by PayloadHash. It
 // excludes the idempotency key and all transport metadata.
-func (r Request) CanonicalPayload() []byte {
-	return canonicalJSON(r.canonicalPayload())
+func (r Request) CanonicalPayload() ([]byte, error) {
+	if !r.valid() {
+		return nil, errUninitialisedRequest()
+	}
+	return r.canonicalPayloadJSON(), nil
 }
 
 // PayloadHash returns the idempotency hash of the business fields.
-func (r Request) PayloadHash() PayloadHash {
-	return sha256.Sum256(r.CanonicalPayload())
+func (r Request) PayloadHash() (PayloadHash, error) {
+	if !r.valid() {
+		return PayloadHash{}, errUninitialisedRequest()
+	}
+	return r.payloadHash(), nil
 }
 
 // CanonicalMessage returns the canonical JSON hashed by MessageHash.
-func (r Request) CanonicalMessage() []byte {
+func (r Request) CanonicalMessage() ([]byte, error) {
+	if !r.valid() {
+		return nil, errUninitialisedRequest()
+	}
+	return r.canonicalMessageJSON(), nil
+}
+
+// MessageHash returns the inbox hash: the business fields plus the
+// idempotency key, so a messageId reused for another operation or another
+// key is detected.
+func (r Request) MessageHash() (PayloadHash, error) {
+	if !r.valid() {
+		return PayloadHash{}, errUninitialisedRequest()
+	}
+	return r.messageHash(), nil
+}
+
+// The unexported forms assume r is valid; callers check first.
+
+func (r Request) canonicalPayloadJSON() []byte { return canonicalJSON(r.canonicalPayload()) }
+
+func (r Request) payloadHash() PayloadHash { return sha256.Sum256(r.canonicalPayloadJSON()) }
+
+func (r Request) messageHash() PayloadHash { return sha256.Sum256(r.canonicalMessageJSON()) }
+
+func (r Request) canonicalMessageJSON() []byte {
 	p := r.canonicalPayload()
 	return canonicalJSON(canonicalMessage{
 		ExternalTransactionID:          p.ExternalTransactionID,
@@ -89,13 +126,6 @@ func (r Request) CanonicalMessage() []byte {
 		RoundID:                        p.RoundID,
 		WalletID:                       p.WalletID,
 	})
-}
-
-// MessageHash returns the inbox hash: the business fields plus the
-// idempotency key, so a messageId reused for another operation or another
-// key is detected.
-func (r Request) MessageHash() PayloadHash {
-	return sha256.Sum256(r.CanonicalMessage())
 }
 
 func canonicalJSON(v any) []byte {
