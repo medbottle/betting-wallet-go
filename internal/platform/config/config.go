@@ -25,6 +25,9 @@ type Config struct {
 	DBMaxConns int32 `env:"DB_MAX_CONNS" envDefault:"10"`
 	// DBStartupTimeout bounds the startup ping and schema version check.
 	DBStartupTimeout time.Duration `env:"DB_STARTUP_TIMEOUT" envDefault:"10s"`
+	// DBLockTimeout is the default lock_timeout of business transactions
+	// (ARCHITECTURE §4).
+	DBLockTimeout time.Duration `env:"DB_LOCK_TIMEOUT" envDefault:"5s"`
 
 	// HTTPAddr is the listen address of the HTTP server.
 	HTTPAddr string `env:"HTTP_ADDR" envDefault:":8081"`
@@ -83,6 +86,7 @@ func (c Config) Validate() error {
 		d    time.Duration
 	}{
 		{"DB_STARTUP_TIMEOUT", c.DBStartupTimeout},
+		{"DB_LOCK_TIMEOUT", c.DBLockTimeout},
 		{"HTTP_READ_HEADER_TIMEOUT", c.HTTPReadHeaderTimeout},
 		{"HTTP_HANDLER_TIMEOUT", c.HTTPHandlerTimeout},
 		{"READINESS_INTERVAL", c.ReadinessInterval},

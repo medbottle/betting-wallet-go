@@ -18,6 +18,9 @@ func TestLoadFromDefaults(t *testing.T) {
 	if c.HTTPAddr != ":8081" {
 		t.Errorf("HTTPAddr = %q, want :8081", c.HTTPAddr)
 	}
+	if c.DBLockTimeout != 5*time.Second {
+		t.Errorf("DBLockTimeout = %v, want 5s", c.DBLockTimeout)
+	}
 	if c.HTTPHandlerTimeout != 10*time.Second {
 		t.Errorf("HTTPHandlerTimeout = %v, want 10s", c.HTTPHandlerTimeout)
 	}
@@ -55,6 +58,7 @@ func TestLoadFromRejectsInvalid(t *testing.T) {
 		{"negative drain delay", func(m map[string]string) { m["READINESS_DRAIN_DELAY"] = "-1s" }, "READINESS_DRAIN_DELAY"},
 		{"check timeout above interval", func(m map[string]string) { m["READINESS_CHECK_TIMEOUT"] = "5s" }, "READINESS_CHECK_TIMEOUT"},
 		{"bad log level", func(m map[string]string) { m["LOG_LEVEL"] = "verbose" }, "LOG_LEVEL"},
+		{"zero lock timeout", func(m map[string]string) { m["DB_LOCK_TIMEOUT"] = "0s" }, "DB_LOCK_TIMEOUT"},
 		{"zero pool size", func(m map[string]string) { m["DB_MAX_CONNS"] = "0" }, "DB_MAX_CONNS"},
 		{"bad bool", func(m map[string]string) { m["RUN_HTTP"] = "maybe" }, "RUN_HTTP"},
 		{"empty listen address", func(m map[string]string) { m["HTTP_ADDR"] = " " }, "HTTP_ADDR"},
