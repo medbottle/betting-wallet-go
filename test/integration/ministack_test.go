@@ -25,10 +25,14 @@ import (
 const ministackImage = "ministackorg/ministack:1.5.27"
 
 // Test credentials (local values; the emulator does not check them, see
-// TestBrokerCredentialSeparation).
+// TestBrokerCredentialSeparation and TestConsumerCredentialSeparation).
 const (
 	publisherKey    = "wallet-publisher"
 	publisherSecret = "wallet-publisher-local-secret"
+	consumerKey     = "wallet-consumer"
+	consumerSecret  = "wallet-consumer-local-secret"
+	operatorKey     = "wallet-operator"
+	operatorSecret  = "wallet-operator-local-secret"
 	readerKey       = "test-reader"
 	readerSecret    = "test-reader-secret"
 )

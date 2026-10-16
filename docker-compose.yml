@@ -96,6 +96,11 @@ services:
       SQS_EVENTS_QUEUE: wallet-events.fifo
       SQS_PUBLISHER_ACCESS_KEY_ID: ${SQS_PUBLISHER_ACCESS_KEY_ID:-wallet-publisher}
       SQS_PUBLISHER_SECRET_ACCESS_KEY: ${SQS_PUBLISHER_SECRET_ACCESS_KEY:-wallet-publisher-local-secret}
+      # Inbound queue, its DLQ and the consumer's own credentials (§10).
+      SQS_INBOUND_QUEUE: wager-transactions.fifo
+      SQS_INBOUND_DLQ: wager-transactions-dlq.fifo
+      SQS_CONSUMER_ACCESS_KEY_ID: ${SQS_CONSUMER_ACCESS_KEY_ID:-wallet-consumer}
+      SQS_CONSUMER_SECRET_ACCESS_KEY: ${SQS_CONSUMER_SECRET_ACCESS_KEY:-wallet-consumer-local-secret}
       LOG_LEVEL: ${LOG_LEVEL:-info}
       RUN_HTTP: "true"
       RUN_CONSUMER: "true"

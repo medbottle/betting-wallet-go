@@ -14,6 +14,8 @@ func validVars() map[string]string {
 
 		"SQS_PUBLISHER_ACCESS_KEY_ID":     "publisher",
 		"SQS_PUBLISHER_SECRET_ACCESS_KEY": "publisher-secret",
+		"SQS_CONSUMER_ACCESS_KEY_ID":      "consumer",
+		"SQS_CONSUMER_SECRET_ACCESS_KEY":  "consumer-secret",
 	}
 }
 
@@ -43,6 +45,10 @@ func TestLoadFromDefaults(t *testing.T) {
 	}
 	if c.OutboxPollInterval != time.Second || c.OutboxRelayConcurrency != 1 || c.SQSEventsQueue != "wallet-events.fifo" || c.AWSRegion != "us-east-1" {
 		t.Errorf("relay defaults: %+v", c)
+	}
+	if c.SQSInboundQueue != "wager-transactions.fifo" || c.SQSInboundDLQ != "wager-transactions-dlq.fifo" || c.ConsumerWaitSeconds != 20 ||
+		c.ConsumerMaxMessages != 10 || c.ConsumerHandlerTimeout != 15*time.Second || c.ConsumerBackoffMax != time.Minute || c.ConsumerPauseInterval != time.Second {
+		t.Errorf("consumer defaults differ from ARCHITECTURE §10/§23: %+v", c)
 	}
 	if c.HTTPHandlerTimeout != 10*time.Second {
 		t.Errorf("HTTPHandlerTimeout = %v, want 10s", c.HTTPHandlerTimeout)
@@ -96,6 +102,11 @@ func TestLoadFromRejectsInvalid(t *testing.T) {
 		{"batch above 10", func(m map[string]string) { m["OUTBOX_BATCH_SIZE"] = "11" }, "OUTBOX_BATCH_SIZE"},
 		{"publish timeout not below lease", func(m map[string]string) { m["OUTBOX_PUBLISH_TIMEOUT"] = "30s" }, "OUTBOX_PUBLISH_TIMEOUT"},
 		{"zero max attempts", func(m map[string]string) { m["OUTBOX_MAX_ATTEMPTS"] = "0" }, "OUTBOX_MAX_ATTEMPTS"},
+		{"missing consumer key", func(m map[string]string) { delete(m, "SQS_CONSUMER_ACCESS_KEY_ID") }, "SQS_CONSUMER_ACCESS_KEY_ID"},
+		{"standard inbound queue", func(m map[string]string) { m["SQS_INBOUND_QUEUE"] = "wager-transactions" }, "SQS_INBOUND_QUEUE"},
+		{"wait above 20", func(m map[string]string) { m["CONSUMER_WAIT_SECONDS"] = "21" }, "CONSUMER_WAIT_SECONDS"},
+		{"zero messages", func(m map[string]string) { m["CONSUMER_MAX_MESSAGES"] = "0" }, "CONSUMER_MAX_MESSAGES"},
+		{"zero handler timeout", func(m map[string]string) { m["CONSUMER_HANDLER_TIMEOUT"] = "0s" }, "CONSUMER_HANDLER_TIMEOUT"},
 		{"zero pool size", func(m map[string]string) { m["DB_MAX_CONNS"] = "0" }, "DB_MAX_CONNS"},
 		{"bad bool", func(m map[string]string) { m["RUN_HTTP"] = "maybe" }, "RUN_HTTP"},
 		{"empty listen address", func(m map[string]string) { m["HTTP_ADDR"] = " " }, "HTTP_ADDR"},

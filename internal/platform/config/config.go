@@ -62,6 +62,19 @@ type Config struct {
 	SQSPublisherAccessKeyID     string `env:"SQS_PUBLISHER_ACCESS_KEY_ID,required,notEmpty"`
 	SQSPublisherSecretAccessKey string `env:"SQS_PUBLISHER_SECRET_ACCESS_KEY,required,notEmpty"`
 
+	// Inbound queue and the consumer's own credentials (ARCHITECTURE §10).
+	SQSInboundQueue            string `env:"SQS_INBOUND_QUEUE" envDefault:"wager-transactions.fifo"`
+	SQSInboundDLQ              string `env:"SQS_INBOUND_DLQ" envDefault:"wager-transactions-dlq.fifo"`
+	SQSConsumerAccessKeyID     string `env:"SQS_CONSUMER_ACCESS_KEY_ID,required,notEmpty"`
+	SQSConsumerSecretAccessKey string `env:"SQS_CONSUMER_SECRET_ACCESS_KEY,required,notEmpty"`
+
+	// Consumer (ARCHITECTURE §10; pause interval §23).
+	ConsumerWaitSeconds    int32         `env:"CONSUMER_WAIT_SECONDS" envDefault:"20"`
+	ConsumerMaxMessages    int32         `env:"CONSUMER_MAX_MESSAGES" envDefault:"10"`
+	ConsumerHandlerTimeout time.Duration `env:"CONSUMER_HANDLER_TIMEOUT" envDefault:"15s"`
+	ConsumerBackoffMax     time.Duration `env:"CONSUMER_BACKOFF_MAX" envDefault:"60s"`
+	ConsumerPauseInterval  time.Duration `env:"CONSUMER_PAUSE_INTERVAL" envDefault:"1s"`
+
 	// Outbox relay (ARCHITECTURE §9; poll interval and concurrency §22).
 	OutboxLease            time.Duration `env:"OUTBOX_LEASE" envDefault:"30s"`
 	OutboxBatchSize        int           `env:"OUTBOX_BATCH_SIZE" envDefault:"10"`
@@ -147,6 +160,9 @@ func (c Config) Validate() error {
 		{"OUTBOX_PUBLISH_TIMEOUT", c.OutboxPublishTimeout},
 		{"OUTBOX_BACKOFF_BASE", c.OutboxBackoffBase},
 		{"OUTBOX_POLL_INTERVAL", c.OutboxPollInterval},
+		{"CONSUMER_HANDLER_TIMEOUT", c.ConsumerHandlerTimeout},
+		{"CONSUMER_BACKOFF_MAX", c.ConsumerBackoffMax},
+		{"CONSUMER_PAUSE_INTERVAL", c.ConsumerPauseInterval},
 		{"HTTP_READ_HEADER_TIMEOUT", c.HTTPReadHeaderTimeout},
 		{"HTTP_HANDLER_TIMEOUT", c.HTTPHandlerTimeout},
 		{"READINESS_INTERVAL", c.ReadinessInterval},
@@ -170,6 +186,18 @@ func (c Config) Validate() error {
 	}
 	if !strings.HasSuffix(c.SQSEventsQueue, ".fifo") {
 		errs = append(errs, errors.New("SQS_EVENTS_QUEUE must be a FIFO queue (.fifo)"))
+	}
+	for _, q := range []struct{ name, value string }{{"SQS_INBOUND_QUEUE", c.SQSInboundQueue}, {"SQS_INBOUND_DLQ", c.SQSInboundDLQ}} {
+		if !strings.HasSuffix(q.value, ".fifo") || len(q.value) <= len(".fifo") {
+			errs = append(errs, fmt.Errorf("%s must be a FIFO queue (.fifo)", q.name))
+		}
+	}
+	// ReceiveMessage limits: wait 0-20s, 1-10 messages.
+	if c.ConsumerWaitSeconds < 0 || c.ConsumerWaitSeconds > 20 {
+		errs = append(errs, errors.New("CONSUMER_WAIT_SECONDS must be between 0 and 20"))
+	}
+	if c.ConsumerMaxMessages < 1 || c.ConsumerMaxMessages > 10 {
+		errs = append(errs, errors.New("CONSUMER_MAX_MESSAGES must be between 1 and 10"))
 	}
 	// SendMessageBatch takes at most 10 entries.
 	if c.OutboxBatchSize < 1 || c.OutboxBatchSize > 10 {

@@ -38,6 +38,8 @@ func setSQSEnv(t *testing.T, s sqsEnv) {
 	t.Setenv("SQS_EVENTS_QUEUE", s.Queue)
 	t.Setenv("SQS_PUBLISHER_ACCESS_KEY_ID", publisherKey)
 	t.Setenv("SQS_PUBLISHER_SECRET_ACCESS_KEY", publisherSecret)
+	t.Setenv("SQS_CONSUMER_ACCESS_KEY_ID", consumerKey)
+	t.Setenv("SQS_CONSUMER_SECRET_ACCESS_KEY", consumerSecret)
 }
 
 func setAppEnv(t *testing.T, databaseURL string, kc keycloakEnv) {
