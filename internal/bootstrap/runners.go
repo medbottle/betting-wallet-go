@@ -22,8 +22,8 @@ const runnersShutdownBudget = 20 * time.Second
 // runs first: readiness flips to draining, the drain delay elapses, then
 // every runner shuts down concurrently while the pool is still open.
 //
-// Start order (ARCHITECTURE §14): reference worker, then HTTP. The outbox
-// relay and the consumer join the same hook in their slices.
+// Start order (ARCHITECTURE §14): reference worker, outbox relay, then
+// HTTP. The consumer joins the same hook in its slice.
 var RunnersModule = fx.Module("runners",
 	fx.Invoke(registerRunners),
 )
@@ -54,25 +54,30 @@ type runnersParams struct {
 	Readiness       *health.Readiness
 	HTTP            *httpapi.Server
 	ReferenceWorker referenceWorker
+	OutboxRelay     outboxRelay
 }
 
 func registerRunners(p runnersParams) {
 	logger := p.Logger.With(slog.String("component", "runners"))
 	p.LC.Append(fx.Hook{
 		OnStart: func(ctx context.Context) error {
-			for _, role := range []struct {
-				name    string
-				enabled bool
-			}{
-				{"outbox_relay", p.Cfg.RunOutbox},
-				{"consumer", p.Cfg.RunConsumer},
-			} {
-				if role.enabled {
-					logger.Info("role enabled but not implemented yet", slog.String("role", role.name))
-				}
+			if p.Cfg.RunConsumer {
+				logger.Info("role enabled but not implemented yet", slog.String("role", "consumer"))
+			}
+			// stopStarted undoes a partial start: Fx does not call OnStop for
+			// a hook whose OnStart failed.
+			stopStarted := func() {
+				_ = p.ReferenceWorker.Stop(ctx)
+				_ = p.OutboxRelay.Stop(ctx)
 			}
 			if p.Cfg.RunReferenceWorker {
 				if err := p.ReferenceWorker.Start(); err != nil {
+					return err
+				}
+			}
+			if p.Cfg.RunOutbox {
+				if err := p.OutboxRelay.Start(); err != nil {
+					stopStarted()
 					return err
 				}
 			}
@@ -81,9 +86,7 @@ func registerRunners(p runnersParams) {
 				return nil
 			}
 			if err := p.HTTP.Start(ctx); err != nil {
-				// Fx does not call OnStop for a hook whose OnStart failed:
-				// stop what already started.
-				_ = p.ReferenceWorker.Stop(ctx)
+				stopStarted()
 				return err
 			}
 			return nil
@@ -108,6 +111,9 @@ func registerRunners(p runnersParams) {
 			// The worker's in-flight iteration sees a cancelled context and
 			// rolls back, releasing its claimed row (ARCHITECTURE §14).
 			g.Go(func() error { return p.ReferenceWorker.Stop(gctx) })
+			// An in-flight publish keeps its own timeout; an unmarked batch
+			// is republished after its lease (ARCHITECTURE §14).
+			g.Go(func() error { return p.OutboxRelay.Stop(gctx) })
 			err := g.Wait()
 			logger.Info("runners stopped")
 			return err

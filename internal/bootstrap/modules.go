@@ -112,8 +112,7 @@ func verifyPostgres(ctx context.Context, cfg config.Config, pool *pgxpool.Pool, 
 }
 
 // HealthModule provides the readiness tracker and runs its loop (§14
-// step 5). SQS is not checked yet; its check joins the readiness_checks
-// group in the SQS slice.
+// step 5) over the readiness_checks group: PostgreSQL and SQS.
 var HealthModule = fx.Module("health",
 	fx.Provide(newReadiness),
 	fx.Invoke(registerReadinessLoop),
@@ -127,7 +126,6 @@ type readinessParams struct {
 }
 
 func newReadiness(p readinessParams) *health.Readiness {
-	// TODO(sqs slice): add the SQS readiness check.
 	return health.NewReadiness(p.Checks, p.Cfg.ReadinessInterval, p.Cfg.ReadinessCheckTimeout, p.Logger)
 }
 
