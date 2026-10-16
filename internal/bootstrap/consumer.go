@@ -29,7 +29,8 @@ var ConsumerModule = fx.Module("consumer",
 // application.
 type consumerTransport struct{ *http.Transport }
 
-func newConsumer(cfg config.Config, svc *wagering.Service, readiness *health.Readiness, clock app.Clock, logger *slog.Logger) (*sqsconsumer.Consumer, consumerTransport) {
+func newConsumer(cfg config.Config, svc *wagering.Service, readiness *health.Readiness, clock app.Clock, logger *slog.Logger,
+	metrics app.Metrics) (*sqsconsumer.Consumer, consumerTransport) {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	// The long poll holds a request for up to CONSUMER_WAIT_SECONDS.
 	timeout := sqsHTTPTimeout + time.Duration(cfg.ConsumerWaitSeconds)*time.Second
@@ -48,7 +49,7 @@ func newConsumer(cfg config.Config, svc *wagering.Service, readiness *health.Rea
 		HandlerTimeout: cfg.ConsumerHandlerTimeout,
 		BackoffMax:     cfg.ConsumerBackoffMax,
 		PauseInterval:  cfg.ConsumerPauseInterval,
-	}, logger)
+	}, logger, metrics)
 	return c, consumerTransport{transport}
 }
 

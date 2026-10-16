@@ -66,6 +66,10 @@ type Config struct {
 	SQSPublisherAccessKeyID     string `env:"SQS_PUBLISHER_ACCESS_KEY_ID,required,notEmpty"`
 	SQSPublisherSecretAccessKey string `env:"SQS_PUBLISHER_SECRET_ACCESS_KEY,required,notEmpty"`
 
+	// MetricsAddr is the separate Prometheus listener (ARCHITECTURE §25,
+	// G2); empty disables it.
+	MetricsAddr string `env:"METRICS_ADDR" envDefault:":9090"`
+
 	// Inbound queue and the consumer's own credentials (ARCHITECTURE §10).
 	SQSInboundQueue            string `env:"SQS_INBOUND_QUEUE" envDefault:"wager-transactions.fifo"`
 	SQSInboundDLQ              string `env:"SQS_INBOUND_DLQ" envDefault:"wager-transactions-dlq.fifo"`

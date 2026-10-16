@@ -19,6 +19,7 @@ import (
 	"github.com/medbottle/betting-wallet-go/internal/platform/config"
 	"github.com/medbottle/betting-wallet-go/internal/platform/health"
 	"github.com/medbottle/betting-wallet-go/internal/platform/logging"
+	"github.com/medbottle/betting-wallet-go/internal/platform/metrics"
 	"github.com/medbottle/betting-wallet-go/migrations"
 )
 
@@ -171,6 +172,7 @@ type routerParams struct {
 	Wallets   *wallets.Service
 	IDs       app.IDGenerator
 	Logger    *slog.Logger
+	Metrics   *metrics.Registry
 }
 
 func newRouter(p routerParams) http.Handler {
@@ -182,6 +184,7 @@ func newRouter(p routerParams) http.Handler {
 		NewID:          p.IDs.NewID,
 		Logger:         p.Logger.With(slog.String("component", "http")),
 		HandlerTimeout: p.Cfg.HTTPHandlerTimeout,
+		Observer:       p.Metrics,
 	})
 }
 

@@ -53,6 +53,9 @@ func TestLoadFromDefaults(t *testing.T) {
 		c.ConsumerMaxMessages != 10 || c.ConsumerHandlerTimeout != 15*time.Second || c.ConsumerBackoffMax != time.Minute || c.ConsumerPauseInterval != time.Second {
 		t.Errorf("consumer defaults differ from ARCHITECTURE §10/§23: %+v", c)
 	}
+	if c.MetricsAddr != ":9090" {
+		t.Errorf("MetricsAddr = %q, want :9090 (ARCHITECTURE §25)", c.MetricsAddr)
+	}
 	if c.HTTPHandlerTimeout != 10*time.Second {
 		t.Errorf("HTTPHandlerTimeout = %v, want 10s", c.HTTPHandlerTimeout)
 	}

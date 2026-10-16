@@ -45,7 +45,7 @@ func relayWith(runner app.TxRunner, pub app.EventPublisher, owner string, mutate
 	for _, m := range mutate {
 		m(&cfg)
 	}
-	return messaging.NewRelay(runner, pub, clock.System{}, cfg, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	return messaging.NewRelay(runner, pub, clock.System{}, cfg, slog.New(slog.NewJSONHandler(io.Discard, nil)), nil)
 }
 
 // relayUntilIdle runs RelayOnce until a cycle finds nothing due.
@@ -199,7 +199,7 @@ func TestOutboxTwoRelaysContend(t *testing.T) {
 	t.Cleanup(pool.Close)
 	relays := []*messaging.Relay{
 		relayFor(t, env.runner, endpoint, queue, "relay-a"),
-		relayFor(t, postgres.NewTxRunner(pool, 5*time.Second, testStatementTimeout), endpoint, queue, "relay-b"),
+		relayFor(t, postgres.NewTxRunner(pool, 5*time.Second, testStatementTimeout, nil), endpoint, queue, "relay-b"),
 	}
 	var wg sync.WaitGroup
 	for _, r := range relays {

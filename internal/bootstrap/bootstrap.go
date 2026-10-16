@@ -4,8 +4,8 @@
 // Module order matters: Fx runs OnStart hooks in registration order and
 // OnStop hooks in reverse (ARCHITECTURE §14). The order below gives:
 //
-//	start: config validated -> pool ping + schema check -> JWKS fetch -> queue URLs -> readiness loop -> runners (worker, relay, consumer, HTTP)
-//	stop:  runners (drain, then parallel shutdown) -> readiness loop -> pool close
+//	start: config validated -> pool ping + schema check -> metrics listener -> JWKS fetch -> queue URLs -> readiness loop -> runners (worker, relay, consumer, HTTP)
+//	stop:  runners (drain, then parallel shutdown) -> readiness loop -> metrics listener -> pool close
 package bootstrap
 
 import (
@@ -32,6 +32,7 @@ func Options(extra ...fx.Option) fx.Option {
 		LoggingModule,
 		PostgresModule,
 		RepositoryModule,
+		MetricsModule,
 		AuthModule,
 		SQSModule,
 		ConsumerModule,

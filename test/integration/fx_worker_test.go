@@ -39,7 +39,7 @@ func TestFxReferenceWorkerResumesAfterRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(pool.Close)
-	runner := postgres.NewTxRunner(pool, 5*time.Second, testStatementTimeout)
+	runner := postgres.NewTxRunner(pool, 5*time.Second, testStatementTimeout, nil)
 	ids := idgen.UUIDv7{}.NewID
 	res, err := wager.OpenWallet(wager.OpenWalletParams{
 		WalletID: ids(), PlayerID: ids(), InitialBalance: brlAmount(t, "100.00"), CorrelationID: "c", Now: now(), NewID: ids,

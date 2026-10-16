@@ -34,11 +34,13 @@ type Relay struct {
 	clock     app.Clock
 	cfg       RelayConfig
 	logger    *slog.Logger
+	metrics   app.Metrics
 }
 
-// NewRelay wires the relay to its ports.
-func NewRelay(tx app.TxRunner, publisher app.EventPublisher, clock app.Clock, cfg RelayConfig, logger *slog.Logger) *Relay {
-	return &Relay{tx: tx, publisher: publisher, clock: clock, cfg: cfg, logger: logger}
+// NewRelay wires the relay to its ports. A nil metrics discards the
+// measurements.
+func NewRelay(tx app.TxRunner, publisher app.EventPublisher, clock app.Clock, cfg RelayConfig, logger *slog.Logger, metrics app.Metrics) *Relay {
+	return &Relay{tx: tx, publisher: publisher, clock: clock, cfg: cfg, logger: logger, metrics: app.OrNop(metrics)}
 }
 
 // RelayOnce is one relay cycle (ARCHITECTURE §9):
@@ -96,7 +98,10 @@ func (r *Relay) RelayOnce(ctx context.Context) (didWork bool, err error) {
 
 func (r *Relay) record(ctx context.Context, batch []app.OutboxRecord, results []app.PublishResult) error {
 	now := r.clock.Now()
-	return r.tx.InTx(ctx, app.TxOptions{}, func(ctx context.Context, repos app.Repos) error {
+	// Counted only once the transaction committed.
+	var parked, rescheduled int
+	err := r.tx.InTx(ctx, app.TxOptions{}, func(ctx context.Context, repos app.Repos) error {
+		parked, rescheduled = 0, 0
 		for i, rec := range batch {
 			res := results[i]
 			if res.Err == nil {
@@ -116,8 +121,7 @@ func (r *Relay) record(ctx context.Context, batch []app.OutboxRecord, results []
 				if err := repos.Outbox().Park(ctx, r.cfg.Owner, rec.EventID, lastErr); err != nil {
 					return err
 				}
-				// The outbox_parked_total metric comes with the metrics
-				// slice; until then this error log is the alert.
+				parked++
 				r.logger.Error("outbox event parked after exhausting attempts",
 					slog.String("eventId", rec.EventID.String()), slog.String("eventType", rec.EventType),
 					slog.Int("attempts", rec.Attempts), slog.Bool("senderFault", res.SenderFault), slog.String("error", lastErr))
@@ -126,9 +130,20 @@ func (r *Relay) record(ctx context.Context, batch []app.OutboxRecord, results []
 			if err := repos.Outbox().Reschedule(ctx, r.cfg.Owner, rec.EventID, r.next(now, rec.Attempts), lastErr); err != nil {
 				return err
 			}
+			rescheduled++
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	for range parked {
+		r.metrics.OutboxParked()
+	}
+	for range rescheduled {
+		r.metrics.Retry(app.RetryOutbox)
+	}
+	return nil
 }
 
 // next is now + min(base * 2^attempts, max) + jitter (ARCHITECTURE §9),

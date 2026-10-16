@@ -43,6 +43,14 @@ type Deps struct {
 	NewID          func() uuid.UUID
 	Logger         *slog.Logger
 	HandlerTimeout time.Duration
+	// Observer, when set, records each request's duration by route pattern
+	// and status code (ARCHITECTURE §25).
+	Observer RequestObserver
+}
+
+// RequestObserver records HTTP request durations.
+type RequestObserver interface {
+	ObserveHTTP(route string, code int, d time.Duration)
 }
 
 // NewRouter builds the root handler. Every route runs under the handler
@@ -74,7 +82,11 @@ func NewRouter(d Deps) http.Handler {
 	}
 
 	timeoutBody := `{"error":{"code":"TEMPORARILY_UNAVAILABLE","message":"handler timeout","retryable":true}}`
-	return withCorrelation(d.NewID, http.TimeoutHandler(mux, d.HandlerTimeout, timeoutBody))
+	var h http.Handler = mux
+	if d.Observer != nil {
+		h = observe(d.Observer, mux)
+	}
+	return withCorrelation(d.NewID, http.TimeoutHandler(h, d.HandlerTimeout, timeoutBody))
 }
 
 type handlers struct {

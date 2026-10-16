@@ -19,14 +19,16 @@ var RepositoryModule = fx.Module("repository",
 		fx.Annotate(newTxRunner, fx.As(new(app.TxRunner))),
 		// One pool-backed reader serves the pre-read, the provider registry
 		// and the GET endpoints (ARCHITECTURE §20, Q3/Q4).
-		fx.Annotate(postgres.NewReader,
-			fx.As(new(app.WalletReader)), fx.As(new(app.ProviderReader)),
-			fx.As(new(app.TransactionReader)), fx.As(new(app.LedgerReader))),
+		postgres.NewReader,
+		func(r *postgres.Reader) app.WalletReader { return r },
+		func(r *postgres.Reader) app.ProviderReader { return r },
+		func(r *postgres.Reader) app.TransactionReader { return r },
+		func(r *postgres.Reader) app.LedgerReader { return r },
 		fx.Annotate(func() clock.System { return clock.System{} }, fx.As(new(app.Clock))),
 		fx.Annotate(func() idgen.UUIDv7 { return idgen.UUIDv7{} }, fx.As(new(app.IDGenerator))),
 	),
 )
 
-func newTxRunner(pool *pgxpool.Pool, cfg config.Config) *postgres.TxRunner {
-	return postgres.NewTxRunner(pool, cfg.DBLockTimeout, cfg.DBStatementTimeout)
+func newTxRunner(pool *pgxpool.Pool, cfg config.Config, metrics app.Metrics) *postgres.TxRunner {
+	return postgres.NewTxRunner(pool, cfg.DBLockTimeout, cfg.DBStatementTimeout, metrics)
 }

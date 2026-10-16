@@ -77,7 +77,8 @@ var OutboxRelayModule = fx.Module("outbox_relay",
 	fx.Provide(newRelay, newOutboxRelay),
 )
 
-func newRelay(cfg config.Config, tx app.TxRunner, publisher app.EventPublisher, clock app.Clock, ids app.IDGenerator, logger *slog.Logger) *messaging.Relay {
+func newRelay(cfg config.Config, tx app.TxRunner, publisher app.EventPublisher, clock app.Clock, ids app.IDGenerator, logger *slog.Logger,
+	metrics app.Metrics) *messaging.Relay {
 	host, err := os.Hostname()
 	if err != nil || host == "" {
 		host = "unknown-host"
@@ -91,7 +92,7 @@ func newRelay(cfg config.Config, tx app.TxRunner, publisher app.EventPublisher, 
 		BackoffBase:    cfg.OutboxBackoffBase,
 		BackoffMax:     cfg.OutboxBackoffMax,
 		MaxAttempts:    cfg.OutboxMaxAttempts,
-	}, logger.With(slog.String("component", "outbox_relay")))
+	}, logger.With(slog.String("component", "outbox_relay")), metrics)
 }
 
 // outboxRelay names the relay's runner in the graph.

@@ -11,8 +11,8 @@ import (
 	"github.com/medbottle/betting-wallet-go/internal/platform/config"
 )
 
-// AppModule provides the use cases. HTTP uses them now; the SQS consumer
-// and the reference worker will share SubmitWagerTransaction.
+// AppModule provides the use cases, shared by HTTP, the SQS consumer and
+// the reference worker.
 var AppModule = fx.Module("app",
 	fx.Provide(
 		newWageringService,
@@ -21,14 +21,14 @@ var AppModule = fx.Module("app",
 )
 
 func newWageringService(cfg config.Config, tx app.TxRunner, walletReader app.WalletReader, providers app.ProviderReader,
-	transactions app.TransactionReader, clock app.Clock, ids app.IDGenerator, logger *slog.Logger) *wagering.Service {
+	transactions app.TransactionReader, clock app.Clock, ids app.IDGenerator, logger *slog.Logger, metrics app.Metrics) *wagering.Service {
 	return wagering.NewService(tx, walletReader, providers, transactions, clock, ids, wagering.Config{
 		ReferenceTTL: cfg.ReferenceTTL,
 		Backoff:      wagering.Backoff{Base: cfg.ReferenceBackoffBase, Max: cfg.ReferenceBackoffMax},
-	}, logger.With(slog.String("component", "wagering")))
+	}, logger.With(slog.String("component", "wagering")), metrics)
 }
 
 func newWalletService(tx app.TxRunner, walletReader app.WalletReader, ledger app.LedgerReader, clock app.Clock,
-	ids app.IDGenerator, logger *slog.Logger) *wallets.Service {
-	return wallets.NewService(tx, walletReader, ledger, clock, ids, logger.With(slog.String("component", "wallets")))
+	ids app.IDGenerator, logger *slog.Logger, metrics app.Metrics) *wallets.Service {
+	return wallets.NewService(tx, walletReader, ledger, clock, ids, logger.With(slog.String("component", "wallets")), metrics)
 }

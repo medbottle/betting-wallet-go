@@ -33,12 +33,15 @@ type Service struct {
 	ids          app.IDGenerator
 	cfg          Config
 	logger       *slog.Logger
+	metrics      app.Metrics
 }
 
-// NewService wires the use cases to their ports.
+// NewService wires the use cases to their ports. A nil metrics discards
+// the measurements.
 func NewService(tx app.TxRunner, wallets app.WalletReader, providers app.ProviderReader, transactions app.TransactionReader,
-	clock app.Clock, ids app.IDGenerator, cfg Config, logger *slog.Logger) *Service {
-	return &Service{tx: tx, wallets: wallets, providers: providers, transactions: transactions, clock: clock, ids: ids, cfg: cfg, logger: logger}
+	clock app.Clock, ids app.IDGenerator, cfg Config, logger *slog.Logger, metrics app.Metrics) *Service {
+	return &Service{tx: tx, wallets: wallets, providers: providers, transactions: transactions, clock: clock, ids: ids, cfg: cfg,
+		logger: logger, metrics: app.OrNop(metrics)}
 }
 
 // SubmitCommand is one external operation as received by a transport.
@@ -84,7 +87,38 @@ type SubmitResult struct {
 // app.ErrInboxHashMismatch, app.ErrTransient (rolled back, retry). An invariant violation rolls back
 // and is recorded as FAILED in a separate transaction (§5); the FAILED
 // transaction is then the result.
-func (s *Service) Submit(ctx context.Context, cmd SubmitCommand) (SubmitResult, error) {
+func (s *Service) Submit(ctx context.Context, cmd SubmitCommand) (res SubmitResult, err error) {
+	start := time.Now()
+	defer func() { s.observe(cmd, res, err, time.Since(start)) }()
+	return s.submit(ctx, cmd)
+}
+
+// observe records the outcome of one submission (ARCHITECTURE §25): a new
+// state, a replay or duplicate, or a conflict, and the duration.
+func (s *Service) observe(cmd SubmitCommand, res SubmitResult, err error, d time.Duration) {
+	transport := app.TransportHTTP
+	if cmd.Inbox != nil {
+		transport = app.TransportSQS
+	}
+	outcome := "error"
+	var ce *wager.ConflictError
+	switch {
+	case err == nil && res.Duplicate:
+		outcome = "replay"
+		s.metrics.Duplicate(transport, app.DuplicateInboxMessage)
+	case err == nil && res.Replay:
+		outcome = "replay"
+		s.metrics.Duplicate(transport, app.DuplicateIdempotentReplay)
+	case err == nil:
+		outcome = string(res.Transaction.Status())
+		s.metrics.TransactionOutcome(transport, res.Transaction.Status(), res.Transaction.FailureCode())
+	case errors.As(err, &ce):
+		s.metrics.Conflict(ce.Code)
+	}
+	s.metrics.ProcessingDuration(transport, outcome, d)
+}
+
+func (s *Service) submit(ctx context.Context, cmd SubmitCommand) (SubmitResult, error) {
 	req, err := wager.NewRequest(cmd.Raw)
 	if err != nil {
 		return SubmitResult{}, err

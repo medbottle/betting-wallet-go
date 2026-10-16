@@ -26,6 +26,7 @@ import (
 	"github.com/medbottle/betting-wallet-go/internal/domain/wallet"
 	"github.com/medbottle/betting-wallet-go/internal/platform/clock"
 	"github.com/medbottle/betting-wallet-go/internal/platform/idgen"
+	"github.com/medbottle/betting-wallet-go/internal/platform/metrics"
 )
 
 // apiEnv is the real HTTP stack: router, middleware, use cases and the
@@ -36,6 +37,7 @@ type apiEnv struct {
 	tokens   map[string]string
 	wagering *wagering.Service
 	logger   *slog.Logger
+	metrics  *metrics.Registry
 }
 
 type apiOption func(*apiConfig)
@@ -74,8 +76,9 @@ func newAPIEnv(t *testing.T, opts ...apiOption) apiEnv {
 	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
 	reader := postgres.NewReader(repo.db.app)
 	ids := idgen.UUIDv7{}
-	wag := wagering.NewService(runner, reader, reader, reader, clock.System{}, ids, cfg.reference, logger)
-	wal := wallets.NewService(runner, reader, reader, clock.System{}, ids, logger)
+	reg := metrics.New()
+	wag := wagering.NewService(runner, reader, reader, reader, clock.System{}, ids, cfg.reference, logger, reg)
+	wal := wallets.NewService(runner, reader, reader, clock.System{}, ids, logger, reg)
 	router := httpapi.NewRouter(httpapi.Deps{
 		Verifier:       newKeycloakVerifier(t, kc, kc.Issuer, "wallet-api", nil),
 		Wagering:       wag,
@@ -83,6 +86,7 @@ func newAPIEnv(t *testing.T, opts ...apiOption) apiEnv {
 		NewID:          ids.NewID,
 		Logger:         logger,
 		HandlerTimeout: 15 * time.Second,
+		Observer:       reg,
 	})
 	srv := httptest.NewServer(router)
 	t.Cleanup(srv.Close)
@@ -90,7 +94,7 @@ func newAPIEnv(t *testing.T, opts ...apiOption) apiEnv {
 	for id := range clientSecrets {
 		tokens[id] = mustToken(t, kc, id)
 	}
-	return apiEnv{repo: repo, srv: srv, tokens: tokens, wagering: wag, logger: logger}
+	return apiEnv{repo: repo, srv: srv, tokens: tokens, wagering: wag, logger: logger, metrics: reg}
 }
 
 // response is a decoded API answer.

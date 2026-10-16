@@ -40,7 +40,7 @@ func newRepoEnv(t *testing.T) repoEnv {
 	gen := idgen.UUIDv7{}
 	return repoEnv{
 		db:     db,
-		runner: postgres.NewTxRunner(db.app, 5*time.Second, testStatementTimeout),
+		runner: postgres.NewTxRunner(db.app, 5*time.Second, testStatementTimeout, nil),
 		reader: postgres.NewReader(db.app),
 		ids:    gen.NewID,
 	}

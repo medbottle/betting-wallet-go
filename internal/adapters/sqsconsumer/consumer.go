@@ -92,6 +92,7 @@ type Consumer struct {
 	clock     app.Clock
 	cfg       Config
 	logger    *slog.Logger
+	metrics   app.Metrics
 
 	queueURL, dlqURL string
 
@@ -103,10 +104,11 @@ type Consumer struct {
 	handled, duplicates, deadLettered, retried, released atomic.Int64
 }
 
-// New returns an unstarted consumer; call Resolve before Start.
-func New(api API, submitter Submitter, readiness Readiness, clock app.Clock, cfg Config, logger *slog.Logger) *Consumer {
+// New returns an unstarted consumer; call Resolve before Start. A nil
+// metrics discards the measurements.
+func New(api API, submitter Submitter, readiness Readiness, clock app.Clock, cfg Config, logger *slog.Logger, metrics app.Metrics) *Consumer {
 	return &Consumer{api: api, submitter: submitter, readiness: readiness, clock: clock, cfg: cfg,
-		logger: logger.With(slog.String("component", "consumer"))}
+		logger: logger.With(slog.String("component", "consumer")), metrics: app.OrNop(metrics)}
 }
 
 // Resolve looks both queue URLs up (ARCHITECTURE §14 step 4).
@@ -354,10 +356,12 @@ func (c *Consumer) deadLetterCode(m types.Message, envID string, code wager.Fail
 	if err != nil {
 		log.Error("dead-letter send failed, message left for redelivery", slog.String("failureCode", string(code)), slog.String("error", err.Error()))
 		c.retried.Add(1)
+		c.metrics.Retry(app.RetryConsumer)
 		c.setVisibility(m, c.backoff(m), log)
 		return false
 	}
 	c.deadLettered.Add(1)
+	c.metrics.DeadLettered(code)
 	log.Warn("message sent to the DLQ", slog.String("failureCode", string(code)), slog.String("error", cause.Error()))
 	c.delete(m, log)
 	return true
@@ -370,6 +374,7 @@ func (c *Consumer) deadLetterCode(m types.Message, envID string, code wager.Fail
 // immediate readiness check, which pauses polling if it fails.
 func (c *Consumer) retry(stop context.Context, m types.Message, err error, log *slog.Logger) {
 	c.retried.Add(1)
+	c.metrics.Retry(app.RetryConsumer)
 	visibility := c.backoff(m)
 	if stop.Err() != nil {
 		visibility = 0

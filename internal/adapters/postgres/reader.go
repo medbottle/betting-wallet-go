@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -25,6 +26,23 @@ var (
 	_ app.TransactionReader = (*Reader)(nil)
 	_ app.LedgerReader      = (*Reader)(nil)
 )
+
+// OutboxBacklog counts the unpublished, unparked outbox rows and returns
+// the oldest occurred_at (zero when none), for the outbox lag gauges
+// (ARCHITECTURE §9, §25). The filter matches the partial index of §9.
+func (r *Reader) OutboxBacklog(ctx context.Context) (int64, time.Time, error) {
+	var count int64
+	var oldest *time.Time
+	err := r.pool.QueryRow(ctx, `SELECT count(*), min(occurred_at) FROM outbox_events
+		WHERE published_at IS NULL AND parked_at IS NULL`).Scan(&count, &oldest)
+	if err != nil {
+		return 0, time.Time{}, classify(err)
+	}
+	if oldest == nil {
+		return count, time.Time{}, nil
+	}
+	return count, *oldest, nil
+}
 
 // NewReader returns a reader on pool.
 func NewReader(pool *pgxpool.Pool) *Reader { return &Reader{pool: pool} }

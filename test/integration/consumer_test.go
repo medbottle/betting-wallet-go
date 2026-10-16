@@ -153,6 +153,7 @@ type consumerOpts struct {
 	readiness  sqsconsumer.Readiness
 	api        sqsconsumer.API
 	backoffMax time.Duration
+	metrics    app.Metrics
 }
 
 // startConsumer runs a consumer on q until the test ends (or until the
@@ -162,7 +163,7 @@ func startConsumer(t *testing.T, e apiEnv, q inboundQueues, opts consumerOpts) (
 	svc := e.wagering
 	if opts.runner != nil {
 		svc = wagering.NewService(opts.runner, e.repo.reader, e.repo.reader, e.repo.reader, clock.System{}, idgen.UUIDv7{},
-			wagering.Config{ReferenceTTL: refTTL, Backoff: wagering.Backoff{Base: testBackoffBase, Max: testBackoffMax}}, e.logger)
+			wagering.Config{ReferenceTTL: refTTL, Backoff: wagering.Backoff{Base: testBackoffBase, Max: testBackoffMax}}, e.logger, opts.metrics)
 	}
 	if opts.readiness == nil {
 		opts.readiness = readyGate()
@@ -176,7 +177,7 @@ func startConsumer(t *testing.T, e apiEnv, q inboundQueues, opts consumerOpts) (
 	c := sqsconsumer.New(opts.api, svc, opts.readiness, clock.System{}, sqsconsumer.Config{
 		Queue: q.queue, DLQ: q.dlq, WaitSeconds: 1, MaxMessages: 10,
 		HandlerTimeout: 15 * time.Second, BackoffMax: opts.backoffMax, PauseInterval: 50 * time.Millisecond,
-	}, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	}, slog.New(slog.NewJSONHandler(io.Discard, nil)), opts.metrics)
 	if err := c.Resolve(ctxT(t)); err != nil {
 		t.Fatal(err)
 	}

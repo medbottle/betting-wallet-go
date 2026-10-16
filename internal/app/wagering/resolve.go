@@ -32,6 +32,13 @@ const ResolveIterationTimeout = 10 * time.Second
 // separate transaction (ARCHITECTURE §5), so a broken row cannot be retried
 // forever.
 func (s *Service) ResolveNext(ctx context.Context) (didWork bool, err error) {
+	start := time.Now()
+	outcome := "error"
+	defer func() {
+		if didWork {
+			s.metrics.ProcessingDuration(app.TransportWorker, outcome, time.Since(start))
+		}
+	}()
 	ctx, cancel := context.WithTimeout(ctx, ResolveIterationTimeout)
 	defer cancel()
 	opts := app.TxOptions{StatementTimeout: ResolveIterationTimeout}
@@ -79,11 +86,21 @@ func (s *Service) ResolveNext(ctx context.Context) (didWork bool, err error) {
 		return false, nil
 	case err == nil:
 		s.logResolved(res)
+		outcome = string(res.Status())
+		if res.Status() == wager.StatusPendingReference {
+			s.metrics.Retry(app.RetryReferenceWorker)
+		} else {
+			s.metrics.TransactionOutcome(app.TransportWorker, res.Status(), res.FailureCode())
+		}
 		return true, nil
 	case claimed == uuid.Nil, errors.Is(err, app.ErrTransient), ctx.Err() != nil:
 		return claimed != uuid.Nil, err
 	default:
-		return true, s.failClaimed(ctx, claimed, err)
+		if ferr := s.failClaimed(ctx, claimed, err); ferr != nil {
+			return true, ferr
+		}
+		outcome = string(wager.StatusFailed)
+		return true, nil
 	}
 }
 
@@ -99,6 +116,7 @@ func lookupReferenceOf(ctx context.Context, r app.Repos, t *wager.WagerTransacti
 func (s *Service) failClaimed(ctx context.Context, id uuid.UUID, cause error) error {
 	s.logger.Error("reference resolution failed permanently, recording FAILED",
 		slog.String("transactionId", id.String()), slog.String("error", cause.Error()))
+	failed := false
 	err := s.tx.InTx(ctx, app.TxOptions{StatementTimeout: ResolveIterationTimeout}, func(ctx context.Context, r app.Repos) error {
 		t, err := r.Transactions().GetForUpdate(ctx, id)
 		if errors.Is(err, app.ErrNotFound) {
@@ -113,10 +131,14 @@ func (s *Service) failClaimed(ctx context.Context, id uuid.UUID, cause error) er
 		if err := t.Fail(wager.CodeInternalInvariantViolation, s.clock.Now()); err != nil {
 			return err
 		}
+		failed = true
 		return r.Transactions().Update(ctx, t)
 	})
 	if err != nil {
 		return fmt.Errorf("recording FAILED for %s: %w (original: %w)", id, err, cause)
+	}
+	if failed {
+		s.metrics.TransactionOutcome(app.TransportWorker, wager.StatusFailed, wager.CodeInternalInvariantViolation)
 	}
 	return nil
 }

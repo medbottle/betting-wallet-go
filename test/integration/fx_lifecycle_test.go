@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"strings"
 	"testing"
@@ -48,6 +50,7 @@ func setAppEnv(t *testing.T, databaseURL string, kc keycloakEnv) {
 	t.Setenv("OIDC_ISSUER", kc.Issuer)
 	t.Setenv("OIDC_JWKS_URL", kc.JWKSURL)
 	t.Setenv("HTTP_ADDR", "127.0.0.1:0")
+	t.Setenv("METRICS_ADDR", "") // tests that need it pick a free port
 	t.Setenv("READINESS_INTERVAL", "200ms")
 	t.Setenv("READINESS_CHECK_TIMEOUT", "200ms")
 	t.Setenv("READINESS_DRAIN_DELAY", "1s")
@@ -126,6 +129,8 @@ func TestFxLifecycle(t *testing.T) {
 	migrateUp(t, urls.owner)
 	setAppEnv(t, urls.app, startKeycloak(t))
 	setSQSEnv(t, sqsEnv{Endpoint: startMiniStack(t), Queue: "wallet-events.fifo"})
+	metricsAddr := freeAddr(t)
+	t.Setenv("METRICS_ADDR", metricsAddr)
 
 	// Snapshot after the container is up so testcontainers' own goroutines
 	// are not reported.
@@ -154,6 +159,18 @@ func TestFxLifecycle(t *testing.T) {
 		return code == http.StatusOK && status == "ready"
 	})
 
+	// The metrics listener serves the Prometheus exposition (ARCHITECTURE §25).
+	resp, err := client.Get("http://" + metricsAddr + "/metrics")
+	if err != nil {
+		t.Fatalf("metrics: %v", err)
+	}
+	exposition, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(exposition), "outbox_lag_seconds") ||
+		!strings.Contains(string(exposition), "go_goroutines") {
+		t.Fatalf("metrics: %d %.300s", resp.StatusCode, exposition)
+	}
+
 	stopErr := make(chan error, 1)
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), bootstrap.StopTimeout)
@@ -179,8 +196,24 @@ func TestFxLifecycle(t *testing.T) {
 	if _, err := client.Get(base + "/health/live"); err == nil {
 		t.Fatal("server still accepting connections after stop")
 	}
+	if _, err := client.Get("http://" + metricsAddr + "/metrics"); err == nil {
+		t.Fatal("metrics listener still accepting connections after stop")
+	}
 	client.CloseIdleConnections()
 	goleak.VerifyNone(t, leaks)
+}
+
+// freeAddr returns a loopback address with a port that was free a moment
+// ago.
+func freeAddr(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	ln.Close()
+	return addr
 }
 
 func migrateUp(t *testing.T, ownerURL string) {

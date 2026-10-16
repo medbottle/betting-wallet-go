@@ -2,11 +2,13 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/medbottle/betting-wallet-go/internal/app"
@@ -21,20 +23,24 @@ type TxRunner struct {
 	pool             *pgxpool.Pool
 	lockTimeout      time.Duration
 	statementTimeout time.Duration
+	metrics          app.Metrics
 }
 
 var _ app.TxRunner = (*TxRunner)(nil)
 
 // NewTxRunner returns a runner whose transactions use lockTimeout and
 // statementTimeout unless TxOptions overrides them (ARCHITECTURE §4, §24).
-func NewTxRunner(pool *pgxpool.Pool, lockTimeout, statementTimeout time.Duration) *TxRunner {
-	return &TxRunner{pool: pool, lockTimeout: lockTimeout, statementTimeout: statementTimeout}
+// Rollbacks caused by a concurrency or timeout SQLSTATE are counted on
+// metrics (nil discards them).
+func NewTxRunner(pool *pgxpool.Pool, lockTimeout, statementTimeout time.Duration, metrics app.Metrics) *TxRunner {
+	return &TxRunner{pool: pool, lockTimeout: lockTimeout, statementTimeout: statementTimeout, metrics: app.OrNop(metrics)}
 }
 
 // InTx implements app.TxRunner. It does not retry: a transient error rolls
 // back and is returned as app.ErrTransient, and the transport retries (HTTP
 // 503, SQS redelivery; ARCHITECTURE §5).
 func (r *TxRunner) InTx(ctx context.Context, opts app.TxOptions, fn func(ctx context.Context, repos app.Repos) error) (err error) {
+	defer func() { r.observe(err) }()
 	txOpts := pgx.TxOptions{IsoLevel: pgx.ReadCommitted, AccessMode: pgx.ReadWrite}
 	if opts.Isolation == app.RepeatableReadReadOnly {
 		txOpts = pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly}
@@ -85,6 +91,14 @@ func (r *TxRunner) InTx(ctx context.Context, opts app.TxOptions, fn func(ctx con
 	}
 	done = true
 	return nil
+}
+
+// observe counts a transaction lost to a concurrency or timeout SQLSTATE.
+func (r *TxRunner) observe(err error) {
+	var pgErr *pgconn.PgError
+	if err != nil && errors.As(err, &pgErr) && transientCodes[pgErr.Code] {
+		r.metrics.DBConflict(pgErr.Code)
+	}
 }
 
 // setLocal applies a timeout for the current transaction. SET does not take

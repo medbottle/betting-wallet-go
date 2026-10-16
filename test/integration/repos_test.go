@@ -80,7 +80,7 @@ func TestTxRunner(t *testing.T) {
 		holdTx(t, env.db.app, `SELECT 1 FROM wallets WHERE id = $1 FOR NO KEY UPDATE`, w.ID())
 		// Lock timeout well above the runner's statement timeout: the wait
 		// is cut by statement_timeout (57014), not lock_timeout (55P03).
-		runner := postgres.NewTxRunner(env.db.app, 5*time.Second, 300*time.Millisecond)
+		runner := postgres.NewTxRunner(env.db.app, 5*time.Second, 300*time.Millisecond, nil)
 		start := time.Now()
 		err := runner.InTx(ctxT(t), app.TxOptions{}, func(ctx context.Context, r app.Repos) error {
 			_, err := r.Wallets().GetForUpdate(ctx, w.ID())

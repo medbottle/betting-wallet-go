@@ -170,6 +170,31 @@ func (r *fakeReadiness) set(ready bool) {
 	r.mu.Unlock()
 }
 
+// countingMetrics records the consumer's retries and DLQ sends.
+type countingMetrics struct {
+	app.NopMetrics
+	mu      sync.Mutex
+	retries int
+	dlq     map[wager.FailureCode]int
+}
+
+func (m *countingMetrics) Retry(component string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if component == app.RetryConsumer {
+		m.retries++
+	}
+}
+
+func (m *countingMetrics) DeadLettered(code wager.FailureCode) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.dlq == nil {
+		m.dlq = map[wager.FailureCode]int{}
+	}
+	m.dlq[code]++
+}
+
 type fixedClock struct{}
 
 func (fixedClock) Now() time.Time { return time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC) }
@@ -189,13 +214,18 @@ func rawMsg(handle, body, group string, receiveCount int) types.Message {
 
 func newTestConsumer(t *testing.T, api *fakeSQS, sub *fakeSubmitter, ready *fakeReadiness) *Consumer {
 	t.Helper()
+	return newTestConsumerWith(t, api, sub, ready, nil)
+}
+
+func newTestConsumerWith(t *testing.T, api *fakeSQS, sub *fakeSubmitter, ready *fakeReadiness, m app.Metrics) *Consumer {
+	t.Helper()
 	if sub.results == nil {
 		sub.results = map[string]error{}
 	}
 	c := New(api, sub, ready, fixedClock{}, Config{
 		Queue: "in.fifo", DLQ: "dlq.fifo", WaitSeconds: 20, MaxMessages: 10,
 		HandlerTimeout: 2 * time.Second, BackoffMax: time.Minute, PauseInterval: 5 * time.Millisecond,
-	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)), m)
 	if err := c.Resolve(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -240,8 +270,12 @@ func TestOutcomes(t *testing.T) {
 		},
 		dups: map[string]bool{"dup": true},
 	}
-	c := newTestConsumer(t, api, sub, &fakeReadiness{ready: true})
+	m := &countingMetrics{}
+	c := newTestConsumerWith(t, api, sub, &fakeReadiness{ready: true}, m)
 	runUntil(t, c, func() bool { d, _, _ := api.snapshot(); return len(d) == 7 })
+	if m.dlq[wager.CodeInvalidRequest] != 2 || m.dlq[wager.CodeInvalidAmountForKind] != 1 || m.dlq["FORBIDDEN"] != 1 || m.retries != 0 {
+		t.Errorf("metrics: dlq %v, retries %d", m.dlq, m.retries)
+	}
 
 	_, vis, sent := api.snapshot()
 	if len(vis) != 0 {
@@ -306,8 +340,12 @@ func TestTransientBackoffAndGroupRelease(t *testing.T) {
 	})
 	ready := &fakeReadiness{ready: true}
 	sub := &fakeSubmitter{results: map[string]error{"b": fmt.Errorf("%w: lock timeout", app.ErrTransient)}}
-	c := newTestConsumer(t, api, sub, ready)
+	m := &countingMetrics{}
+	c := newTestConsumerWith(t, api, sub, ready, m)
 	runUntil(t, c, func() bool { d, v, _ := api.snapshot(); return len(d) == 3 && len(v) == 3 })
+	if m.retries != 1 {
+		t.Errorf("retries metric = %d, want 1 (released messages are not retries)", m.retries)
+	}
 
 	d, v, _ := api.snapshot()
 	sort.Strings(d)
@@ -426,7 +464,7 @@ func TestStopFinishesInFlightAndReleasesTheRest(t *testing.T) {
 
 func TestStartRequiresResolve(t *testing.T) {
 	c := New(newFakeSQS(), &fakeSubmitter{}, &fakeReadiness{}, fixedClock{}, Config{HandlerTimeout: time.Second, PauseInterval: time.Second, MaxMessages: 1},
-		slog.New(slog.NewTextHandler(io.Discard, nil)))
+		slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
 	if err := c.Start(); err == nil {
 		t.Fatal("started without queue URLs")
 	}

@@ -169,8 +169,8 @@ func TestWorkerContention(t *testing.T) {
 	}
 	t.Cleanup(pool.Close)
 	reader := postgres.NewReader(pool)
-	other := wagering.NewService(postgres.NewTxRunner(pool, 5*time.Second, testStatementTimeout), reader, reader, reader, clock.System{}, idgen.UUIDv7{},
-		wagering.Config{ReferenceTTL: 10 * time.Minute, Backoff: wagering.Backoff{Base: testBackoffBase, Max: testBackoffMax}}, e.logger)
+	other := wagering.NewService(postgres.NewTxRunner(pool, 5*time.Second, testStatementTimeout, nil), reader, reader, reader, clock.System{}, idgen.UUIDv7{},
+		wagering.Config{ReferenceTTL: 10 * time.Minute, Backoff: wagering.Backoff{Base: testBackoffBase, Max: testBackoffMax}}, e.logger, nil)
 
 	const n = 20
 	wallets := make([]apiWallet, n)

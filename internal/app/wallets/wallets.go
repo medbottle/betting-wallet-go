@@ -33,11 +33,14 @@ type Service struct {
 	clock   app.Clock
 	ids     app.IDGenerator
 	logger  *slog.Logger
+	metrics app.Metrics
 }
 
-// NewService wires the use cases to their ports.
-func NewService(tx app.TxRunner, wallets app.WalletReader, ledger app.LedgerReader, clock app.Clock, ids app.IDGenerator, logger *slog.Logger) *Service {
-	return &Service{tx: tx, wallets: wallets, ledger: ledger, clock: clock, ids: ids, logger: logger}
+// NewService wires the use cases to their ports. A nil metrics discards
+// the measurements.
+func NewService(tx app.TxRunner, wallets app.WalletReader, ledger app.LedgerReader, clock app.Clock, ids app.IDGenerator, logger *slog.Logger,
+	metrics app.Metrics) *Service {
+	return &Service{tx: tx, wallets: wallets, ledger: ledger, clock: clock, ids: ids, logger: logger, metrics: app.OrNop(metrics)}
 }
 
 // OpenCommand is POST /wallets, as received.
@@ -83,6 +86,7 @@ func (s *Service) Open(ctx context.Context, cmd OpenCommand) (*wallet.Wallet, er
 		return r.Outbox().Insert(ctx, res.Events...)
 	})
 	if errors.Is(err, app.ErrWalletAlreadyExists) {
+		s.metrics.Conflict(wager.CodeWalletAlreadyExists)
 		return nil, &wager.ConflictError{Code: wager.CodeWalletAlreadyExists, Msg: "the player already has a wallet in this currency"}
 	}
 	if err != nil {
@@ -200,6 +204,7 @@ func (s *Service) Reconcile(ctx context.Context, walletID uuid.UUID, correlation
 		return Reconciliation{}, err
 	}
 	if !rec.Consistent {
+		s.metrics.ReconciliationDivergence()
 		s.logger.Error("reconciliation divergence",
 			slog.String("walletId", walletID.String()), slog.String("correlationId", correlationID),
 			slog.String("storedBalance", rec.StoredBalance.String()), slog.String("calculatedBalance", rec.CalculatedBalance.String()),
