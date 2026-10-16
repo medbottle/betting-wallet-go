@@ -41,6 +41,12 @@ type Config struct {
 	// triggered by an unknown kid (rate limit, ARCHITECTURE §11/§19).
 	OIDCJWKSMinRefreshInterval time.Duration `env:"OIDC_JWKS_MIN_REFRESH_INTERVAL" envDefault:"30s"`
 
+	// Reference resolution (ARCHITECTURE §8): deadline = created_at + TTL;
+	// retries back off as min(base * 2^attempts, max) with full jitter.
+	ReferenceTTL         time.Duration `env:"REFERENCE_TTL" envDefault:"10m"`
+	ReferenceBackoffBase time.Duration `env:"REFERENCE_BACKOFF_BASE" envDefault:"1s"`
+	ReferenceBackoffMax  time.Duration `env:"REFERENCE_BACKOFF_MAX" envDefault:"60s"`
+
 	// HTTPAddr is the listen address of the HTTP server.
 	HTTPAddr string `env:"HTTP_ADDR" envDefault:":8081"`
 	// HTTPReadHeaderTimeout bounds reading request headers.
@@ -108,6 +114,9 @@ func (c Config) Validate() error {
 		{"DB_STARTUP_TIMEOUT", c.DBStartupTimeout},
 		{"DB_LOCK_TIMEOUT", c.DBLockTimeout},
 		{"OIDC_JWKS_MIN_REFRESH_INTERVAL", c.OIDCJWKSMinRefreshInterval},
+		{"REFERENCE_TTL", c.ReferenceTTL},
+		{"REFERENCE_BACKOFF_BASE", c.ReferenceBackoffBase},
+		{"REFERENCE_BACKOFF_MAX", c.ReferenceBackoffMax},
 		{"HTTP_READ_HEADER_TIMEOUT", c.HTTPReadHeaderTimeout},
 		{"HTTP_HANDLER_TIMEOUT", c.HTTPHandlerTimeout},
 		{"READINESS_INTERVAL", c.ReadinessInterval},
@@ -120,6 +129,9 @@ func (c Config) Validate() error {
 	}
 	if c.ReadinessDrainDelay < 0 {
 		errs = append(errs, errors.New("READINESS_DRAIN_DELAY must be >= 0"))
+	}
+	if c.ReferenceBackoffBase > c.ReferenceBackoffMax {
+		errs = append(errs, errors.New("REFERENCE_BACKOFF_BASE must be <= REFERENCE_BACKOFF_MAX"))
 	}
 	if c.ReadinessCheckTimeout > c.ReadinessInterval {
 		errs = append(errs, errors.New("READINESS_CHECK_TIMEOUT must be <= READINESS_INTERVAL"))
