@@ -4,11 +4,11 @@ Distributed processing of bets and wallet movements in Go (Uber Fx, PostgreSQL,
 SQS, Keycloak). Spec: [docs/CHALLENGE.md](docs/CHALLENGE.md). Design decisions:
 [ARCHITECTURE.md](ARCHITECTURE.md).
 
-> **Status: slice 4 (persistence adapter).** Infrastructure, health
-> endpoints, migrations, the full schema, the pure-Go domain and the pgx
-> persistence adapter (transaction runner, repositories, error
-> classification) exist. There are no use cases, business API, auth or SQS
-> consumer yet. Points the documents leave open are tracked in
+> **Status: slice 5 (authentication).** Infrastructure, health endpoints,
+> migrations, the full schema, the pure-Go domain, the persistence adapter and
+> authentication (Keycloak realm, OIDC token verification, authorization
+> rules, bearer middleware) exist. There are no business endpoints, use cases
+> or SQS consumer yet. Points the documents leave open are tracked in
 > [docs/OPEN-QUESTIONS.md](docs/OPEN-QUESTIONS.md).
 
 ## Prerequisites
@@ -67,11 +67,28 @@ To list them from the host (any AWS CLI, with dummy credentials):
 AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test aws --endpoint-url http://localhost:4566 --region us-east-1 sqs list-queues
 ```
 
-### Keycloak
+### Keycloak and test identities
 
-Keycloak only starts in this slice, with admin `admin`/`admin` at
-http://localhost:8080. The `wagering` realm, its clients and the test identities
-are provisioned in the auth slice.
+Keycloak (admin console `admin`/`admin` at http://localhost:8080) imports the
+`wagering` realm from `deploy/keycloak/realm-wagering.json` on start. Every
+token has `iss=http://localhost:8080/realms/wagering` and `aud=wallet-api`.
+
+| Client (`client_credentials`) | Secret (local test value) | Role | `provider_id` claim |
+| --- | --- | --- | --- |
+| `provider-a` | `provider-a-local-secret` | `provider` | `provider-a` |
+| `provider-b` | `provider-b-local-secret` | `provider` | `provider-b` |
+| `wallet-internal` | `wallet-internal-local-secret` | `wallet-internal` | — |
+
+Get a token:
+
+```sh
+curl -s -d grant_type=client_credentials -d client_id=provider-a -d client_secret=provider-a-local-secret http://localhost:8080/realms/wagering/protocol/openid-connect/token
+```
+
+Send it as `Authorization: Bearer <access_token>`. Business endpoints answer
+401 with `WWW-Authenticate: Bearer error="invalid_token"` when the token is
+missing, invalid or expired. The providerId a provider may act for comes only
+from the `provider_id` claim. `/health/*` needs no token.
 
 ## Environment variables
 
@@ -84,6 +101,10 @@ are provisioned in the auth slice.
 | `DB_MAX_CONNS` | `10` | app | pgxpool size |
 | `DB_STARTUP_TIMEOUT` | `10s` | app | bound on the startup ping and schema check |
 | `DB_LOCK_TIMEOUT` | `5s` | app | default `lock_timeout` of business transactions (ARCHITECTURE §4) |
+| `OIDC_ISSUER` | — (required) | app | exact expected `iss` |
+| `OIDC_JWKS_URL` | — (required) | app | JWKS endpoint (inside compose: `http://keycloak:8080/...`) |
+| `OIDC_AUDIENCE` | `wallet-api` | app | required `aud` value |
+| `OIDC_JWKS_MIN_REFRESH_INTERVAL` | `30s` | app | minimum gap between JWKS fetches for unknown `kid`s |
 | `HTTP_ADDR` | `:8081` | app | listen address |
 | `HTTP_READ_HEADER_TIMEOUT` | `5s` | app | header read timeout |
 | `HTTP_HANDLER_TIMEOUT` | `10s` | app | per-request handler timeout |
@@ -175,7 +196,7 @@ integration tests.
 | `go test -race ./...` | the same with the race detector | Go + gcc (cgo) |
 | `go vet ./...` | vet (add `-tags=integration` to vet integration code too) | Go |
 | `gofmt -l .` | lists unformatted files (should print nothing) | Go |
-| `go test -tags=integration -count=1 ./test/integration/...` | real Postgres via testcontainers: migrations up/down, Fx start/stop with goroutine-leak check, every schema constraint, trigger and grant, the repositories, wallet locking and transaction atomicity | Docker |
+| `go test -tags=integration -count=1 ./test/integration/...` | real Postgres via testcontainers: migrations up/down, Fx start/stop with goroutine-leak check, every schema constraint, trigger and grant, the repositories, wallet locking and transaction atomicity, token verification against a real Keycloak (started once per run) | Docker |
 | `go test -tags=integration -race -count=1 ./test/integration/...` | the same with the race detector | Docker + gcc |
 
 With no local C toolchain (for example, on Windows without gcc), run the race

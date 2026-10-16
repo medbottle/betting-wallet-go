@@ -414,7 +414,7 @@ stateDiagram-v2
 
 **Validação do JWT**:
 - Algoritmo: somente RS256.
-- Chaves: JWKS com cache e refetch em `kid` desconhecido, com rate limit.
+- Chaves: JWKS com cache e refetch em `kid` desconhecido, com rate limit de 30s entre buscas (seção 19).
 - Claims:
   - `iss` exato;
   - `aud` contém `wallet-api` (via audience mapper);
@@ -771,6 +771,44 @@ Tudo abaixo segue as seções 3, 4, 6, 8 e 9; os pontos que os documentos não d
 **Relógios**: timestamps do domínio vêm do `Clock` da aplicação; o nudge usa o `now()` do banco, como no SQL da seção 8. `idgen.UUIDv7` gera os IDs (seção 9); uma falha da fonte aleatória do sistema encerra o processo, porque nada mais pode funcionar sem ela.
 
 **Testes** (`integration`, Postgres real, conectado como `wallet_app`): commit, rollback por erro e por panic, transação somente leitura recusando escrita, snapshot único em `REPEATABLE READ`; o mesmo lock de carteira serializa, carteiras diferentes não esperam, `lock_timeout` vira `ErrTransient`; o insert duplicado concorrente espera o índice único e vê o resultado do primeiro (commit ou rollback); o nudge pula linhas travadas sem bloquear; ida e volta de cada repositório pelo domínio; atomicidade (falha depois de todas as escritas não deixa nada) e saldo armazenado igual ao ledger no cenário 100.00 vs 2 × 80.00 sequencial.
+
+---
+
+## 19. Decisões do slice 5 (autenticação e autorização)
+
+**Realm provisionado** (`deploy/keycloak/realm-wagering.json`, importado com `start-dev --import-realm` no compose e nos testes):
+- Cliente `wallet-api` só como recurso (`bearerOnly`), com os client roles `provider` e `wallet-internal`.
+- Clientes confidenciais `provider-a`, `provider-b` e `wallet-internal`, só com `client_credentials` (service accounts; outros fluxos desligados). Segredos locais de teste (`<client>-local-secret`), documentados no README e no `.env.example`; não são segredos reais.
+- Mapper de claim fixo `provider_id` nos clientes de provedor e mapper de audiência `wallet-api` em todos. Conferido num token real: `iss` fixo em `http://localhost:8080/realms/wagering`, `aud=wallet-api`, `azp`, `provider_id` (ausente no interno) e `resource_access.wallet-api.roles`. O Keycloak não emite `nbf`.
+
+**Verificador** (`internal/adapters/oidc`):
+- `go-oidc/v3` com `NewVerifier`, sem discovery: issuer exato, `aud` contendo `wallet-api`, somente RS256.
+- O go-oidc confere `exp` sem tolerância e `nbf` com 5 minutos fixos, e `SkipExpiryCheck` desliga os dois. Por isso a checagem nativa é desligada e o código confere `exp` (obrigatório) e `nbf` (quando presente) com a tolerância de 30s da seção 11. `azp` é obrigatório.
+- O `Principal` usa somente `azp`, a claim `provider_id` e `resource_access.wallet-api.roles`; papéis de outros clientes são ignorados. Um token com papel `provider` sem `provider_id` é inválido.
+- Toda falha é `ErrInvalidToken` → 401. O motivo vai para o log; o token nunca.
+
+**JWKS com rate limit** (aprovado: 30s):
+- O `RemoteKeySet` do go-oidc busca as chaves dentro da própria verificação e não aceita limite de tempo, então há um `KeySet` próprio.
+- Cache das chaves RS256 de assinatura (`use=sig`); a chave `RSA-OAEP` de cifragem que o Keycloak publica é ignorada.
+- `kid` desconhecido dispara uma busca imediata, desde que a última tenha sido há pelo menos `OIDC_JWKS_MIN_REFRESH_INTERVAL` (30s); dentro da janela o token é recusado com as chaves em cache, sem chamar o IdP. Pedidos concorrentes compartilham uma busca. Uma busca que falha mantém as chaves em cache e também conta para a janela.
+- Por que 30s: a primeira rotação real é atendida na hora; sob tokens forjados com `kid` aleatório, cada instância faz no máximo 2 buscas por minuto (6 com as 3 instâncias da seção 8 do desafio); o pior caso é ~30s de 401 logo após uma rotação que coincida com uma busca recente, pequeno diante dos 5 minutos de vida do token. É o mesmo padrão do Nimbus (Spring Security).
+- Timeout de 5s por requisição de JWKS, além do contexto de quem chama. No stop, as conexões ociosas do cliente HTTP são fechadas.
+
+**Inicialização**: o `AuthModule` busca o JWKS no `OnStart`, depois do ping do pool e antes da readiness (passo 3 da seção 14). Falhou, o start falha e libera o pool.
+
+**Autorização** (`internal/app/authz`, Go puro, regras da seção 11):
+- `CanSubmitTransaction(bodyProviderID)`: só `provider`; `providerId` do corpo diferente da claim → `PROVIDER_MISMATCH` (403).
+- `CanReadProviderTransaction(pathProviderID)` e `CanReadTransaction(txProviderID)`: o provedor lê só as próprias, e qualquer outra resposta é 404; o serviço interno lê qualquer uma. Interpretação: "leitura de qualquer transação" (seção 11) vale para as duas rotas de leitura, inclusive a do caminho do provedor. Um `OPENING` (sem provedor) é 404 para provedores.
+- `CanUseWalletOperations()`: só `wallet-internal`; provedores recebem 403 (`FORBIDDEN`).
+- As rotas que chamam essas regras chegam com o slice HTTP.
+
+**Middleware HTTP**: `RequireAuth` exige `Authorization: Bearer` (esquema sem diferenciar maiúsculas) e responde 401 com `WWW-Authenticate: Bearer error="invalid_token"` e `{"error":{"code":"UNAUTHENTICATED",...,"retryable":false}}`, inclusive quando o header falta. `/health/*` continua público. Nenhuma rota de negócio existe ainda; todas usarão o middleware.
+
+**Testes**:
+- Unitários com uma chave RSA local atrás de um JWKS `httptest`, para regras que o Keycloak não produz sob demanda: `azp` ausente, HS256/RS512, tolerância de `exp`/`nbf` nos dois lados, `aud` em lista, rotação, rate limit, busca compartilhada, falha mantendo o cache, chave de cifragem ignorada.
+- Integração com Keycloak real (testcontainers, mesmo arquivo de realm, um container compartilhado pelo pacote): tokens reais de `client_credentials` dos três clientes; recusa de token ausente, assinatura adulterada, issuer errado, audiência errada e token expirado (o mesmo token real, verificado com o relógio adiantado além de `exp` + 30s); segredo errado não obtém token; middleware com rota protegida e `/health` público; o teste de lifecycle do Fx sobe Keycloak e o app não inicia sem JWKS.
+
+**Em aberto**: Q5 em [docs/OPEN-QUESTIONS.md](docs/OPEN-QUESTIONS.md) (`kid` desconhecido com o IdP fora do ar: hoje 401).
 
 ---
 
