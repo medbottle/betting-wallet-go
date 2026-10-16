@@ -31,15 +31,18 @@ import (
 // apiEnv is the real HTTP stack: router, middleware, use cases and the
 // pgx adapter on a migrated Postgres, tokens from a real Keycloak.
 type apiEnv struct {
-	repo   repoEnv
-	srv    *httptest.Server
-	tokens map[string]string
+	repo     repoEnv
+	srv      *httptest.Server
+	tokens   map[string]string
+	wagering *wagering.Service
+	logger   *slog.Logger
 }
 
 type apiOption func(*apiConfig)
 
 type apiConfig struct {
 	runnerFrom func(repo repoEnv) app.TxRunner
+	reference  wagering.Config
 }
 
 // withRunner replaces the transaction runner (a short lock timeout, a
@@ -48,11 +51,19 @@ func withRunner(r func(repo repoEnv) app.TxRunner) apiOption {
 	return func(c *apiConfig) { c.runnerFrom = r }
 }
 
+// withReference sets the reference TTL and backoff (short values make the
+// worker tests fast; ARCHITECTURE §8 uses a 2s TTL in tests).
+func withReference(ttl, base, max time.Duration) apiOption {
+	return func(c *apiConfig) {
+		c.reference = wagering.Config{ReferenceTTL: ttl, Backoff: wagering.Backoff{Base: base, Max: max}}
+	}
+}
+
 func newAPIEnv(t *testing.T, opts ...apiOption) apiEnv {
 	t.Helper()
 	repo := newRepoEnv(t)
 	kc := startKeycloak(t)
-	cfg := apiConfig{}
+	cfg := apiConfig{reference: wagering.Config{ReferenceTTL: refTTL, Backoff: wagering.Backoff{Base: time.Second, Max: time.Minute}}}
 	for _, o := range opts {
 		o(&cfg)
 	}
@@ -63,9 +74,7 @@ func newAPIEnv(t *testing.T, opts ...apiOption) apiEnv {
 	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
 	reader := postgres.NewReader(repo.db.app)
 	ids := idgen.UUIDv7{}
-	wag := wagering.NewService(runner, reader, reader, reader, clock.System{}, ids, wagering.Config{
-		ReferenceTTL: refTTL, Backoff: wagering.Backoff{Base: time.Second, Max: time.Minute},
-	}, logger)
+	wag := wagering.NewService(runner, reader, reader, reader, clock.System{}, ids, cfg.reference, logger)
 	wal := wallets.NewService(runner, reader, reader, clock.System{}, ids, logger)
 	router := httpapi.NewRouter(httpapi.Deps{
 		Verifier:       newKeycloakVerifier(t, kc, kc.Issuer, "wallet-api", nil),
@@ -81,7 +90,7 @@ func newAPIEnv(t *testing.T, opts ...apiOption) apiEnv {
 	for id := range clientSecrets {
 		tokens[id] = mustToken(t, kc, id)
 	}
-	return apiEnv{repo: repo, srv: srv, tokens: tokens}
+	return apiEnv{repo: repo, srv: srv, tokens: tokens, wagering: wag, logger: logger}
 }
 
 // response is a decoded API answer.
