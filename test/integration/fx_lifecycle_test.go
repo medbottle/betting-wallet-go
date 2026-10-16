@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -19,11 +20,17 @@ import (
 	"github.com/medbottle/betting-wallet-go/internal/bootstrap"
 )
 
-func setAppEnv(t *testing.T, databaseURL string) {
+// unreachableOIDC points the IdP settings at a closed port, for tests that
+// must fail before (or exactly at) the JWKS fetch.
+var unreachableOIDC = keycloakEnv{
+	Issuer:  "http://127.0.0.1:1/realms/wagering",
+	JWKSURL: "http://127.0.0.1:1/realms/wagering/protocol/openid-connect/certs",
+}
+
+func setAppEnv(t *testing.T, databaseURL string, kc keycloakEnv) {
 	t.Setenv("DATABASE_URL", databaseURL)
-	// Required since the OIDC settings; nothing fetches the JWKS yet.
-	t.Setenv("OIDC_ISSUER", "http://127.0.0.1:1/realms/wagering")
-	t.Setenv("OIDC_JWKS_URL", "http://127.0.0.1:1/realms/wagering/protocol/openid-connect/certs")
+	t.Setenv("OIDC_ISSUER", kc.Issuer)
+	t.Setenv("OIDC_JWKS_URL", kc.JWKSURL)
 	t.Setenv("HTTP_ADDR", "127.0.0.1:0")
 	t.Setenv("READINESS_INTERVAL", "200ms")
 	t.Setenv("READINESS_CHECK_TIMEOUT", "200ms")
@@ -35,7 +42,7 @@ func setAppEnv(t *testing.T, databaseURL string) {
 // (ARCHITECTURE §14 step 2) fails fast and leaves nothing running.
 func TestFxStartFailsOnUnmigratedSchema(t *testing.T) {
 	urls := startPostgres(t)
-	setAppEnv(t, urls.app)
+	setAppEnv(t, urls.app, unreachableOIDC)
 	leaks := goleak.IgnoreCurrent()
 
 	app := fx.New(bootstrap.Options())
@@ -51,13 +58,35 @@ func TestFxStartFailsOnUnmigratedSchema(t *testing.T) {
 	goleak.VerifyNone(t, leaks)
 }
 
+// TestFxStartFailsWithoutJWKS: the first JWKS fetch must succeed (fail
+// fast, ARCHITECTURE §11 and §14 step 3), and the failed start releases
+// the pool and everything else.
+func TestFxStartFailsWithoutJWKS(t *testing.T) {
+	urls := startPostgres(t)
+	migrateUp(t, urls.owner)
+	setAppEnv(t, urls.app, unreachableOIDC)
+	leaks := goleak.IgnoreCurrent()
+
+	app := fx.New(bootstrap.Options())
+	if err := app.Err(); err != nil {
+		t.Fatalf("build graph: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	err := app.Start(ctx)
+	if err == nil || !strings.Contains(err.Error(), "initial JWKS fetch") {
+		t.Fatalf("Start err = %v, want the initial JWKS fetch to fail the start", err)
+	}
+	goleak.VerifyNone(t, leaks)
+}
+
 // TestFxLifecycle starts the full graph against a migrated database,
 // checks the health endpoints, verifies readiness drains before the server
 // stops, and asserts that stopping leaves no goroutines behind.
 func TestFxLifecycle(t *testing.T) {
 	urls := startPostgres(t)
 	migrateUp(t, urls.owner)
-	setAppEnv(t, urls.app)
+	setAppEnv(t, urls.app, startKeycloak(t))
 
 	// Snapshot after the container is up so testcontainers' own goroutines
 	// are not reported.
