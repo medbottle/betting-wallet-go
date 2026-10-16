@@ -12,12 +12,13 @@ COPY . .
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     go build -ldflags="-s -w" -o /out/wallet ./cmd/wallet && \
-    go build -ldflags="-s -w" -o /out/migrate ./cmd/migrate
+    go build -ldflags="-s -w" -o /out/migrate ./cmd/migrate && \
+    go build -ldflags="-s -w" -o /out/dlqredrive ./cmd/dlqredrive
 
-# One image, two binaries: the compose "migrate" service overrides the
-# entrypoint with /app/migrate.
+# One image, three binaries: the compose "migrate" service overrides the
+# entrypoint with /app/migrate; /app/dlqredrive is the DLQ redrive tool.
 FROM gcr.io/distroless/static-debian13:nonroot
-COPY --from=build /out/wallet /out/migrate /app/
+COPY --from=build /out/wallet /out/migrate /out/dlqredrive /app/
 USER nonroot:nonroot
 EXPOSE 8081
 ENTRYPOINT ["/app/wallet"]
