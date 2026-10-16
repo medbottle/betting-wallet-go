@@ -50,6 +50,9 @@ func TestMain(m *testing.M) {
 	if kcContainer != nil {
 		_ = kcContainer.Terminate(context.Background())
 	}
+	if msContainer != nil {
+		_ = msContainer.Terminate(context.Background())
+	}
 	os.Exit(code)
 }
 

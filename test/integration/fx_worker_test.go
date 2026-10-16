@@ -27,6 +27,7 @@ func TestFxReferenceWorkerResumesAfterRestart(t *testing.T) {
 	urls := startPostgres(t)
 	migrateUp(t, urls.owner)
 	setAppEnv(t, urls.app, startKeycloak(t))
+	setSQSEnv(t, sqsEnv{Endpoint: startMiniStack(t), Queue: "wallet-events.fifo"})
 	t.Setenv("RUN_REFERENCE_WORKER", "true")
 	t.Setenv("REFERENCE_WORKER_POLL_INTERVAL", "100ms")
 	t.Setenv("REFERENCE_BACKOFF_BASE", "50ms")

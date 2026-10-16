@@ -27,7 +27,21 @@ var unreachableOIDC = keycloakEnv{
 	JWKSURL: "http://127.0.0.1:1/realms/wagering/protocol/openid-connect/certs",
 }
 
+// sqsEnv points the app at a broker endpoint and its events queue.
+type sqsEnv struct{ Endpoint, Queue string }
+
+// unreachableSQS is for tests that fail before the queue is resolved.
+var unreachableSQS = sqsEnv{Endpoint: "http://127.0.0.1:1", Queue: "wallet-events.fifo"}
+
+func setSQSEnv(t *testing.T, s sqsEnv) {
+	t.Setenv("SQS_ENDPOINT", s.Endpoint)
+	t.Setenv("SQS_EVENTS_QUEUE", s.Queue)
+	t.Setenv("SQS_PUBLISHER_ACCESS_KEY_ID", publisherKey)
+	t.Setenv("SQS_PUBLISHER_SECRET_ACCESS_KEY", publisherSecret)
+}
+
 func setAppEnv(t *testing.T, databaseURL string, kc keycloakEnv) {
+	setSQSEnv(t, unreachableSQS)
 	t.Setenv("DATABASE_URL", databaseURL)
 	t.Setenv("OIDC_ISSUER", kc.Issuer)
 	t.Setenv("OIDC_JWKS_URL", kc.JWKSURL)
@@ -80,6 +94,28 @@ func TestFxStartFailsWithoutJWKS(t *testing.T) {
 	goleak.VerifyNone(t, leaks)
 }
 
+// TestFxStartFailsWithoutQueue: the queue URL is resolved at start
+// (ARCHITECTURE §14 step 4); a missing queue fails the start and leaks
+// nothing.
+func TestFxStartFailsWithoutQueue(t *testing.T) {
+	urls := startPostgres(t)
+	migrateUp(t, urls.owner)
+	setAppEnv(t, urls.app, startKeycloak(t))
+	setSQSEnv(t, sqsEnv{Endpoint: startMiniStack(t), Queue: "does-not-exist.fifo"})
+	leaks := goleak.IgnoreCurrent()
+
+	app := fx.New(bootstrap.Options())
+	if err := app.Err(); err != nil {
+		t.Fatalf("build graph: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := app.Start(ctx); err == nil || !strings.Contains(err.Error(), "resolve queue does-not-exist.fifo") {
+		t.Fatalf("Start err = %v, want the queue resolution to fail the start", err)
+	}
+	goleak.VerifyNone(t, leaks)
+}
+
 // TestFxLifecycle starts the full graph against a migrated database,
 // checks the health endpoints, verifies readiness drains before the server
 // stops, and asserts that stopping leaves no goroutines behind.
@@ -87,6 +123,7 @@ func TestFxLifecycle(t *testing.T) {
 	urls := startPostgres(t)
 	migrateUp(t, urls.owner)
 	setAppEnv(t, urls.app, startKeycloak(t))
+	setSQSEnv(t, sqsEnv{Endpoint: startMiniStack(t), Queue: "wallet-events.fifo"})
 
 	// Snapshot after the container is up so testcontainers' own goroutines
 	// are not reported.
