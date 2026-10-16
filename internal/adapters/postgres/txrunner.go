@@ -18,16 +18,17 @@ const rollbackTimeout = 5 * time.Second
 
 // TxRunner implements app.TxRunner on a pgx pool.
 type TxRunner struct {
-	pool        *pgxpool.Pool
-	lockTimeout time.Duration
+	pool             *pgxpool.Pool
+	lockTimeout      time.Duration
+	statementTimeout time.Duration
 }
 
 var _ app.TxRunner = (*TxRunner)(nil)
 
-// NewTxRunner returns a runner whose transactions use lockTimeout unless
-// TxOptions overrides it.
-func NewTxRunner(pool *pgxpool.Pool, lockTimeout time.Duration) *TxRunner {
-	return &TxRunner{pool: pool, lockTimeout: lockTimeout}
+// NewTxRunner returns a runner whose transactions use lockTimeout and
+// statementTimeout unless TxOptions overrides them (ARCHITECTURE §4, §24).
+func NewTxRunner(pool *pgxpool.Pool, lockTimeout, statementTimeout time.Duration) *TxRunner {
+	return &TxRunner{pool: pool, lockTimeout: lockTimeout, statementTimeout: statementTimeout}
 }
 
 // InTx implements app.TxRunner. It does not retry: a transient error rolls
@@ -64,10 +65,12 @@ func (r *TxRunner) InTx(ctx context.Context, opts app.TxOptions, fn func(ctx con
 	if err := setLocal(ctx, tx, "lock_timeout", lockTimeout); err != nil {
 		return err
 	}
-	if opts.StatementTimeout > 0 {
-		if err := setLocal(ctx, tx, "statement_timeout", opts.StatementTimeout); err != nil {
-			return err
-		}
+	statementTimeout := opts.StatementTimeout
+	if statementTimeout <= 0 {
+		statementTimeout = r.statementTimeout
+	}
+	if err := setLocal(ctx, tx, "statement_timeout", statementTimeout); err != nil {
+		return err
 	}
 
 	if err := fn(ctx, repos{tx: tx}); err != nil {

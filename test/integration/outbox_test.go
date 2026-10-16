@@ -199,7 +199,7 @@ func TestOutboxTwoRelaysContend(t *testing.T) {
 	t.Cleanup(pool.Close)
 	relays := []*messaging.Relay{
 		relayFor(t, env.runner, endpoint, queue, "relay-a"),
-		relayFor(t, postgres.NewTxRunner(pool, 5*time.Second), endpoint, queue, "relay-b"),
+		relayFor(t, postgres.NewTxRunner(pool, 5*time.Second, testStatementTimeout), endpoint, queue, "relay-b"),
 	}
 	var wg sync.WaitGroup
 	for _, r := range relays {

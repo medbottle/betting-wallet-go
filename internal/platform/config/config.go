@@ -29,6 +29,10 @@ type Config struct {
 	// DBLockTimeout is the default lock_timeout of business transactions
 	// (ARCHITECTURE §4).
 	DBLockTimeout time.Duration `env:"DB_LOCK_TIMEOUT" envDefault:"5s"`
+	// DBStatementTimeout is the default statement_timeout of every
+	// transaction (ARCHITECTURE §4 and §24, Q1): twice the lock timeout, the
+	// same 10s as a reference-worker iteration.
+	DBStatementTimeout time.Duration `env:"DB_STATEMENT_TIMEOUT" envDefault:"10s"`
 
 	// OIDCIssuer is the exact expected iss claim (ARCHITECTURE §11).
 	OIDCIssuer string `env:"OIDC_ISSUER,required,notEmpty"`
@@ -151,6 +155,7 @@ func (c Config) Validate() error {
 	}{
 		{"DB_STARTUP_TIMEOUT", c.DBStartupTimeout},
 		{"DB_LOCK_TIMEOUT", c.DBLockTimeout},
+		{"DB_STATEMENT_TIMEOUT", c.DBStatementTimeout},
 		{"OIDC_JWKS_MIN_REFRESH_INTERVAL", c.OIDCJWKSMinRefreshInterval},
 		{"REFERENCE_TTL", c.ReferenceTTL},
 		{"REFERENCE_BACKOFF_BASE", c.ReferenceBackoffBase},

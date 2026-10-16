@@ -22,6 +22,9 @@ import (
 
 const refTTL = 10 * time.Minute
 
+// testStatementTimeout is the production default (DB_STATEMENT_TIMEOUT).
+const testStatementTimeout = 10 * time.Second
+
 // repoEnv is a migrated database with the adapter wired as the
 // application role.
 type repoEnv struct {
@@ -37,7 +40,7 @@ func newRepoEnv(t *testing.T) repoEnv {
 	gen := idgen.UUIDv7{}
 	return repoEnv{
 		db:     db,
-		runner: postgres.NewTxRunner(db.app, 5*time.Second),
+		runner: postgres.NewTxRunner(db.app, 5*time.Second, testStatementTimeout),
 		reader: postgres.NewReader(db.app),
 		ids:    gen.NewID,
 	}

@@ -31,9 +31,9 @@ type TxOptions struct {
 	// LockTimeout bounds every lock wait (SET LOCAL lock_timeout). Zero
 	// uses the runner's default (5s, ARCHITECTURE §4).
 	LockTimeout time.Duration
-	// StatementTimeout, when positive, is applied with SET LOCAL
-	// statement_timeout. Zero leaves the server setting (see
-	// docs/OPEN-QUESTIONS.md Q1).
+	// StatementTimeout bounds every statement (SET LOCAL
+	// statement_timeout). Zero uses the runner's default (10s,
+	// ARCHITECTURE §24, Q1). A cancelled statement is transient.
 	StatementTimeout time.Duration
 }
 

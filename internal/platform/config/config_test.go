@@ -30,6 +30,9 @@ func TestLoadFromDefaults(t *testing.T) {
 	if c.DBLockTimeout != 5*time.Second {
 		t.Errorf("DBLockTimeout = %v, want 5s", c.DBLockTimeout)
 	}
+	if c.DBStatementTimeout != 10*time.Second {
+		t.Errorf("DBStatementTimeout = %v, want 10s (ARCHITECTURE §24, Q1)", c.DBStatementTimeout)
+	}
 	if c.OIDCAudience != "wallet-api" || c.OIDCJWKSMinRefreshInterval != 30*time.Second {
 		t.Errorf("OIDC defaults = %q/%v, want wallet-api/30s", c.OIDCAudience, c.OIDCJWKSMinRefreshInterval)
 	}
@@ -88,6 +91,7 @@ func TestLoadFromRejectsInvalid(t *testing.T) {
 		{"check timeout above interval", func(m map[string]string) { m["READINESS_CHECK_TIMEOUT"] = "5s" }, "READINESS_CHECK_TIMEOUT"},
 		{"bad log level", func(m map[string]string) { m["LOG_LEVEL"] = "verbose" }, "LOG_LEVEL"},
 		{"zero lock timeout", func(m map[string]string) { m["DB_LOCK_TIMEOUT"] = "0s" }, "DB_LOCK_TIMEOUT"},
+		{"zero statement timeout", func(m map[string]string) { m["DB_STATEMENT_TIMEOUT"] = "0s" }, "DB_STATEMENT_TIMEOUT"},
 		{"missing issuer", func(m map[string]string) { delete(m, "OIDC_ISSUER") }, "OIDC_ISSUER"},
 		{"relative jwks url", func(m map[string]string) { m["OIDC_JWKS_URL"] = "/certs" }, "OIDC_JWKS_URL"},
 		{"empty audience", func(m map[string]string) { m["OIDC_AUDIENCE"] = " " }, "OIDC_AUDIENCE"},

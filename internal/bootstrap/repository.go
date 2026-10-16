@@ -28,5 +28,5 @@ var RepositoryModule = fx.Module("repository",
 )
 
 func newTxRunner(pool *pgxpool.Pool, cfg config.Config) *postgres.TxRunner {
-	return postgres.NewTxRunner(pool, cfg.DBLockTimeout)
+	return postgres.NewTxRunner(pool, cfg.DBLockTimeout, cfg.DBStatementTimeout)
 }

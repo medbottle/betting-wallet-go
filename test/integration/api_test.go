@@ -402,7 +402,7 @@ func TestAPITransientAndFailed(t *testing.T) {
 
 	t.Run("lock timeout answers 503 and persists nothing", func(t *testing.T) {
 		e := newAPIEnv(t, withRunner(func(repo repoEnv) app.TxRunner {
-			return postgres.NewTxRunner(repo.db.app, 300*time.Millisecond)
+			return postgres.NewTxRunner(repo.db.app, 300*time.Millisecond, testStatementTimeout)
 		}))
 		w := e.openWallet(t, "100.00")
 		release := holdTx(t, e.repo.db.owner, `SELECT 1 FROM wallets WHERE id = $1 FOR UPDATE`, w.ID)

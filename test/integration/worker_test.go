@@ -169,7 +169,7 @@ func TestWorkerContention(t *testing.T) {
 	}
 	t.Cleanup(pool.Close)
 	reader := postgres.NewReader(pool)
-	other := wagering.NewService(postgres.NewTxRunner(pool, 5*time.Second), reader, reader, reader, clock.System{}, idgen.UUIDv7{},
+	other := wagering.NewService(postgres.NewTxRunner(pool, 5*time.Second, testStatementTimeout), reader, reader, reader, clock.System{}, idgen.UUIDv7{},
 		wagering.Config{ReferenceTTL: 10 * time.Minute, Backoff: wagering.Backoff{Base: testBackoffBase, Max: testBackoffMax}}, e.logger)
 
 	const n = 20
