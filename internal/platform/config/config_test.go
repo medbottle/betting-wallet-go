@@ -11,6 +11,9 @@ func validVars() map[string]string {
 		"DATABASE_URL":  "postgres://wallet_app:x@localhost:5432/wallet",
 		"OIDC_ISSUER":   "http://localhost:8080/realms/wagering",
 		"OIDC_JWKS_URL": "http://keycloak:8080/realms/wagering/protocol/openid-connect/certs",
+
+		"SQS_PUBLISHER_ACCESS_KEY_ID":     "publisher",
+		"SQS_PUBLISHER_SECRET_ACCESS_KEY": "publisher-secret",
 	}
 }
 
@@ -33,6 +36,13 @@ func TestLoadFromDefaults(t *testing.T) {
 	}
 	if c.ReferenceWorkerConcurrency != 4 || c.ReferenceWorkerPollInterval != time.Second {
 		t.Errorf("worker defaults = %d/%v, want 4/1s", c.ReferenceWorkerConcurrency, c.ReferenceWorkerPollInterval)
+	}
+	if c.OutboxLease != 30*time.Second || c.OutboxBatchSize != 10 || c.OutboxPublishTimeout != 5*time.Second ||
+		c.OutboxBackoffBase != time.Second || c.OutboxBackoffMax != 5*time.Minute || c.OutboxMaxAttempts != 20 {
+		t.Errorf("outbox defaults differ from ARCHITECTURE §9: %+v", c)
+	}
+	if c.OutboxPollInterval != time.Second || c.OutboxRelayConcurrency != 1 || c.SQSEventsQueue != "wallet-events.fifo" || c.AWSRegion != "us-east-1" {
+		t.Errorf("relay defaults: %+v", c)
 	}
 	if c.HTTPHandlerTimeout != 10*time.Second {
 		t.Errorf("HTTPHandlerTimeout = %v, want 10s", c.HTTPHandlerTimeout)
@@ -80,6 +90,12 @@ func TestLoadFromRejectsInvalid(t *testing.T) {
 		{"backoff base above max", func(m map[string]string) { m["REFERENCE_BACKOFF_BASE"] = "2m" }, "REFERENCE_BACKOFF_BASE"},
 		{"zero workers", func(m map[string]string) { m["REFERENCE_WORKER_CONCURRENCY"] = "0" }, "REFERENCE_WORKER_CONCURRENCY"},
 		{"zero poll interval", func(m map[string]string) { m["REFERENCE_WORKER_POLL_INTERVAL"] = "0s" }, "REFERENCE_WORKER_POLL_INTERVAL"},
+		{"missing publisher key", func(m map[string]string) { delete(m, "SQS_PUBLISHER_ACCESS_KEY_ID") }, "SQS_PUBLISHER_ACCESS_KEY_ID"},
+		{"relative sqs endpoint", func(m map[string]string) { m["SQS_ENDPOINT"] = "ministack:4566" }, "SQS_ENDPOINT"},
+		{"standard events queue", func(m map[string]string) { m["SQS_EVENTS_QUEUE"] = "wallet-events" }, "SQS_EVENTS_QUEUE"},
+		{"batch above 10", func(m map[string]string) { m["OUTBOX_BATCH_SIZE"] = "11" }, "OUTBOX_BATCH_SIZE"},
+		{"publish timeout not below lease", func(m map[string]string) { m["OUTBOX_PUBLISH_TIMEOUT"] = "30s" }, "OUTBOX_PUBLISH_TIMEOUT"},
+		{"zero max attempts", func(m map[string]string) { m["OUTBOX_MAX_ATTEMPTS"] = "0" }, "OUTBOX_MAX_ATTEMPTS"},
 		{"zero pool size", func(m map[string]string) { m["DB_MAX_CONNS"] = "0" }, "DB_MAX_CONNS"},
 		{"bad bool", func(m map[string]string) { m["RUN_HTTP"] = "maybe" }, "RUN_HTTP"},
 		{"empty listen address", func(m map[string]string) { m["HTTP_ADDR"] = " " }, "HTTP_ADDR"},

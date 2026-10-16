@@ -53,6 +53,25 @@ type Config struct {
 	// looking for due rows again (ARCHITECTURE §21).
 	ReferenceWorkerPollInterval time.Duration `env:"REFERENCE_WORKER_POLL_INTERVAL" envDefault:"1s"`
 
+	// SQS (ARCHITECTURE §10). SQSEndpoint overrides the AWS endpoint (the
+	// emulator); empty uses AWS itself.
+	SQSEndpoint    string `env:"SQS_ENDPOINT"`
+	AWSRegion      string `env:"AWS_REGION" envDefault:"us-east-1"`
+	SQSEventsQueue string `env:"SQS_EVENTS_QUEUE" envDefault:"wallet-events.fifo"`
+	// Publisher credentials, separate from the consumer's (ARCHITECTURE §10).
+	SQSPublisherAccessKeyID     string `env:"SQS_PUBLISHER_ACCESS_KEY_ID,required,notEmpty"`
+	SQSPublisherSecretAccessKey string `env:"SQS_PUBLISHER_SECRET_ACCESS_KEY,required,notEmpty"`
+
+	// Outbox relay (ARCHITECTURE §9; poll interval and concurrency §22).
+	OutboxLease            time.Duration `env:"OUTBOX_LEASE" envDefault:"30s"`
+	OutboxBatchSize        int           `env:"OUTBOX_BATCH_SIZE" envDefault:"10"`
+	OutboxPublishTimeout   time.Duration `env:"OUTBOX_PUBLISH_TIMEOUT" envDefault:"5s"`
+	OutboxBackoffBase      time.Duration `env:"OUTBOX_BACKOFF_BASE" envDefault:"1s"`
+	OutboxBackoffMax       time.Duration `env:"OUTBOX_BACKOFF_MAX" envDefault:"5m"`
+	OutboxMaxAttempts      int           `env:"OUTBOX_MAX_ATTEMPTS" envDefault:"20"`
+	OutboxPollInterval     time.Duration `env:"OUTBOX_POLL_INTERVAL" envDefault:"1s"`
+	OutboxRelayConcurrency int           `env:"OUTBOX_RELAY_CONCURRENCY" envDefault:"1"`
+
 	// HTTPAddr is the listen address of the HTTP server.
 	HTTPAddr string `env:"HTTP_ADDR" envDefault:":8081"`
 	// HTTPReadHeaderTimeout bounds reading request headers.
@@ -124,6 +143,10 @@ func (c Config) Validate() error {
 		{"REFERENCE_BACKOFF_BASE", c.ReferenceBackoffBase},
 		{"REFERENCE_BACKOFF_MAX", c.ReferenceBackoffMax},
 		{"REFERENCE_WORKER_POLL_INTERVAL", c.ReferenceWorkerPollInterval},
+		{"OUTBOX_LEASE", c.OutboxLease},
+		{"OUTBOX_PUBLISH_TIMEOUT", c.OutboxPublishTimeout},
+		{"OUTBOX_BACKOFF_BASE", c.OutboxBackoffBase},
+		{"OUTBOX_POLL_INTERVAL", c.OutboxPollInterval},
 		{"HTTP_READ_HEADER_TIMEOUT", c.HTTPReadHeaderTimeout},
 		{"HTTP_HANDLER_TIMEOUT", c.HTTPHandlerTimeout},
 		{"READINESS_INTERVAL", c.ReadinessInterval},
@@ -136,6 +159,30 @@ func (c Config) Validate() error {
 	}
 	if c.ReadinessDrainDelay < 0 {
 		errs = append(errs, errors.New("READINESS_DRAIN_DELAY must be >= 0"))
+	}
+	if c.SQSEndpoint != "" {
+		if u, err := url.Parse(c.SQSEndpoint); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			errs = append(errs, errors.New("SQS_ENDPOINT must be an absolute http(s) URL"))
+		}
+	}
+	if strings.TrimSpace(c.AWSRegion) == "" || strings.TrimSpace(c.SQSEventsQueue) == "" {
+		errs = append(errs, errors.New("AWS_REGION and SQS_EVENTS_QUEUE must not be empty"))
+	}
+	if !strings.HasSuffix(c.SQSEventsQueue, ".fifo") {
+		errs = append(errs, errors.New("SQS_EVENTS_QUEUE must be a FIFO queue (.fifo)"))
+	}
+	// SendMessageBatch takes at most 10 entries.
+	if c.OutboxBatchSize < 1 || c.OutboxBatchSize > 10 {
+		errs = append(errs, errors.New("OUTBOX_BATCH_SIZE must be between 1 and 10"))
+	}
+	if c.OutboxMaxAttempts < 1 || c.OutboxRelayConcurrency < 1 {
+		errs = append(errs, errors.New("OUTBOX_MAX_ATTEMPTS and OUTBOX_RELAY_CONCURRENCY must be >= 1"))
+	}
+	if c.OutboxBackoffBase > c.OutboxBackoffMax {
+		errs = append(errs, errors.New("OUTBOX_BACKOFF_BASE must be <= OUTBOX_BACKOFF_MAX"))
+	}
+	if c.OutboxPublishTimeout >= c.OutboxLease {
+		errs = append(errs, errors.New("OUTBOX_PUBLISH_TIMEOUT must be shorter than OUTBOX_LEASE"))
 	}
 	if c.ReferenceWorkerConcurrency < 1 {
 		errs = append(errs, errors.New("REFERENCE_WORKER_CONCURRENCY must be >= 1"))
