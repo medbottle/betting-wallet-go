@@ -4,11 +4,12 @@ Distributed processing of bets and wallet movements in Go (Uber Fx, PostgreSQL,
 SQS, Keycloak). Spec: [docs/CHALLENGE.md](docs/CHALLENGE.md). Design decisions:
 [ARCHITECTURE.md](ARCHITECTURE.md).
 
-> **Status: slice 9 (SQS consumer).** The authenticated HTTP API, the SQS
-> consumer (with inbox, DLQ and the `dlqredrive` tool), the reference worker
-> and the outbox relay run on the full schema, domain and persistence
-> adapter; committed events are published to `wallet-events.fifo`. Metrics
-> and the multi-instance tests are not built yet. Questions the documents
+> **Status: slice 10 (metrics, multi-instance tests, failure simulations).**
+> The authenticated HTTP API, the SQS consumer (with inbox, DLQ and the
+> `dlqredrive` tool), the reference worker and the outbox relay run on the
+> full schema, domain and persistence adapter; committed events are
+> published to `wallet-events.fifo`; Prometheus metrics are served on
+> `:9090`; the CHALLENGE §13 scenarios run against three instances. Questions the documents
 > left open, all resolved: [docs/OPEN-QUESTIONS.md](docs/OPEN-QUESTIONS.md); parked
 > assumptions: [docs/ASSUMPTIONS.md](docs/ASSUMPTIONS.md).
 
@@ -155,6 +156,34 @@ AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test aws --endpoint-url http://loca
 4. Redriving is safe: the envelope `messageId` does not change, so the inbox
    and idempotency absorb anything already processed.
 
+### Metrics
+
+Prometheus text format on a separate listener (`METRICS_ADDR`, default
+`:9090`; compose publishes it on the host):
+
+```sh
+curl -s http://localhost:9090/metrics | grep -E '^(wager_|outbox_|sqs_|retries_|db_|reconciliation_|http_request)'
+```
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `wager_transactions_total` | counter | `transport`, `status`, `failure_code` | operations that reached a new state (http, sqs, worker) |
+| `wager_duplicates_total` | counter | `transport`, `kind` | replays by idempotency key and inbox duplicates |
+| `wager_conflicts_total` | counter | `code` | idempotency, external id and wallet conflicts |
+| `db_concurrency_conflicts_total` | counter | `sqlstate` | rollbacks by lock timeout, deadlock, serialization failure or statement timeout |
+| `retries_total` | counter | `component` | consumer, reference worker and outbox retries |
+| `sqs_dlq_messages_total` | counter | `failure_code` | messages sent to the DLQ explicitly |
+| `outbox_parked_total` | counter | — | events parked after exhausting attempts |
+| `outbox_unpublished` / `outbox_lag_seconds` | gauge | — | outbox backlog and age of the oldest unpublished event |
+| `wager_processing_duration_seconds` | histogram | `transport`, `outcome` | duration of a submission or worker iteration |
+| `http_request_duration_seconds` | histogram | `route`, `code` | HTTP latency by route pattern |
+| `reconciliation_divergences_total` | counter | — | reconciliations with `consistent=false` |
+
+Alert on `wager_transactions_total{status="FAILED"}`, `outbox_parked_total`,
+`outbox_lag_seconds`, `sqs_dlq_messages_total` and
+`reconciliation_divergences_total`. Labels never carry wallet, transaction or
+provider ids. Details: ARCHITECTURE.md §25.
+
 ### Keycloak and test identities
 
 Keycloak (admin console `admin`/`admin` at http://localhost:8080) imports the
@@ -222,6 +251,7 @@ from the `provider_id` claim. `/health/*` needs no token.
 | `OUTBOX_POLL_INTERVAL` | `1s` | app | idle wait of the relay |
 | `OUTBOX_RELAY_CONCURRENCY` | `1` | app | relay goroutines per instance |
 | `HTTP_ADDR` | `:8081` | app | listen address |
+| `METRICS_ADDR` | `:9090` | app | Prometheus listener; empty disables it (ARCHITECTURE §25) |
 | `HTTP_READ_HEADER_TIMEOUT` | `5s` | app | header read timeout |
 | `HTTP_HANDLER_TIMEOUT` | `10s` | app | per-request handler timeout |
 | `READINESS_INTERVAL` | `2s` | app | readiness loop period |
@@ -368,7 +398,55 @@ docker run --rm -v "$PWD:/src" -w /src \
 Build tags:
 
 - `integration`: tests under `test/integration` that start real containers.
-- `multiinstance` (planned): three-process tests on the compose stack.
+- `multiinstance`: three-process tests on the compose stack (below).
+
+### Multi-instance tests and failure simulations
+
+`test/multiinstance` runs the CHALLENGE §13 scenarios against three
+independent app processes (`app`, `app-2`, `app-3` from
+`docker-compose.multi.yml`, on ports 8081-8083, metrics on 9090-9092) sharing
+Postgres, Keycloak and MiniStack, and simulates the failures of CHALLENGE §3:
+
+| Test | What it shows |
+| --- | --- |
+| `TestSameBet50TimesAcrossInstances` | the same BET 50 times over three HTTP APIs and SQS: one debit |
+| `TestTwoBetsOf80AcrossInstances` | 100.00 vs 2 x 80.00 through different instances (five rounds): one processed, one `INSUFFICIENT_FUNDS`, 20.00 left |
+| `TestDistinctWalletsInParallel` | other wallets progress on every instance while one wallet is locked |
+| `TestHTTPAndSQSCrossoverAcrossInstances` | the same operation over SQS and three HTTP APIs at once: one effect |
+| `TestConsumerKilledUnderLoad` | SIGKILL of a consuming instance: redeliveries are inbox duplicates, one effect each |
+| `TestOutboxRelaysKilledUnderLoad` | SIGKILL of a relaying instance under load: every committed event reaches `wallet-events.fifo` |
+| `TestReferenceResolvedAfterInstanceKill` | pending references held by a killed instance are resolved or expired by another |
+| `TestRestartAllInstances` | all three killed and restarted: replays, pending references and queued messages survive |
+| `TestPostgresOutage` | Postgres stopped: readiness 503, HTTP 503 retryable, consumers paused, no DLQ; recovery |
+| `TestSQSOutage` | MiniStack paused: HTTP keeps committing, events wait in the outbox and are all published after recovery |
+
+Each test ends with the invariant checks: nothing left pending, reconciliation
+consistent with the expected balance, one ledger entry per money-moving
+processed operation, outbox drained with nothing parked, and every committed
+`eventId` received on `wallet-events.fifo`.
+
+Prepare: Docker running, the dev stack stopped (`docker compose down`), ports
+8080-8083, 4566, 5432 and 9090-9092 free. The suite builds and starts the
+stack itself under the project `wager-wallet-multi` and removes it at the end
+(`MULTIINSTANCE_KEEP_STACK=1` keeps it):
+
+```sh
+go test -tags=multiinstance -count=1 -v -timeout 40m ./test/multiinstance/
+```
+
+It takes several minutes: messages held by a killed consumer return only
+after the 60s visibility timeout, and the outages last about 15s each. The
+same stack can be started by hand to explore:
+
+```sh
+docker compose -p wager-wallet-multi -f docker-compose.yml -f docker-compose.multi.yml up -d --build
+```
+
+The suite drives the stack from the host with `docker compose`, so it runs
+without `-race` here (no local C toolchain, and the Go container used for
+`-race` has no Docker CLI). The processes under test are the image's
+binaries, which are not race-instrumented in any case; `-race` covers the
+unit and integration suites.
 
 The architecture test (`test/architecture`) runs with the plain `go test ./...`.
 It fails if:

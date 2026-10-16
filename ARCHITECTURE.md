@@ -544,7 +544,7 @@ Workers usam o seu próprio `context.WithCancel(context.Background())`, não o c
 | 0s a 2s | `READINESS_DRAIN_DELAY = 2s`, para que balanceadores percebam o draining |
 | 2s a 22s | Grupo paralelo com orçamento de 20s, aguardado por `errgroup` (detalhes abaixo) |
 | até 25s | `pool.Close()`, com até 3s |
-| até 26s | Flush de logs e métricas, com até 1s |
+| até 26s | Flush de logs e métricas, com até 1s (com Prometheus em modelo pull, é o desligamento do listener de métricas; seção 25) |
 
 Componentes do grupo paralelo:
 - `http.Server.Shutdown(ctx)`: requisições em andamento terminam; o timeout de handler é de 10s.
@@ -596,7 +596,7 @@ deploy/
   postgres/init/01-roles.sh
 test/
   integration/       # //go:build integration — testcontainers (PG, Keycloak, LocalStack)
-  multiinstance/     # //go:build multiinstance — 3 processos via compose
+  multiinstance/     # //go:build multiinstance — 3 processos via compose (docker-compose.multi.yml, seção 25)
 docker-compose.yml  Dockerfile  .env.example  README.md  ARCHITECTURE.md
 ```
 
@@ -831,7 +831,7 @@ Tudo abaixo segue as seções 3, 4, 6, 8 e 9; os pontos que os documentos não d
 - `wallets.Open`: valida `playerId` e `initialBalance`, roda `wager.OpenWallet` e grava carteira, `OPENING`, lançamento e eventos numa transação. Duplicata → `WALLET_ALREADY_EXISTS`.
 - `wagering.Submit`: o fluxo da seção 4. Fora de transação: `NewRequest`, registro de provedores, pré-leitura. Na transação: `InsertPending`; se não inseriu, busca por chave e depois por ID externo e aplica `CheckReplay` (replay ou conflito); senão lock da carteira, referência, `Apply`, gravação de saldo, ledger, linha e outbox, e nudge dos dependentes quando terminal. Erro de invariante → rollback e `FAILED` numa transação separada com lock da carteira (seção 5); se outra chamada já gravou a operação, essa é reproduzida.
 - O `NextAttemptAt` usado ao entrar em `PENDING_REFERENCE` segue o backoff da seção 8 (`REFERENCE_BACKOFF_BASE=1s`, `REFERENCE_BACKOFF_MAX=60s`, jitter total); o TTL é `REFERENCE_TTL=10m`.
-- `wallets.Reconcile`: carteira e fold do ledger no mesmo snapshot; `difference = armazenado − calculado`; divergência vai na resposta e num log de erro com os valores (a métrica chega com o slice de métricas).
+- `wallets.Reconcile`: carteira e fold do ledger no mesmo snapshot; `difference = armazenado − calculado`; divergência vai na resposta e num log de erro com os valores (a métrica `reconciliation_divergences_total` veio no slice 10, seção 25).
 
 **HTTP** (seção 13):
 - Ordem no `POST /wagering/transactions`: corpo JSON → `providerId` do corpo contra a claim (403 sem efeitos) → `money` como strings → caso de uso (validação, registro de provedores, pré-leitura, idempotência). Status: 200 `PROCESSED`, 422 `REJECTED` (com o saldo observado), 202 `PENDING_REFERENCE` com `Location` para o GET do provedor, 500 `FAILED`; o replay devolve o mesmo status com `idempotentReplay: true`.
@@ -888,7 +888,7 @@ Tudo abaixo segue as seções 3, 4, 6, 8 e 9; os pontos que os documentos não d
 **Interpretações**:
 - O "+ jitter" da fórmula de backoff é aditivo e sorteado em `[0, base)`: `now + min(1s·2^attempts, 5m) + U[0, 1s)` (premissa A10). `attempts` já inclui o claim atual.
 - O corpo publicado é o `payload` lido do banco. Como a coluna é `JSONB` (seção 9), o conteúdo é idêntico ao snapshot do evento, mas a ordem das chaves e os espaços são os do Postgres (premissa A11).
-- Sem métricas ainda: um evento estacionado gera log de erro com `eventId`, tipo, tentativas, `senderFault` e erro; `outbox_parked_total` chega com o slice de métricas.
+- Um evento estacionado gera log de erro com `eventId`, tipo, tentativas, `senderFault` e erro; `outbox_parked_total` veio no slice 10 (seção 25).
 
 **Credenciais do broker** (seção 10): o publisher usa só `SQS_PUBLISHER_ACCESS_KEY_ID`/`SECRET`, sem ler arquivos de configuração da AWS nem o ambiente; o consumidor ganhou as suas no slice 9 (seção 23). O teste negativo existe e foi executado: o MiniStack **não aplica IAM** (as credenciais do publisher conseguem `ReceiveMessage` na fila de entrada, e até credenciais desconhecidas são aceitas), então o teste é pulado com essa razão explícita. A separação está configurada, mas não é verificável neste emulador (limitação, premissa A12).
 
@@ -974,6 +974,64 @@ Aprovadas depois do slice 9, todas com a recomendação proposta. Nenhuma muda a
 **A5, teto da página do ledger**: mantido como está: `limit` padrão 50 (o exemplo do desafio) e teto de 200; um `limit` acima do teto é recusado com `INVALID_REQUEST`, não truncado. O desafio só mostra `limit=50` e não fixa máximo.
 
 **Testes**: unitários para a classificação de `57014`, o padrão e a validação de `DB_STATEMENT_TIMEOUT`, o `KeySet` durante a queda (busca falha, janela de rate limit, chave em cache, assinatura inválida, recuperação) e o middleware respondendo 503. Integração: uma espera de lock cortada pelo `statement_timeout` padrão do `TxRunner` vira `ErrTransient` com `57014`; contra o Keycloak real, um JWKS indisponível faz um `kid` rotacionado responder 503, o token com a chave em cache continuar 204, e o mesmo `kid` responder 401 depois da recuperação.
+
+---
+
+## 25. Decisões do slice 10 (métricas, múltiplas instâncias e simulações de falha)
+
+**Seguido dos documentos, sem mudança**: as métricas cobrem a lista da seção 12 do desafio (resultados por status, duplicatas, retries, DLQ, conflitos de concorrência, atraso da outbox, latência de processamento e divergências de reconciliação); o atraso da outbox é `now() - min(occurred_at)` dos não publicados (seção 9); `outbox_parked_total` (seção 9) e o alerta de `FAILED` via métrica (seção 5) passam a existir; a divergência de reconciliação vai para resposta, log e métrica (seção 9 do desafio). `MetricsModule` fica em `internal/bootstrap` e o registro em `internal/platform/metrics` (seções 1 e 14). O domínio não importa nada de métricas: a camada de aplicação depende de uma porta `app.Metrics` com chamadas simples, e a implementação Prometheus fica em `platform`. Os testes de múltiplas instâncias ficam em `test/multiinstance` com a build tag `multiinstance`, três processos via compose (árvore de diretórios), cobrindo os itens 1 a 8 da seção 13 do desafio e as falhas da seção 3.
+
+**Respostas às lacunas** (aprovadas):
+- **G1**: formato Prometheus (texto) com `prometheus/client_golang`, num registro privado (não o global), com os coletores de Go e de processo. Com modelo pull, o passo "flush de métricas" da seção 14 não tem o que enviar: fica como o desligamento do listener, limitado a 1s.
+- **G2**: listener próprio, `METRICS_ADDR=:9090` (vazio desliga), separado da API. Os rótulos não carregam ids de carteira, transação ou provedor, e a rota HTTP é o padrão do `ServeMux` (nunca o caminho com ids). O compose publica a porta só para uso local; em produção ela ficaria na rede interna do scraper.
+- **G3**: `docker-compose.multi.yml` acrescenta `app-2` e `app-3` (mesma imagem e configuração, `extends` do serviço `app`, todos os papéis ligados), em `8082`/`8083` e métricas em `9091`/`9092`. Cada um é um processo com pool e memória próprios; Postgres, Keycloak e MiniStack são compartilhados. O mesmo arquivo encurta `REFERENCE_TTL` para 8s e o backoff de referência para 200ms..1s nas três instâncias, para a expiração e a retomada rodarem em segundos.
+- **G4**: o `TestMain` da suíte sobe a pilha com `docker compose -p wager-wallet-multi -f docker-compose.yml -f docker-compose.multi.yml up -d --build`, espera as três readiness e remove tudo no fim (`down -v`); `MULTIINSTANCE_KEEP_STACK=1` mantém a pilha. As portas são as mesmas da pilha de desenvolvimento, que precisa estar parada.
+- **G5**: quedas abruptas em caixa-preta: `docker compose kill -s SIGKILL` numa instância sob carga HTTP e SQS, depois `start`, e verificação dos invariantes. Os pontos de queda determinísticos (commit e queda antes do delete; publicação e queda antes da marcação) continuam provados pelos testes de integração.
+- **G6**: Postgres indisponível com `docker compose stop postgres` e `start`; SQS indisponível com `docker compose pause ministack` e `unpause`. Pausar em vez de parar porque o MiniStack guarda as filas em memória e um restart as apagaria, o que o SQS real não faz (limitação do emulador, premissa A18).
+- **G7**: `outbox_unpublished` e `outbox_lag_seconds` são calculados no scrape, com uma consulta limitada a 1s no índice parcial da seção 9. Toda instância reporta o mesmo valor global. Uma consulta que falha omite as duas séries naquele scrape, sem falhar o scrape.
+- **G8**: buckets explícitos de 5ms a 10s (`.005 .01 .025 .05 .1 .25 .5 1 2.5 5 10`); o teto é o handler timeout e o `statement_timeout`.
+- **G9**: o reinício (item 8 da seção 13) mata as três instâncias com um `BET` processado, um `WIN` em `PENDING_REFERENCE` e mensagens enfileiradas durante a parada; depois verifica replays com o saldo original, resolução da pendência, processamento único das mensagens e o ledger. A cláusula de aceite assíncrono não se aplica: o caminho síncrono nunca commita `PENDING` (seção 5), e o worker já varre `PENDING` vencido de forma defensiva.
+
+**Métricas**:
+
+| Métrica | Tipo | Rótulos | Origem |
+| --- | --- | --- | --- |
+| `wager_transactions_total` | counter | `transport` (http, sqs, worker), `status`, `failure_code` | operações que chegaram a um novo estado (replays não contam aqui) |
+| `wager_duplicates_total` | counter | `transport`, `kind` (`idempotent_replay`, `inbox_duplicate`) | caminhos de replay do submit |
+| `wager_conflicts_total` | counter | `code` | conflitos de categoria C (chave, ID externo, carteira) |
+| `db_concurrency_conflicts_total` | counter | `sqlstate` (55P03, 40P01, 40001, 57014) | transações desfeitas por lock, deadlock, serialização ou `statement_timeout` (no `TxRunner`) |
+| `retries_total` | counter | `component` (consumer, reference_worker, outbox) | backoff de visibilidade, reagendamento de referência e da outbox |
+| `sqs_dlq_messages_total` | counter | `failure_code` | envio explícito à DLQ |
+| `outbox_parked_total` | counter | — | eventos estacionados |
+| `outbox_unpublished`, `outbox_lag_seconds` | gauge | — | consulta no scrape (G7) |
+| `wager_processing_duration_seconds` | histogram | `transport`, `outcome` (status, `replay` ou `error`) | cada submit e cada iteração do worker que fez trabalho |
+| `http_request_duration_seconds` | histogram | `route` (padrão do mux ou `unmatched`), `code` | middleware dentro do handler timeout |
+| `reconciliation_divergences_total` | counter | — | reconciliação com `consistent=false` |
+
+Séries para alertar: `wager_transactions_total{status="FAILED"}`, `outbox_parked_total`, `outbox_lag_seconds`, `sqs_dlq_messages_total`, `reconciliation_divergences_total`. As regras dependem de uma stack de monitoramento que o desafio não fornece, então não fazem parte do repositório.
+
+**Interpretações**:
+- Contagens da outbox (reagendamento e estacionamento) só sobem depois que a transação de marcação commitou, para um rollback não inflar a métrica.
+- `FAILED` no submit e no worker conta em `wager_transactions_total`; no worker, só depois que a transação que grava `FAILED` commitou.
+- O consumidor conta retries (falha transitória, inclusive envio à DLQ que falhou) e envios à DLQ; mensagens liberadas sem iniciar não são retries. Duplicatas da inbox contam no submit, para não contar duas vezes.
+- O `TxRunner` recebe a porta de métricas no construtor; leituras fora de transação não contam conflitos (não tomam locks).
+- `go get` do `client_golang` v1.25.0 também atualizou dependências indiretas (`klauspost/compress`, `x/sys`, `x/text`, `x/oauth2`) para as versões que ele exige.
+
+**Suíte `multiinstance`** (Postgres, Keycloak e MiniStack reais, três processos da aplicação):
+1. A mesma aposta 50 vezes ao mesmo tempo, pelas APIs das três instâncias e pelo SQS (o mesmo envelope repetido e envelopes novos para a mesma operação): um débito, uma transação, todas as respostas HTTP com o mesmo `transactionId`.
+2. 100.00 contra duas apostas de 80.00 por instâncias diferentes, cinco vezes: uma processada, uma `INSUFFICIENT_FUNDS`, saldo 20.00, um débito; replays pela terceira instância devolvem os mesmos resultados.
+3. Uma carteira travada no banco enquanto 45 operações em 15 outras carteiras terminam pelas três instâncias: sem lock global entre processos.
+4. Cruzamento HTTP (nas três instâncias) e SQS para a mesma operação ao mesmo tempo: um efeito.
+5. Consumidor morto sob carga SQS (cada mensagem enviada duas vezes): reentregas viram duplicatas da inbox, cada operação aplicada uma vez, DLQ vazia.
+6. Relays disputando a outbox com uma instância morta no meio: todo evento commitado chega à fila de eventos.
+7. `REFUND` e `ROLLBACK` aceitos em `PENDING_REFERENCE` por uma instância que é morta: outra instância resolve o `REFUND` e expira o `ROLLBACK` como `REFERENCE_NOT_FOUND`.
+8. Reinício das três instâncias (G9).
+9. Postgres parado: readiness 503 nas três, HTTP 503 retryable, consumidores pausados, nada na DLQ; depois da volta, tudo processado uma vez e o retry HTTP aplica a operação.
+10. SQS pausado: readiness 503, operações HTTP commitam com os eventos na outbox; depois da volta, todo evento publicado.
+
+Todo teste termina com os invariantes: nenhuma operação pendente, reconciliação consistente com o saldo esperado, um lançamento por operação processada que move dinheiro, outbox esvaziada sem estacionados e cada `eventId` commitado recebido em `wallet-events.fifo` (repetições são permitidas e logadas).
+
+**Limitação**: a suíte roda no host e dirige a pilha pelo `docker compose`, então não roda com `-race` neste ambiente (sem gcc no host, e a imagem Go usada para o `-race` não tem o CLI do Docker). Os processos testados são os binários da imagem, que não são compilados com o detector de corrida em nenhum caso; o detector cobre os testes unitários e de integração (premissa N7).
 
 ---
 
