@@ -133,6 +133,13 @@ type TransactionRepository interface {
 	// Update writes the mutable state (status, outcome, scheduling,
 	// resolved reference). Exactly one row must change.
 	Update(ctx context.Context, t *wager.WagerTransaction) error
+	// ClaimDue claims the oldest due PENDING or PENDING_REFERENCE row with
+	// FOR UPDATE SKIP LOCKED (ARCHITECTURE §8). The row lock is the claim and
+	// lasts until the transaction ends; found is false when nothing is due.
+	ClaimDue(ctx context.Context) (t *wager.WagerTransaction, found bool, err error)
+	// GetForUpdate locks one non-terminal row by id (used to record FAILED
+	// after a rollback). ErrNotFound when absent or already terminal.
+	GetForUpdate(ctx context.Context, transactionID uuid.UUID) (*wager.WagerTransaction, error)
 	// NudgeDependents moves next_attempt_at to now() for PENDING_REFERENCE
 	// operations waiting on (provider, external id), skipping rows another
 	// transaction holds (FOR UPDATE SKIP LOCKED, ARCHITECTURE §8).

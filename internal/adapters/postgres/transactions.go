@@ -188,6 +188,31 @@ func (r transactionRepo) Update(ctx context.Context, t *wager.WagerTransaction) 
 	return nil
 }
 
+func (r transactionRepo) ClaimDue(ctx context.Context) (*wager.WagerTransaction, bool, error) {
+	t, err := scanTx(r.tx.QueryRow(ctx, `SELECT `+txColumns+` FROM wager_transactions
+		WHERE status IN ('PENDING', 'PENDING_REFERENCE') AND next_attempt_at <= now()
+		ORDER BY next_attempt_at
+		LIMIT 1
+		FOR UPDATE SKIP LOCKED`))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, notFound(err, "due transaction")
+	}
+	return t, true, nil
+}
+
+func (r transactionRepo) GetForUpdate(ctx context.Context, transactionID uuid.UUID) (*wager.WagerTransaction, error) {
+	t, err := scanTx(r.tx.QueryRow(ctx, `SELECT `+txColumns+` FROM wager_transactions
+		WHERE id = $1 AND status IN ('PENDING', 'PENDING_REFERENCE')
+		FOR UPDATE`, transactionID))
+	if err != nil {
+		return nil, notFound(err, "pending transaction "+transactionID.String())
+	}
+	return t, nil
+}
+
 func (r transactionRepo) NudgeDependents(ctx context.Context, providerID, externalTransactionID string) (int64, error) {
 	tag, err := r.tx.Exec(ctx, `
 		UPDATE wager_transactions SET next_attempt_at = now()
