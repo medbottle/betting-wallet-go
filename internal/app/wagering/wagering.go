@@ -184,10 +184,16 @@ func (s *Service) process(ctx context.Context, r app.Repos, t *wager.WagerTransa
 // wallet lock, without locking it (ARCHITECTURE §4 step 3).
 func lookupReference(ctx context.Context, r app.Repos, req wager.Request) (wager.ReferenceState, error) {
 	refExt, ok := req.ReferenceExternalTransactionID()
-	if !ok {
+	return findReference(ctx, r, req.ProviderID(), refExt, ok)
+}
+
+// findReference resolves (provider, refExt) and whether it already has a
+// processed reversal. A missing reference is not an error.
+func findReference(ctx context.Context, r app.Repos, providerID, refExt string, hasRef bool) (wager.ReferenceState, error) {
+	if !hasRef {
 		return wager.ReferenceState{}, nil
 	}
-	found, err := r.Transactions().FindByExternalID(ctx, req.ProviderID(), refExt)
+	found, err := r.Transactions().FindByExternalID(ctx, providerID, refExt)
 	if errors.Is(err, app.ErrNotFound) {
 		return wager.ReferenceState{}, nil
 	}
