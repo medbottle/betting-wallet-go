@@ -1,3 +1,7 @@
 # Shell scripts run inside Linux containers; CRLF would break them.
 *.sh text eol=lf
 *.sql text eol=lf
+# gofmt requires LF; keep Go sources LF even with core.autocrlf=true.
+*.go text eol=lf
+go.mod text eol=lf
+go.sum text eol=lf
