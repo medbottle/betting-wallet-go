@@ -46,6 +46,12 @@ type Config struct {
 	ReferenceTTL         time.Duration `env:"REFERENCE_TTL" envDefault:"10m"`
 	ReferenceBackoffBase time.Duration `env:"REFERENCE_BACKOFF_BASE" envDefault:"1s"`
 	ReferenceBackoffMax  time.Duration `env:"REFERENCE_BACKOFF_MAX" envDefault:"60s"`
+	// ReferenceWorkerConcurrency is the number of worker goroutines per
+	// instance (ARCHITECTURE §8).
+	ReferenceWorkerConcurrency int `env:"REFERENCE_WORKER_CONCURRENCY" envDefault:"4"`
+	// ReferenceWorkerPollInterval is how long an idle worker waits before
+	// looking for due rows again (ARCHITECTURE §21).
+	ReferenceWorkerPollInterval time.Duration `env:"REFERENCE_WORKER_POLL_INTERVAL" envDefault:"1s"`
 
 	// HTTPAddr is the listen address of the HTTP server.
 	HTTPAddr string `env:"HTTP_ADDR" envDefault:":8081"`
@@ -117,6 +123,7 @@ func (c Config) Validate() error {
 		{"REFERENCE_TTL", c.ReferenceTTL},
 		{"REFERENCE_BACKOFF_BASE", c.ReferenceBackoffBase},
 		{"REFERENCE_BACKOFF_MAX", c.ReferenceBackoffMax},
+		{"REFERENCE_WORKER_POLL_INTERVAL", c.ReferenceWorkerPollInterval},
 		{"HTTP_READ_HEADER_TIMEOUT", c.HTTPReadHeaderTimeout},
 		{"HTTP_HANDLER_TIMEOUT", c.HTTPHandlerTimeout},
 		{"READINESS_INTERVAL", c.ReadinessInterval},
@@ -129,6 +136,9 @@ func (c Config) Validate() error {
 	}
 	if c.ReadinessDrainDelay < 0 {
 		errs = append(errs, errors.New("READINESS_DRAIN_DELAY must be >= 0"))
+	}
+	if c.ReferenceWorkerConcurrency < 1 {
+		errs = append(errs, errors.New("REFERENCE_WORKER_CONCURRENCY must be >= 1"))
 	}
 	if c.ReferenceBackoffBase > c.ReferenceBackoffMax {
 		errs = append(errs, errors.New("REFERENCE_BACKOFF_BASE must be <= REFERENCE_BACKOFF_MAX"))

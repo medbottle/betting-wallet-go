@@ -31,6 +31,9 @@ func TestLoadFromDefaults(t *testing.T) {
 	if c.ReferenceTTL != 10*time.Minute || c.ReferenceBackoffBase != time.Second || c.ReferenceBackoffMax != time.Minute {
 		t.Errorf("reference defaults = %v/%v/%v, want 10m/1s/60s (ARCHITECTURE §8)", c.ReferenceTTL, c.ReferenceBackoffBase, c.ReferenceBackoffMax)
 	}
+	if c.ReferenceWorkerConcurrency != 4 || c.ReferenceWorkerPollInterval != time.Second {
+		t.Errorf("worker defaults = %d/%v, want 4/1s", c.ReferenceWorkerConcurrency, c.ReferenceWorkerPollInterval)
+	}
 	if c.HTTPHandlerTimeout != 10*time.Second {
 		t.Errorf("HTTPHandlerTimeout = %v, want 10s", c.HTTPHandlerTimeout)
 	}
@@ -75,6 +78,8 @@ func TestLoadFromRejectsInvalid(t *testing.T) {
 		{"zero jwks interval", func(m map[string]string) { m["OIDC_JWKS_MIN_REFRESH_INTERVAL"] = "0s" }, "OIDC_JWKS_MIN_REFRESH_INTERVAL"},
 		{"zero reference ttl", func(m map[string]string) { m["REFERENCE_TTL"] = "0s" }, "REFERENCE_TTL"},
 		{"backoff base above max", func(m map[string]string) { m["REFERENCE_BACKOFF_BASE"] = "2m" }, "REFERENCE_BACKOFF_BASE"},
+		{"zero workers", func(m map[string]string) { m["REFERENCE_WORKER_CONCURRENCY"] = "0" }, "REFERENCE_WORKER_CONCURRENCY"},
+		{"zero poll interval", func(m map[string]string) { m["REFERENCE_WORKER_POLL_INTERVAL"] = "0s" }, "REFERENCE_WORKER_POLL_INTERVAL"},
 		{"zero pool size", func(m map[string]string) { m["DB_MAX_CONNS"] = "0" }, "DB_MAX_CONNS"},
 		{"bad bool", func(m map[string]string) { m["RUN_HTTP"] = "maybe" }, "RUN_HTTP"},
 		{"empty listen address", func(m map[string]string) { m["HTTP_ADDR"] = " " }, "HTTP_ADDR"},
