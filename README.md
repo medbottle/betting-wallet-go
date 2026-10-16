@@ -4,13 +4,13 @@ Distributed processing of bets and wallet movements in Go (Uber Fx, PostgreSQL,
 SQS, Keycloak). Spec: [docs/CHALLENGE.md](docs/CHALLENGE.md). Design decisions:
 [ARCHITECTURE.md](ARCHITECTURE.md).
 
-> **Status: slice 6 (HTTP API).** The authenticated HTTP API (wallets,
-> operations with persistent idempotency, reads, reconciliation) runs on the
-> full schema, domain and persistence adapter. The SQS consumer, the outbox
-> relay, the reference worker and metrics are not built yet: operations that
-> wait for a reference stay `PENDING_REFERENCE`, and outbox events are stored
-> but not published. Open points: [docs/OPEN-QUESTIONS.md](docs/OPEN-QUESTIONS.md);
-> parked assumptions: [docs/ASSUMPTIONS.md](docs/ASSUMPTIONS.md).
+> **Status: slice 7 (reference worker).** The authenticated HTTP API runs
+> on the full schema, domain and persistence adapter, and the reference
+> worker resumes operations waiting for a reference (also after a restart).
+> The SQS consumer, the outbox relay and metrics are not built yet: outbox
+> events are stored but not published. Open points:
+> [docs/OPEN-QUESTIONS.md](docs/OPEN-QUESTIONS.md); parked assumptions:
+> [docs/ASSUMPTIONS.md](docs/ASSUMPTIONS.md).
 
 ## Prerequisites
 
@@ -109,6 +109,8 @@ from the `provider_id` claim. `/health/*` needs no token.
 | `REFERENCE_TTL` | `10m` | app | how long an operation waits for its reference (ARCHITECTURE §8) |
 | `REFERENCE_BACKOFF_BASE` | `1s` | app | first retry delay for a missing reference |
 | `REFERENCE_BACKOFF_MAX` | `60s` | app | longest retry delay |
+| `REFERENCE_WORKER_CONCURRENCY` | `4` | app | reference worker goroutines per instance |
+| `REFERENCE_WORKER_POLL_INTERVAL` | `1s` | app | idle wait before the worker looks for due operations again |
 | `HTTP_ADDR` | `:8081` | app | listen address |
 | `HTTP_READ_HEADER_TIMEOUT` | `5s` | app | header read timeout |
 | `HTTP_HANDLER_TIMEOUT` | `10s` | app | per-request handler timeout |
@@ -119,7 +121,7 @@ from the `provider_id` claim. `/health/*` needs no token.
 | `RUN_HTTP` | `true` | app | serve HTTP |
 | `RUN_CONSUMER` | `true` | app | SQS consumer (not implemented yet) |
 | `RUN_OUTBOX` | `true` | app | outbox relay (not implemented yet) |
-| `RUN_REFERENCE_WORKER` | `true` | app | PENDING_REFERENCE worker (not implemented yet) |
+| `RUN_REFERENCE_WORKER` | `true` | app | PENDING_REFERENCE worker |
 
 Invalid configuration makes the app exit at startup and lists every problem it
 found.
@@ -238,7 +240,7 @@ integration tests.
 | `go test -race ./...` | the same with the race detector | Go + gcc (cgo) |
 | `go vet ./...` | vet (add `-tags=integration` to vet integration code too) | Go |
 | `gofmt -l .` | lists unformatted files (should print nothing) | Go |
-| `go test -tags=integration -count=1 ./test/integration/...` | real Postgres via testcontainers: migrations up/down, Fx start/stop with goroutine-leak check, every schema constraint, trigger and grant, the repositories, wallet locking and transaction atomicity, token verification against a real Keycloak (started once per run), the HTTP API end to end including the concurrency scenarios of CHALLENGE §13 | Docker |
+| `go test -tags=integration -count=1 ./test/integration/...` | real Postgres via testcontainers: migrations up/down, Fx start/stop with goroutine-leak check, every schema constraint, trigger and grant, the repositories, wallet locking and transaction atomicity, token verification against a real Keycloak (started once per run), the HTTP API end to end including the concurrency scenarios of CHALLENGE §13, the reference worker (late references, expiry, contention, abandoned claims, restart) | Docker |
 | `go test -tags=integration -race -count=1 ./test/integration/...` | the same with the race detector | Docker + gcc |
 
 With no local C toolchain (for example, on Windows without gcc), run the race

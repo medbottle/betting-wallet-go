@@ -847,6 +847,33 @@ Tudo abaixo segue as seções 3, 4, 6, 8 e 9; os pontos que os documentos não d
 
 ---
 
+## 21. Decisões do slice 7 (worker de referências)
+
+**Seguido da seção 8, sem mudança**: claim com `FOR UPDATE SKIP LOCKED` em uma transação por linha (o lock da linha é o claim, sem coluna de lease); lock da carteira (`FOR NO KEY UPDATE`, seção 4); releitura da referência com statement novo; `Apply` processa, rejeita após o deadline ou reagenda; gravação, nudge e commit. Ordem de locks: linha reivindicada, depois carteira. `REFERENCE_WORKER_CONCURRENCY=4` goroutines por instância, ligadas por `RUN_REFERENCE_WORKER`.
+
+**Intervalo ocioso** (aprovado): `REFERENCE_WORKER_POLL_INTERVAL=1s`, quanto uma goroutine espera quando nada está vencido ou depois de um erro. Igual ao `REFERENCE_BACKOFF_BASE`, de modo que um dependente antecipado pelo nudge é pego em cerca de 1s; ocioso, são no máximo 4 consultas indexadas por segundo por instância. Quando há trabalho, a goroutine segue sem esperar.
+
+**Iteração** (`wagering.Service.ResolveNext`):
+- Contexto e `statement_timeout` de 10s por iteração (seção 14).
+- `NextAttemptAt` de um reagendamento usa `attempts + 1` na fórmula da seção 8: a tentativa em curso é a de número `attempts + 1`, então a espera seguinte cresce a partir dela (premissa A8).
+- Erro transitório (ou contexto cancelado no shutdown): rollback, a linha continua vencida e qualquer instância a retoma.
+- Qualquer outro erro: rollback e `FAILED`/`INTERNAL_INVARIANT_VIOLATION` numa transação separada, que trava a linha (`GetForUpdate`, só se ainda não terminal) e depois a carteira, como na seção 5. Assim uma linha quebrada não fica em retry infinito (premissa A9).
+- `ClaimDue` também pega `PENDING` vencido, como defesa (seção 5).
+- O fluxo de gravação é o mesmo do submit (`persist`, `findReference`), sem duplicação.
+
+**Runner genérico** (`internal/platform/worker`): contexto próprio (`context.WithCancel(context.Background())`), N goroutines, espera ociosa, contadores (processados, polls ociosos, falhas), `Stop` que cancela e espera até o prazo, log `worker stopped` com os contadores e canal `done` (seção 14). Cancelamento durante um passo não conta como falha.
+
+**Lifecycle**: o worker inicia no hook "runners" antes do HTTP e para em paralelo com ele, dentro do orçamento de 20s. A iteração em curso vê o contexto cancelado, faz rollback e libera a linha. Se o HTTP falhar ao iniciar, o worker já iniciado é parado no próprio `OnStart`, porque o Fx não chama o `OnStop` de um hook que falhou.
+
+**Testes** (Postgres e Keycloak reais):
+- Item 7 da seção 13 do desafio: `REFUND` e `WIN` antes da `BET` são aplicados depois que ela chega, cada um uma única vez (um lançamento, um `PendingReference` emitido só na entrada, um `Processed`, um `BalanceChanged`); com TTL de 2s, referência que nunca chega vira `REFERENCE_NOT_FOUND` com evento de rejeição e replay 422; `ROLLBACK` de um `REFUND` ainda pendente vira `REFERENCE_UNRESOLVED_TIMEOUT`.
+- Disputa: dois workers com pools e conexões próprios, quatro goroutines cada, sobre 20 operações pendentes: cada uma aplicada exatamente uma vez.
+- Recuperação: uma linha reivindicada por um worker "morto" é pulada sem bloquear os outros e, quando a transação dele aborta, outro worker a resolve.
+- Item 8: com o Fx, a instância A para com uma operação pendente, a referência chega sem nenhuma instância no ar, e a instância B retoma e resolve; nenhum dos dois stops deixa goroutines (`goleak`).
+- Todos terminam conferindo o saldo armazenado contra o ledger.
+
+---
+
 ## Esboço do schema
 
 > O schema implementado está em `migrations/`; a seção 16 registra onde ele refina este esboço.
