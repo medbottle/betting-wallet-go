@@ -4,10 +4,11 @@ Distributed processing of bets and wallet movements in Go (Uber Fx, PostgreSQL,
 SQS, Keycloak). Spec: [docs/CHALLENGE.md](docs/CHALLENGE.md). Design decisions:
 [ARCHITECTURE.md](ARCHITECTURE.md).
 
-> **Status: slice 8 (outbox relay).** The authenticated HTTP API, the
-> reference worker and the outbox relay run on the full schema, domain and
-> persistence adapter: committed events are published to
-> `wallet-events.fifo`. The SQS consumer and metrics are not built yet. Open
+> **Status: slice 9 (SQS consumer).** The authenticated HTTP API, the SQS
+> consumer (with inbox, DLQ and the `dlqredrive` tool), the reference worker
+> and the outbox relay run on the full schema, domain and persistence
+> adapter; committed events are published to `wallet-events.fifo`. Metrics
+> and the multi-instance tests are not built yet. Open
 > points: [docs/OPEN-QUESTIONS.md](docs/OPEN-QUESTIONS.md); parked
 > assumptions: [docs/ASSUMPTIONS.md](docs/ASSUMPTIONS.md).
 
@@ -83,6 +84,77 @@ AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test aws --endpoint-url http://loca
 
 `/health/ready` reports both `postgres` and `sqs`.
 
+### Inbound operations (SQS)
+
+Providers can also submit operations through `wager-transactions.fifo`. The
+consumer runs the same use case as `POST /wagering/transactions`, with the
+same idempotency guarantees, plus an inbox keyed by the envelope's
+`messageId` (ARCHITECTURE §9, §10, §23).
+
+Message body (CHALLENGE §10); `data` takes the same fields as the HTTP body
+plus `idempotencyKey`. Unknown fields are refused, and amounts must be
+strings:
+
+```json
+{
+  "messageId": "msg-123",
+  "type": "WagerTransactionRequested",
+  "occurredAt": "2026-09-08T12:00:00.000Z",
+  "data": {
+    "providerId": "provider-a",
+    "externalTransactionId": "transaction-123",
+    "idempotencyKey": "provider-a:transaction-123",
+    "playerId": "0192f28f-5dc0-7d58-bdb2-814ad6a0f4a1",
+    "walletId": "0192f291-27dd-7d3f-8071-5f8685deef37",
+    "roundId": "round-987",
+    "gameId": "fortune-chimp",
+    "kind": "BET",
+    "money": { "amount": "25.00", "currency": "BRL" }
+  }
+}
+```
+
+| Item | Value |
+| --- | --- |
+| `MessageGroupId` | the `walletId`: per-wallet order, different wallets in parallel |
+| `MessageDeduplicationId` | the envelope `messageId` (best effort; the inbox and the database constraints are the guarantee) |
+| Visibility timeout / handler deadline | 60s / 15s |
+| Attempts | transient failures retry with visibility `min(2^receiveCount, 60)`s; after 10 receives the redrive policy moves the message to `wager-transactions-dlq.fifo` |
+| Readiness | polling pauses while `/health/ready` fails, so an outage does not use up attempts |
+| Invalid or permanent | sent to the DLQ at once with `failureClass=PERMANENT`, `failureCode`, `originalMessageId` and `envelopeMessageId`, then deleted; nothing is persisted |
+| Business rejection | committed as `REJECTED`, message deleted |
+| Duplicate `messageId` | same payload: deleted without effect; different payload: DLQ (`INVALID_REQUEST`) |
+
+The message is deleted only after its transaction committed. Follow the
+outcome with `GET /providers/{providerId}/wagering/transactions/{externalId}`.
+
+Send one from the host:
+
+```sh
+AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test aws --endpoint-url http://localhost:4566 --region us-east-1 sqs send-message --queue-url http://localhost:4566/000000000000/wager-transactions.fifo --message-group-id <walletId> --message-deduplication-id msg-123 --message-body file://message.json
+```
+
+#### DLQ redrive procedure
+
+1. Confirm the cause is resolved: `/health/ready` answers 200.
+2. Messages with `failureClass=PERMANENT` need a fix by the producer; they are
+   not resent as they are. Inspect them with `receive-message` on
+   `wager-transactions-dlq.fifo` (`--message-attribute-names All`).
+3. Resend the others (transient attempts exhausted) with `dlqredrive`, which
+   keeps the body and `MessageGroupId`, uses
+   `MessageDeduplicationId=<MessageId>:redrive:<unixSeconds>`, deletes each
+   message from the DLQ after the send, and skips the permanent ones:
+
+   ```sh
+   docker compose run --rm --no-deps --entrypoint /app/dlqredrive -e SQS_OPERATOR_ACCESS_KEY_ID=wallet-operator -e SQS_OPERATOR_SECRET_ACCESS_KEY=wallet-operator-local-secret app
+   ```
+
+   It prints `redriven=N skipped_permanent=M`. Skipped messages stay in
+   flight for the DLQ visibility timeout (60s); because of FIFO order, later
+   messages of the same group may need a second run after that.
+4. Redriving is safe: the envelope `messageId` does not change, so the inbox
+   and idempotency absorb anything already processed.
+
 ### Keycloak and test identities
 
 Keycloak (admin console `admin`/`admin` at http://localhost:8080) imports the
@@ -130,6 +202,14 @@ from the `provider_id` claim. `/health/*` needs no token.
 | `AWS_REGION` | `us-east-1` | app | broker region |
 | `SQS_EVENTS_QUEUE` | `wallet-events.fifo` | app | outbound events queue |
 | `SQS_PUBLISHER_ACCESS_KEY_ID` / `SQS_PUBLISHER_SECRET_ACCESS_KEY` | — (required) | app | publisher-only credentials (ARCHITECTURE §10) |
+| `SQS_INBOUND_QUEUE` / `SQS_INBOUND_DLQ` | `wager-transactions.fifo` / `wager-transactions-dlq.fifo` | app, dlqredrive | inbound queue and its DLQ |
+| `SQS_CONSUMER_ACCESS_KEY_ID` / `SQS_CONSUMER_SECRET_ACCESS_KEY` | — (required) | app | consumer-only credentials (ARCHITECTURE §10) |
+| `SQS_OPERATOR_ACCESS_KEY_ID` / `SQS_OPERATOR_SECRET_ACCESS_KEY` | — (required) | dlqredrive | operator credentials for the redrive tool (ARCHITECTURE §23) |
+| `CONSUMER_WAIT_SECONDS` | `20` | app | long-poll wait (0-20) |
+| `CONSUMER_MAX_MESSAGES` | `10` | app | messages per receive (1-10) |
+| `CONSUMER_HANDLER_TIMEOUT` | `15s` | app | deadline of one message |
+| `CONSUMER_BACKOFF_MAX` | `60s` | app | longest visibility after a transient failure |
+| `CONSUMER_PAUSE_INTERVAL` | `1s` | app | readiness recheck while polling is paused |
 | `OUTBOX_LEASE` | `30s` | app | claim lease (ARCHITECTURE §9) |
 | `OUTBOX_BATCH_SIZE` | `10` | app | events per `SendMessageBatch` (max 10) |
 | `OUTBOX_PUBLISH_TIMEOUT` | `5s` | app | timeout of one publish call |
@@ -145,7 +225,7 @@ from the `provider_id` claim. `/health/*` needs no token.
 | `READINESS_DRAIN_DELAY` | `2s` | app | how long `/health/ready` reports draining before shutdown |
 | `LOG_LEVEL` | `info` | app | `debug`, `info`, `warn`, `error` |
 | `RUN_HTTP` | `true` | app | serve HTTP |
-| `RUN_CONSUMER` | `true` | app | SQS consumer (not implemented yet) |
+| `RUN_CONSUMER` | `true` | app | SQS consumer |
 | `RUN_OUTBOX` | `true` | app | outbox relay |
 | `RUN_REFERENCE_WORKER` | `true` | app | PENDING_REFERENCE worker |
 
@@ -266,7 +346,7 @@ integration tests.
 | `go test -race ./...` | the same with the race detector | Go + gcc (cgo) |
 | `go vet ./...` | vet (add `-tags=integration` to vet integration code too) | Go |
 | `gofmt -l .` | lists unformatted files (should print nothing) | Go |
-| `go test -tags=integration -count=1 ./test/integration/...` | real Postgres via testcontainers: migrations up/down, Fx start/stop with goroutine-leak check, every schema constraint, trigger and grant, the repositories, wallet locking and transaction atomicity, token verification against a real Keycloak (started once per run), the HTTP API end to end including the concurrency scenarios of CHALLENGE §13, the reference worker (late references, expiry, contention, abandoned claims, restart), the outbox relay against a real MiniStack (publishing, contention, crash recovery, backoff, parking) | Docker |
+| `go test -tags=integration -count=1 ./test/integration/...` | real Postgres via testcontainers: migrations up/down, Fx start/stop with goroutine-leak check, every schema constraint, trigger and grant, the repositories, wallet locking and transaction atomicity, token verification against a real Keycloak (started once per run), the HTTP API end to end including the concurrency scenarios of CHALLENGE §13, the reference worker (late references, expiry, contention, abandoned claims, restart), the outbox relay against a real MiniStack (publishing, contention, crash recovery, backoff, parking), the SQS consumer against a real MiniStack (inbox, duplicates, DLQ, HTTP/SQS crossover, crash before delete, transient retries and redrive, readiness pause, graceful stop) | Docker |
 | `go test -tags=integration -race -count=1 ./test/integration/...` | the same with the race detector | Docker + gcc |
 
 With no local C toolchain (for example, on Windows without gcc), run the race

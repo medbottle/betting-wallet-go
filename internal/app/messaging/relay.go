@@ -1,6 +1,6 @@
-// Package messaging holds the outbox relay (and, in its slice, the inbound
-// message handler). The relay publishes committed outbox rows; it never
-// publishes inside a database transaction (CLAUDE.md, ARCHITECTURE §9).
+// Package messaging holds the outbox relay. The relay publishes committed
+// outbox rows; it never publishes inside a database transaction (CLAUDE.md,
+// ARCHITECTURE §9). The inbox lives in wagering.Submit (ARCHITECTURE §23).
 package messaging
 
 import (

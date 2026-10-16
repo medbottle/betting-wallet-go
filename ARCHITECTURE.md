@@ -577,7 +577,7 @@ internal/
     ports.go         # TxRunner, Repos, Clock, IDGenerator, EventPublisher
     wagering/        # SubmitWagerTransaction, ResolvePendingReference, consultas
     wallets/         # OpenWallet, GetWallet, ListLedger, Reconcile
-    messaging/       # HandleInboundMessage (inbox), RelayOutbox
+    messaging/       # RelayOutbox (a inbox ficou em wagering.Submit, seção 23)
     authz/           # Principal, checagem de permissões
   adapters/
     postgres/        # pool, TxRunner, repositórios, classificação de erros pg
@@ -889,7 +889,7 @@ Tudo abaixo segue as seções 3, 4, 6, 8 e 9; os pontos que os documentos não d
 - O corpo publicado é o `payload` lido do banco. Como a coluna é `JSONB` (seção 9), o conteúdo é idêntico ao snapshot do evento, mas a ordem das chaves e os espaços são os do Postgres (premissa A11).
 - Sem métricas ainda: um evento estacionado gera log de erro com `eventId`, tipo, tentativas, `senderFault` e erro; `outbox_parked_total` chega com o slice de métricas.
 
-**Credenciais do broker** (seção 10): o publisher usa só `SQS_PUBLISHER_ACCESS_KEY_ID`/`SECRET`, sem ler arquivos de configuração da AWS nem o ambiente; o consumidor terá as suas no próximo slice. O teste negativo existe e foi executado: o MiniStack **não aplica IAM** (as credenciais do publisher conseguem `ReceiveMessage` na fila de entrada, e até credenciais desconhecidas são aceitas), então o teste é pulado com essa razão explícita. A separação está configurada, mas não é verificável neste emulador (limitação, premissa A12).
+**Credenciais do broker** (seção 10): o publisher usa só `SQS_PUBLISHER_ACCESS_KEY_ID`/`SECRET`, sem ler arquivos de configuração da AWS nem o ambiente; o consumidor ganhou as suas no slice 9 (seção 23). O teste negativo existe e foi executado: o MiniStack **não aplica IAM** (as credenciais do publisher conseguem `ReceiveMessage` na fila de entrada, e até credenciais desconhecidas são aceitas), então o teste é pulado com essa razão explícita. A separação está configurada, mas não é verificável neste emulador (limitação, premissa A12).
 
 **Readiness e startup**: a readiness agora checa PostgreSQL e SQS (`GetQueueAttributes` na fila de eventos, timeout de 1s por checagem, a cada 2s). A URL da fila é resolvida no `OnStart` (passo 4 da seção 14); fila ausente faz o start falhar. Nesse caminho de erro as conexões ociosas do cliente HTTP do SQS são fechadas no próprio `OnStart` (o Fx não chama o `OnStop` de um hook que falhou; o `goleak` pegou isso).
 
@@ -916,6 +916,47 @@ Regras para consumidores: a entrega é at-least-once, então deduplicar por `eve
 - Backoff e estacionamento: com o broker inacessível, as tentativas crescem com `last_error` e, no limite, a linha é estacionada e não é mais reivindicada.
 - Falha parcial do lote: um publisher roteirizado (o único lugar com broker simulado; Postgres é real) rejeita entradas alternadas; as aceitas são marcadas e as rejeitadas reagendadas, sem novo claim antes do backoff.
 - Readiness do SQS, fila ausente falhando o start sem vazar goroutines, e o teste negativo de credenciais (pulado com a razão acima).
+
+---
+
+## 23. Decisões do slice 9 (consumidor SQS, inbox, DLQ e redrive)
+
+**Seguido das seções 4, 9, 10 e 14, sem mudança**: long poll com `WaitTimeSeconds = 20`, `MaxNumberOfMessages = 10` e os atributos `MessageGroupId` e `ApproximateReceiveCount`; mensagens do mesmo grupo em sequência e grupos diferentes em paralelo; deadline de 15s por mensagem; `DeleteMessage` só depois do commit; rejeição de negócio commitada e removida; falha transitória com `ChangeMessageVisibility(min(2^ApproximateReceiveCount, 60))` e liberação (visibility 0) das mensagens seguintes do mesmo grupo no lote; mensagem inválida ou erro permanente com `SendMessage` explícito para a DLQ (grupo = `MessageGroupId` recebido, fallback `invalid-messages`; dedup = `MessageId` do SQS; atributos `failureClass=PERMANENT`, `failureCode`, `originalMessageId`, `envelopeMessageId` quando legível) e depois `DeleteMessage`; polling pausado enquanto a readiness falha, com rechecagem imediata após erro transitório de banco; no SIGTERM, para de buscar, os handlers em voo terminam dentro do deadline e as mensagens não iniciadas são liberadas com visibility 0. O insert da inbox é o primeiro comando da transação (antes do insert da própria linha e do lock da carteira), e a conclusão da inbox é gravada no mesmo commit das mudanças de domínio, do ledger e da outbox.
+
+**Respostas às lacunas** (aprovadas):
+- **G1**: um único poller por instância (`Consumer`), que termina ou libera o lote inteiro antes do próximo `ReceiveMessage`; no máximo 10 mensagens em voo por instância. Mais vazão vem de mais instâncias.
+- **G2**: `cmd/dlqredrive` usa credenciais próprias de operador (`SQS_OPERATOR_ACCESS_KEY_ID`/`SECRET`), separadas das do consumidor e do publisher, como a seção 10 faz para os outros papéis.
+- **G3**: `consumer_name = wager-transactions` na inbox.
+- **G4**: consumidor pausado rechecando a readiness a cada 1s (`CONSUMER_PAUSE_INTERVAL`). Erro de `ReceiveMessage` também espera esse intervalo.
+- **G5**: erros de categoria A recebidos pelo SQS são permanentes: DLQ com o próprio código (`INVALID_MONEY`, `UNSUPPORTED_KIND`, `WALLET_NOT_FOUND` etc.). Reenviar a mesma mensagem não muda o resultado.
+- **G6**: `FAILED` pelo SQS segue a seção 5: a transação separada que grava `FAILED/INTERNAL_INVARIANT_VIOLATION` também insere e conclui a inbox com `outcome = FAILED`, e a mensagem é removida (o estado é terminal e persistido; um replay devolve o mesmo resultado).
+- **G7**: envelope estrito: um único objeto JSON, campos desconhecidos recusados no envelope e em `data`; `messageId` com 1 a 255 caracteres ASCII imprimíveis sem espaço; `type = WagerTransactionRequested`; `occurredAt` em RFC 3339; `data` obrigatório; `money.amount` e `money.currency` como strings JSON (número é `INVALID_MONEY`). Falhas vão para a DLQ com `INVALID_REQUEST` (ou `INVALID_MONEY`).
+- **G8**: erro não classificado no handler é transitório (sem remoção, visibility com backoff), como a premissa A6 faz no HTTP; o redrive da fila manda para a DLQ depois de 10 recebimentos.
+
+**Interpretações**:
+- **Códigos na DLQ**: provedor desconhecido ou inativo usa `FORBIDDEN`, o mesmo código que o HTTP devolve para `ErrProviderNotAllowed`; hash divergente na inbox usa `INVALID_REQUEST` ("mensagem inválida", seção 10). Conflitos usam `IDEMPOTENCY_KEY_CONFLICT`/`EXTERNAL_ID_CONFLICT`. Nenhum código novo foi criado.
+- **`correlationId` no SQS**: o envelope não tem campo de correlação, então o `messageId` do envelope é usado como `correlationId` e como `causationId` da transação e dos eventos.
+- **Replay pela inbox**: se o `messageId` é novo mas a operação já existe (mesma chave, por exemplo enviada antes pelo HTTP), a inbox é concluída com a transação existente e o status dela; a mensagem é removida. Se a operação existente ainda estiver `PENDING` (só uma linha antiga deixada para o worker, seção 5), o handler devolve erro transitório e a mensagem volta depois, porque a inbox não aceita `PENDING` como resultado.
+- **Duplicata**: `messageId` existente com o mesmo hash devolve a transação original sem tocar em nada; um registro de inbox commitado sem conclusão não deveria existir (insert e conclusão estão na mesma transação) e, se aparecer, é tratado como erro não classificado.
+- **Deadline durante o shutdown**: o contexto do handler (15s) não depende do `Stop`, então o trabalho em voo termina ou faz rollback sozinho. Uma falha transitória depois que o `Stop` começou libera a mensagem com visibility 0 (em vez do backoff), para outra instância assumir logo, como a seção 14 descreve.
+- **Falha no envio à DLQ**: a mensagem não é removida e recebe o backoff transitório; o próximo envio é deduplicado pelo `MessageId` dentro de 5 min.
+- **Falha no `DeleteMessage`**: só é logada; a mensagem volta após o visibility timeout e a inbox a reconhece como duplicata.
+- **Liberação das mensagens não iniciadas**: as chamadas de delete, visibility e DLQ usam um contexto próprio de 5s, independente do cancelamento do polling, para acontecerem também durante o shutdown. Cancelar o long poll em andamento no `Stop` pode perder uma resposta já a caminho; essas mensagens voltam após o visibility timeout de 60s.
+- **Readiness no início**: as checagens começam como pendentes, então o consumidor só faz o primeiro `ReceiveMessage` depois da primeira rodada de readiness bem-sucedida.
+
+**Onde fica a inbox**: a árvore de diretórios previa um `HandleInboundMessage` em `app/messaging`. A inbox ficou dentro de `wagering.Submit` (campo opcional `Inbox` do comando), porque o insert e a conclusão precisam estar na mesma transação que o insert da própria linha, o lock e a outbox (seção 4, passos 1 e 4); um caso de uso separado teria de duplicar esse fluxo. O parse do envelope, a classificação dos erros e as chamadas ao SQS ficam no adapter `sqsconsumer`. `app/messaging` mantém só o relay.
+
+**Redrive** (`cmd/dlqredrive`, no mesmo image em `/app/dlqredrive`): lê a DLQ em lotes de 10 com espera de 2s; ignora mensagens com `failureClass=PERMANENT`; reenvia as outras para a fila de origem com o mesmo corpo e o mesmo `MessageGroupId` e `MessageDeduplicationId = <MessageId>:redrive:<unixSeconds>`; remove da DLQ só depois do envio; termina quando um recebimento volta vazio. As mensagens ignoradas ficam em voo até o visibility timeout da DLQ (60s), então, por causa da ordem FIFO, mensagens posteriores do mesmo grupo só são alcançadas se vierem no mesmo lote; rodar de novo depois do timeout alcança o restante. Uma queda entre envio e remoção faz a mensagem ser reenviada numa segunda execução, e a inbox absorve a duplicata.
+
+**Configuração** (env, com padrões da seção 10): `SQS_INBOUND_QUEUE`, `SQS_INBOUND_DLQ` (ambas `.fifo`), `SQS_CONSUMER_ACCESS_KEY_ID`/`SECRET` (obrigatórias), `CONSUMER_WAIT_SECONDS = 20` (0 a 20), `CONSUMER_MAX_MESSAGES = 10` (1 a 10), `CONSUMER_HANDLER_TIMEOUT = 15s`, `CONSUMER_BACKOFF_MAX = 60s`, `CONSUMER_PAUSE_INTERVAL = 1s`. O cliente HTTP do consumidor tem timeout de 10s mais o tempo do long poll. As URLs das duas filas são resolvidas no `OnStart` (passo 4 da seção 14) com as credenciais do consumidor; fila ausente faz o start falhar e fecha as conexões ociosas.
+
+**Lifecycle**: o consumidor inicia no hook "runners" depois do relay e antes do HTTP, e para em paralelo com os outros no orçamento de 20s. O draining da readiness já pausa o polling no instante 0.
+
+**Credenciais do broker**: o consumidor usa só as suas. O teste negativo do lado do consumidor (as credenciais dele não publicam numa fila de eventos) existe e é pulado no MiniStack, que não aplica IAM (premissa A12).
+
+**Testes**:
+- Unitários (`internal/adapters/sqsconsumer`, com `-race` e `goleak`, SQS falso só aqui): regras do envelope; classificação dos erros e atributos da DLQ; fallback de grupo; falha no envio à DLQ; backoff com teto; ordem dentro do grupo e paralelismo entre grupos; liberação após falha transitória; pausa sem readiness; `Stop` esperando o handler em voo e liberando o resto; lógica do redrive.
+- Integração (Postgres, MiniStack e Keycloak reais, uma fila de entrada e uma DLQ próprias por teste): mensagem do exemplo processada com inbox concluída e eventos com `causationId`; item 4 da seção 13 do desafio (três entregas com dedup diferentes do SQS, um efeito); DLQ explícita para hash divergente, JSON inválido, `OPENING`, provedor desconhecido, valor numérico e conflito de chave, sem linhas de domínio, e o redrive deixando essas mensagens na DLQ; rejeição de negócio; `PENDING_REFERENCE` concluindo a inbox e o worker resolvendo depois; cruzamento HTTP e SQS nas duas ordens e concorrente; item 5 da seção 13 (commit e queda antes do delete, reentrega como duplicata); falhas transitórias até o redrive da fila mandar para a DLQ sem `failureClass`, seguidas do redrive pela ferramenta e do processamento; pausa sem readiness; `Stop` com handler em voo; teste negativo de credenciais (pulado). O teste de lifecycle do Fx roda com o consumidor ligado e verifica `goleak`.
 
 ---
 
