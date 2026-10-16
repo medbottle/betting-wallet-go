@@ -9,6 +9,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/medbottle/betting-wallet-go/internal/adapters/httpapi"
+	"github.com/medbottle/betting-wallet-go/internal/adapters/sqsconsumer"
 	"github.com/medbottle/betting-wallet-go/internal/app/wagering"
 	"github.com/medbottle/betting-wallet-go/internal/platform/config"
 	"github.com/medbottle/betting-wallet-go/internal/platform/health"
@@ -22,8 +23,8 @@ const runnersShutdownBudget = 20 * time.Second
 // runs first: readiness flips to draining, the drain delay elapses, then
 // every runner shuts down concurrently while the pool is still open.
 //
-// Start order (ARCHITECTURE §14): reference worker, outbox relay, then
-// HTTP. The consumer joins the same hook in its slice.
+// Start order (ARCHITECTURE §14): reference worker, outbox relay,
+// consumer, then HTTP.
 var RunnersModule = fx.Module("runners",
 	fx.Invoke(registerRunners),
 )
@@ -55,20 +56,19 @@ type runnersParams struct {
 	HTTP            *httpapi.Server
 	ReferenceWorker referenceWorker
 	OutboxRelay     outboxRelay
+	Consumer        *sqsconsumer.Consumer
 }
 
 func registerRunners(p runnersParams) {
 	logger := p.Logger.With(slog.String("component", "runners"))
 	p.LC.Append(fx.Hook{
 		OnStart: func(ctx context.Context) error {
-			if p.Cfg.RunConsumer {
-				logger.Info("role enabled but not implemented yet", slog.String("role", "consumer"))
-			}
 			// stopStarted undoes a partial start: Fx does not call OnStop for
 			// a hook whose OnStart failed.
 			stopStarted := func() {
 				_ = p.ReferenceWorker.Stop(ctx)
 				_ = p.OutboxRelay.Stop(ctx)
+				_ = p.Consumer.Stop(ctx)
 			}
 			if p.Cfg.RunReferenceWorker {
 				if err := p.ReferenceWorker.Start(); err != nil {
@@ -77,6 +77,12 @@ func registerRunners(p runnersParams) {
 			}
 			if p.Cfg.RunOutbox {
 				if err := p.OutboxRelay.Start(); err != nil {
+					stopStarted()
+					return err
+				}
+			}
+			if p.Cfg.RunConsumer {
+				if err := p.Consumer.Start(); err != nil {
 					stopStarted()
 					return err
 				}
@@ -114,6 +120,10 @@ func registerRunners(p runnersParams) {
 			// An in-flight publish keeps its own timeout; an unmarked batch
 			// is republished after its lease (ARCHITECTURE §14).
 			g.Go(func() error { return p.OutboxRelay.Stop(gctx) })
+			// Draining already paused polling; handlers in flight finish
+			// within their deadline and unstarted messages are released
+			// (ARCHITECTURE §14).
+			g.Go(func() error { return p.Consumer.Stop(gctx) })
 			err := g.Wait()
 			logger.Info("runners stopped")
 			return err
