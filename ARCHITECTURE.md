@@ -719,7 +719,9 @@ Versão do Go: a última estável no momento da implementação, fixada em `go.m
 - `kind` diferencia maiúsculas (`bet` → `UNSUPPORTED_KIND`).
 - Ordem das checagens (o primeiro erro vence): chave → identificadores e UUIDs → money → kind → valor por kind → referências. Formato inválido de identificador ou de chave é `INVALID_REQUEST`; chave ausente é `MISSING_IDEMPOTENCY_KEY`.
 
-**Hash canônico**: `money` é um objeto aninhado (`{"amount","currency"}`), as chaves seguem ordem lexicográfica (garantida pela ordem dos campos e verificada contra um mapa reordenado), sem escape HTML, sem `\n` final. O digest de um exemplo fixo está fixado em teste e foi conferido com `sha256sum`. `MessageHash` acrescenta `idempotencyKey`.
+**Hash canônico**: `money` é um objeto aninhado (`{"amount","currency"}`), as chaves seguem ordem lexicográfica (garantida pela ordem dos campos e verificada contra um mapa reordenado), sem escape HTML, sem `\n` final. O digest de um exemplo fixo está fixado em teste e foi conferido com `sha256sum`. `MessageHash` acrescenta `idempotencyKey`. Os métodos exportados (`PayloadHash`, `MessageHash`, `CanonicalPayload`, `CanonicalMessage`) devolvem erro para um `Request` não inicializado, que nunca produz um hash.
+
+**Valores não inicializados**: `Money{}`, `Currency{}`, `Kind`/`Status`/`FailureCode` vazios, UUID nulo e `time.Time` zero são rejeitados pelos construtores e operações. `wallet.LedgerEntry` e `event.Envelope` expõem `Valid()`, e a persistência deve recusar valores zero desses tipos antes do insert.
 
 **`CheckReplay`**: implementa as regras de conflito da seção 6 de forma pura e devolve `*ConflictError` (categoria C). Uma linha existente de outro provedor, ou que não bate nem por chave nem por ID externo, é erro de programação (`ErrInvalidTransaction`).
 
@@ -731,7 +733,7 @@ Versão do Go: a última estável no momento da implementação, fixada em `go.m
 **`Apply`** (regras da seção 7):
 - Valida antes de tudo que a carteira é a da transação (senão erro de programação) e que jogador e moeda batem (`PLAYER_WALLET_MISMATCH`/`CURRENCY_MISMATCH`, categoria A), inclusive para `LOSS`.
 - Referência ausente ou ainda não terminal (`PENDING` ou `PENDING_REFERENCE`): espera até o deadline (`created_at + TTL`); `WagerTransactionPendingReference` só na entrada; `Reschedule` não emite evento. No deadline: `REFERENCE_NOT_FOUND` (nunca chegou) ou `REFERENCE_UNRESOLVED_TIMEOUT` (existe mas pendente). Referência resolvível é aplicada mesmo após o deadline.
-- Ordem das checagens da referência: status → kind → provedor/carteira/rodada → valor → já revertida → saldo. `WIN` com referência que não seja `BET`, ou referência a operação `INTERNAL`, é `REFERENCE_KIND_NOT_ALLOWED`.
+- Ordem das checagens da referência: status → kind → provedor/jogador/carteira/moeda/rodada → valor → já revertida → saldo. Jogador e moeda também decorrem da carteira no schema (FKs compostas), mas são comparados explicitamente para que a regra do CHALLENGE §7 valha para valores em memória. `WIN` com referência que não seja `BET`, ou referência a operação `INTERNAL`, é `REFERENCE_KIND_NOT_ALLOWED`.
 - Uma referência encontrada e terminal é gravada em `reference_transaction_id` mesmo quando a operação é rejeitada, para auditoria.
 - O cálculo do backoff (com jitter) fica no worker: o domínio só recebe `NextAttemptAt`.
 - Rejeições de negócio são `Outcome`, não erros. Um erro significa que nada deve ser persistido; quem chama descarta transação e carteira em memória e faz rollback.
