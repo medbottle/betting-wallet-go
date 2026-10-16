@@ -1,17 +1,84 @@
 // Package httpapi is the HTTP transport: router, handlers, DTOs and error
-// mapping. In this slice it serves only the public health endpoints.
+// mapping (ARCHITECTURE §13). Business routes always sit behind
+// RequireAuth; /health/* is public.
 package httpapi
 
 import (
+	"context"
+	"log/slog"
 	"net/http"
 	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/medbottle/betting-wallet-go/internal/app/wagering"
+	"github.com/medbottle/betting-wallet-go/internal/app/wallets"
+	"github.com/medbottle/betting-wallet-go/internal/domain/wager"
+	"github.com/medbottle/betting-wallet-go/internal/domain/wallet"
 )
 
-// NewRouter builds the root handler. Every route runs under
-// handlerTimeout (ARCHITECTURE §14).
-func NewRouter(readiness ReadinessReporter, handlerTimeout time.Duration) http.Handler {
+// WageringService is what the wagering handlers need.
+type WageringService interface {
+	Submit(ctx context.Context, cmd wagering.SubmitCommand) (wagering.SubmitResult, error)
+	Get(ctx context.Context, id uuid.UUID) (*wager.WagerTransaction, error)
+	GetByExternalID(ctx context.Context, providerID, externalTransactionID string) (*wager.WagerTransaction, error)
+}
+
+// WalletService is what the wallet handlers need.
+type WalletService interface {
+	Open(ctx context.Context, cmd wallets.OpenCommand) (*wallet.Wallet, error)
+	Get(ctx context.Context, walletID uuid.UUID) (*wallet.Wallet, error)
+	Ledger(ctx context.Context, walletID uuid.UUID, cursor string, limit int) (wallets.LedgerPage, error)
+	Reconcile(ctx context.Context, walletID uuid.UUID, correlationID string) (wallets.Reconciliation, error)
+}
+
+// Deps are the router's collaborators. Without a Verifier only the public
+// health routes are registered: a business route is never served
+// unauthenticated.
+type Deps struct {
+	Readiness      ReadinessReporter
+	Verifier       TokenVerifier
+	Wagering       WageringService
+	Wallets        WalletService
+	NewID          func() uuid.UUID
+	Logger         *slog.Logger
+	HandlerTimeout time.Duration
+}
+
+// NewRouter builds the root handler. Every route runs under the handler
+// timeout (ARCHITECTURE §14) and gets a correlation id (§20, Q6).
+func NewRouter(d Deps) http.Handler {
+	if d.Logger == nil {
+		d.Logger = slog.New(slog.DiscardHandler)
+	}
+	if d.NewID == nil {
+		d.NewID = uuid.New
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health/live", handleLive)
-	mux.HandleFunc("GET /health/ready", handleReady(readiness))
-	return http.TimeoutHandler(mux, handlerTimeout, `{"error":{"code":"TEMPORARILY_UNAVAILABLE","message":"handler timeout","retryable":true}}`)
+	mux.HandleFunc("GET /health/ready", handleReady(d.Readiness))
+
+	if d.Verifier != nil {
+		h := handlers{wagering: d.Wagering, wallets: d.Wallets, logger: d.Logger}
+		auth := RequireAuth(d.Verifier, d.Logger)
+		route := func(pattern string, fn http.HandlerFunc) { mux.Handle(pattern, auth(fn)) }
+
+		route("POST /wagering/transactions", h.submit)
+		route("GET /wagering/transactions/{transactionId}", h.getTransaction)
+		route("GET /providers/{providerId}/wagering/transactions/{externalTransactionId}", h.getProviderTransaction)
+
+		route("POST /wallets", h.openWallet)
+		route("GET /wallets/{walletId}", h.getWallet)
+		route("GET /wallets/{walletId}/ledger", h.listLedger)
+		route("POST /wallets/{walletId}/reconciliation", h.reconcile)
+	}
+
+	timeoutBody := `{"error":{"code":"TEMPORARILY_UNAVAILABLE","message":"handler timeout","retryable":true}}`
+	return withCorrelation(d.NewID, http.TimeoutHandler(mux, d.HandlerTimeout, timeoutBody))
+}
+
+type handlers struct {
+	wagering WageringService
+	wallets  WalletService
+	logger   *slog.Logger
 }

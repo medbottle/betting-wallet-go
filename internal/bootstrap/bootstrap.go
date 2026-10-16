@@ -33,6 +33,7 @@ func Options(extra ...fx.Option) fx.Option {
 		PostgresModule,
 		RepositoryModule,
 		AuthModule,
+		AppModule,
 		HealthModule,
 		HTTPModule,
 		RunnersModule,

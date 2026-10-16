@@ -29,7 +29,7 @@ func TestHealthEndpoints(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			h := NewRouter(fakeReporter{tt.rep}, time.Second)
+			h := NewRouter(Deps{Readiness: fakeReporter{tt.rep}, HandlerTimeout: time.Second})
 			rec := httptest.NewRecorder()
 			h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, tt.path, nil))
 			if rec.Code != tt.wantCode {
@@ -52,7 +52,7 @@ func TestHealthEndpoints(t *testing.T) {
 }
 
 func TestHealthRejectsOtherMethods(t *testing.T) {
-	h := NewRouter(fakeReporter{}, time.Second)
+	h := NewRouter(Deps{Readiness: fakeReporter{}, HandlerTimeout: time.Second})
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/health/live", nil))
 	if rec.Code != http.StatusMethodNotAllowed {

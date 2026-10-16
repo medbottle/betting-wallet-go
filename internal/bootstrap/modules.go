@@ -13,6 +13,9 @@ import (
 
 	"github.com/medbottle/betting-wallet-go/internal/adapters/httpapi"
 	"github.com/medbottle/betting-wallet-go/internal/adapters/postgres"
+	"github.com/medbottle/betting-wallet-go/internal/app"
+	"github.com/medbottle/betting-wallet-go/internal/app/wagering"
+	"github.com/medbottle/betting-wallet-go/internal/app/wallets"
 	"github.com/medbottle/betting-wallet-go/internal/platform/config"
 	"github.com/medbottle/betting-wallet-go/internal/platform/health"
 	"github.com/medbottle/betting-wallet-go/internal/platform/logging"
@@ -161,8 +164,27 @@ var HTTPModule = fx.Module("http",
 	),
 )
 
-func newRouter(cfg config.Config, r *health.Readiness) http.Handler {
-	return httpapi.NewRouter(r, cfg.HTTPHandlerTimeout)
+type routerParams struct {
+	fx.In
+	Cfg       config.Config
+	Readiness *health.Readiness
+	Verifier  httpapi.TokenVerifier
+	Wagering  *wagering.Service
+	Wallets   *wallets.Service
+	IDs       app.IDGenerator
+	Logger    *slog.Logger
+}
+
+func newRouter(p routerParams) http.Handler {
+	return httpapi.NewRouter(httpapi.Deps{
+		Readiness:      p.Readiness,
+		Verifier:       p.Verifier,
+		Wagering:       p.Wagering,
+		Wallets:        p.Wallets,
+		NewID:          p.IDs.NewID,
+		Logger:         p.Logger.With(slog.String("component", "http")),
+		HandlerTimeout: p.Cfg.HTTPHandlerTimeout,
+	})
 }
 
 func newHTTPServer(cfg config.Config, h http.Handler, logger *slog.Logger) *httpapi.Server {

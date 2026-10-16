@@ -103,7 +103,7 @@ func TestAuthMiddlewareWithKeycloak(t *testing.T) {
 	readiness := health.NewReadiness(nil, time.Second, time.Second, logger)
 	readiness.CheckNow(context.Background())
 	mux := http.NewServeMux()
-	mux.Handle("/health/", httpapi.NewRouter(readiness, time.Second))
+	mux.Handle("/health/", httpapi.NewRouter(httpapi.Deps{Readiness: readiness, HandlerTimeout: time.Second}))
 	mux.Handle("GET /protected", httpapi.RequireAuth(v, logger)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p, _ := authz.FromContext(r.Context())
 		id, _ := p.ProviderID()
