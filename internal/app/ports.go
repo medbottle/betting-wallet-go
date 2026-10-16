@@ -67,6 +67,34 @@ type WalletIdentity struct {
 type WalletReader interface {
 	// GetIdentity returns ErrNotFound for an unknown wallet.
 	GetIdentity(ctx context.Context, walletID uuid.UUID) (WalletIdentity, error)
+	// Get reads the whole wallet without locking (GET /wallets/{id}).
+	// ErrNotFound for an unknown wallet.
+	Get(ctx context.Context, walletID uuid.UUID) (*wallet.Wallet, error)
+}
+
+// The readers below run single statements on the pool, outside any
+// transaction, under READ COMMITTED and without locks: the provider
+// registry check of ARCHITECTURE §11 and the GET endpoints
+// (ARCHITECTURE §20, Q3/Q4).
+
+// ProviderReader checks the provider registry (ARCHITECTURE §11).
+type ProviderReader interface {
+	// IsActive is false for an unknown or inactive provider.
+	IsActive(ctx context.Context, providerID string) (bool, error)
+}
+
+// TransactionReader serves the transaction GET endpoints.
+type TransactionReader interface {
+	// GetByID and GetByExternalID return ErrNotFound when absent.
+	GetByID(ctx context.Context, transactionID uuid.UUID) (*wager.WagerTransaction, error)
+	GetByExternalID(ctx context.Context, providerID, externalTransactionID string) (*wager.WagerTransaction, error)
+}
+
+// LedgerReader serves the ledger listing.
+type LedgerReader interface {
+	// List returns up to limit entries with wallet_version > afterVersion,
+	// in version order.
+	List(ctx context.Context, walletID uuid.UUID, afterVersion int64, limit int) ([]wallet.LedgerEntry, error)
 }
 
 // WalletRepository persists the wallet aggregate.
@@ -74,6 +102,9 @@ type WalletRepository interface {
 	// Insert returns ErrWalletAlreadyExists when the player already has a
 	// wallet in that currency.
 	Insert(ctx context.Context, w *wallet.Wallet) error
+	// Get reads the wallet without locking, inside the transaction (the
+	// reconciliation snapshot). ErrNotFound for an unknown wallet.
+	Get(ctx context.Context, walletID uuid.UUID) (*wallet.Wallet, error)
 	// GetForUpdate locks the wallet row (SELECT ... FOR NO KEY UPDATE) for the rest
 	// of the transaction. ErrNotFound for an unknown wallet.
 	GetForUpdate(ctx context.Context, walletID uuid.UUID) (*wallet.Wallet, error)

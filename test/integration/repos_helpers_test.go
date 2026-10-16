@@ -27,7 +27,7 @@ const refTTL = 10 * time.Minute
 type repoEnv struct {
 	db     schemaDB
 	runner *postgres.TxRunner
-	reader *postgres.WalletReader
+	reader *postgres.Reader
 	ids    func() uuid.UUID
 }
 
@@ -38,7 +38,7 @@ func newRepoEnv(t *testing.T) repoEnv {
 	return repoEnv{
 		db:     db,
 		runner: postgres.NewTxRunner(db.app, 5*time.Second),
-		reader: postgres.NewWalletReader(db.app),
+		reader: postgres.NewReader(db.app),
 		ids:    gen.NewID,
 	}
 }

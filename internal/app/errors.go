@@ -10,6 +10,9 @@ var (
 	// ErrWalletAlreadyExists means the player already has a wallet in that
 	// currency (WALLET_ALREADY_EXISTS, category C).
 	ErrWalletAlreadyExists = errors.New("app: wallet already exists")
+	// ErrProviderNotAllowed means the provider is unknown or inactive in the
+	// registry (ARCHITECTURE §11): rejected with no effects.
+	ErrProviderNotAllowed = errors.New("app: provider unknown or inactive")
 	// ErrTransient means the operation may succeed if retried: rolled back,
 	// nothing persisted (category E: HTTP 503, SQS redelivery; ARCHITECTURE
 	// §4/§5).

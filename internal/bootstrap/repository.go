@@ -17,7 +17,11 @@ import (
 var RepositoryModule = fx.Module("repository",
 	fx.Provide(
 		fx.Annotate(newTxRunner, fx.As(new(app.TxRunner))),
-		fx.Annotate(postgres.NewWalletReader, fx.As(new(app.WalletReader))),
+		// One pool-backed reader serves the pre-read, the provider registry
+		// and the GET endpoints (ARCHITECTURE §20, Q3/Q4).
+		fx.Annotate(postgres.NewReader,
+			fx.As(new(app.WalletReader)), fx.As(new(app.ProviderReader)),
+			fx.As(new(app.TransactionReader)), fx.As(new(app.LedgerReader))),
 		fx.Annotate(func() clock.System { return clock.System{} }, fx.As(new(app.Clock))),
 		fx.Annotate(func() idgen.UUIDv7 { return idgen.UUIDv7{} }, fx.As(new(app.IDGenerator))),
 	),
