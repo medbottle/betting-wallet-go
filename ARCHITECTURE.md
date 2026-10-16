@@ -653,7 +653,50 @@ Versão do Go: a última estável no momento da implementação, fixada em `go.m
 
 ---
 
+## 16. Decisões do slice 2 (schema)
+
+**Uma migration por tabela**, na ordem das dependências de FK: `0002_providers`, `0003_wallets`, `0004_wager_transactions`, `0005_wallet_ledger_entries`, `0006_inbox_messages`, `0007_outbox_events`. A `0001` (`schema_info`) é mantida. O seed de `provider-a`/`provider-b` fica na própria `0002`.
+
+**Funções de trigger por tabela** (`<tabela>_guard()`), criadas e removidas na migration da tabela. Nenhuma migration depende de função de outra, então cada `down` é autocontido. O golang-migrate envia cada arquivo como uma única query de múltiplos statements, que o Postgres executa numa transação implícita: uma migration falha por inteiro ou é aplicada por inteiro.
+
+**SQLSTATE dos triggers**: todos levantam `23000` (`integrity_constraint_violation`) com mensagem `"<tabela>: ..."`. A classe 23 permite que o adapter trate qualquer violação de integridade disparada pelo banco como `INTERNAL_INVARIANT_VIOLATION`. As constraints têm nomes explícitos (por exemplo, `wallets_player_currency_key`, `wager_transactions_provider_external_id_key`), para que o adapter mapeie `ConstraintName` para `WALLET_ALREADY_EXISTS`, `EXTERNAL_ID_CONFLICT` etc. sem depender de nomes gerados.
+
+**Guardas além do esboço** (aprovadas):
+- **FK composta de jogador**: `wager_transactions (wallet_id, player_id, currency) → wallets (id, player_id, currency)`, com `UNIQUE (id, player_id, currency)` em `wallets`. Jogador e moeda de uma operação sempre coincidem com os da carteira.
+- **FK composta do ledger**: `wallet_ledger_entries (transaction_id, wallet_id, currency) → wager_transactions (id, wallet_id, currency)`. Um lançamento não aponta para uma operação de outra carteira.
+- **Colunas de negócio imutáveis e máquina de estados no trigger de `wager_transactions`**:
+  - mesmo antes do estado terminal, não mudam `id`, `origin`, `kind`, carteira, jogador, moeda, valor, provedor, ID externo, chave, hash, `hash_version`, rodada, jogo, referência externa, `correlation_id` e `created_at`;
+  - `PENDING_REFERENCE → PENDING` é rejeitado;
+  - `reference_transaction_id`, uma vez preenchido, não muda.
+- **`failure_code` restrito por CHECK**: `REJECTED` aceita só os códigos da categoria B; `FAILED` só `INTERNAL_INVARIANT_VIOLATION`; os demais estados exigem `NULL`. Um código novo exige migration, além da atualização da seção 12.
+- **Regra de versão da carteira**: o trigger de `wallets` exige `version = OLD.version + 1` quando o saldo muda e versão inalterada quando não muda (CHALLENGE §6.2).
+- **`TRUNCATE` bloqueado em todas as tabelas**, não só no ledger. Como `TRUNCATE` de tabela referenciada exige `CASCADE`, os testes usam `TRUNCATE ... CASCADE` como owner para exercitar o trigger.
+
+**Outras interpretações do esboço**:
+- `OPENING` (`INTERNAL`) é inserido já `PROCESSED`, sem passar por `PENDING`; o CHECK de forma exige isso.
+- `completed_at` é preenchido se e somente se o estado é terminal. `PENDING`/`PENDING_REFERENCE` exigem `result_*` nulos. `PENDING_REFERENCE` exige `reference_deadline_at`.
+- `payload_hash` tem exatamente 32 bytes (SHA-256). `idempotency_key` casa com `^[ -~]{1,255}$` (ASCII imprimível, espaço incluído).
+- `amount_minor`: `LOSS` ⇔ zero, aplicado também ao `OPENING` (saldo inicial zero não cria `OPENING`).
+- `wallet_ledger_entries.wallet_version >= 1`: o crédito do `OPENING` é registrado na versão 1. Um crédito que estouraria `BIGINT` falha no próprio CHECK aritmético com `22003`.
+- **Inbox**: `outcome` e `processed_at` ficam nulos entre o insert (passo 1 da seção 4) e a conclusão, na mesma transação, e um CHECK amarra os dois. `outcome` é o status da transação vinculada na conclusão (`PROCESSED`, `REJECTED`, `PENDING_REFERENCE`, `FAILED`), inclusive quando uma mensagem SQS reproduz uma operação recebida por HTTP. Mensagem concluída é imutável.
+- **Outbox**: além das colunas da seção 9, `aggregate_type`, `correlation_id` e `causation_id` também são imutáveis; `published_at`, uma vez preenchido, não muda; `published_at` e `parked_at` não coexistem; `payload` precisa ser objeto JSON.
+- **`providers`**: `wallet_app` tem só `SELECT`. O registro é gerido por operação; a aplicação apenas consulta.
+
+**Matriz de privilégios de `wallet_app`** (verificada por `TestSchemaGrants`):
+
+| Tabela | Privilégios |
+| --- | --- |
+| `wallets`, `wager_transactions`, `inbox_messages`, `outbox_events` | `SELECT`, `INSERT`, `UPDATE` |
+| `wallet_ledger_entries` | `SELECT`, `INSERT` |
+| `providers`, `schema_info`, `schema_migrations` | `SELECT` |
+
+**Testes**: `test/integration/schema_*_test.go` (tag `integration`) sobem um Postgres por tabela e verificam cada CHECK, unicidade, FK e trigger pelo SQLSTATE e pelo nome da constraint. Triggers são exercitados como `wallet_owner`; privilégios, como `wallet_app`. Cada caso roda numa transação desfeita ao final.
+
+---
+
 ## Esboço do schema
+
+> O schema implementado está em `migrations/`; a seção 16 registra onde ele refina este esboço.
 
 **`providers`**: `provider_id TEXT PK`, `active BOOL NOT NULL`.
 
@@ -711,7 +754,7 @@ Versão do Go: a última estável no momento da implementação, fixada em `go.m
 1. Trigger `BEFORE UPDATE OR DELETE` por linha e trigger `BEFORE TRUNCATE` por statement, ambos com `RAISE EXCEPTION`.
 2. Privilégios: migrations rodam como `wallet_owner`; a aplicação conecta como `wallet_app`.
    - No ledger, `wallet_app` tem somente `SELECT` e `INSERT`.
-   - Nas demais tabelas, `SELECT`, `INSERT` e `UPDATE`, sem `DELETE` nem `TRUNCATE`.
+   - Nas demais tabelas, `SELECT`, `INSERT` e `UPDATE`, sem `DELETE` nem `TRUNCATE` (exceto `providers`, só `SELECT`; seção 16).
 3. Testes de integração verificam que `UPDATE` e `DELETE` falham mesmo executados como owner, o que exercita o trigger.
 
 ---

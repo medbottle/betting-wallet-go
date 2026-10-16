@@ -4,9 +4,9 @@ Distributed processing of bets and wallet movements in Go (Uber Fx, PostgreSQL,
 SQS, Keycloak). Spec: [docs/CHALLENGE.md](docs/CHALLENGE.md). Design decisions:
 [ARCHITECTURE.md](ARCHITECTURE.md).
 
-> **Status: slice 1 (skeleton and infrastructure).** Only the health endpoints
-> and the migration tooling exist. There is no domain logic, business API, SQS
-> consumer or real schema yet.
+> **Status: slice 2 (schema).** The infrastructure, health endpoints, migration
+> tooling and the full database schema exist, with constraints, triggers and
+> grants. There is no domain logic, business API or SQS consumer yet.
 
 ## Prerequisites
 
@@ -97,7 +97,22 @@ found.
 
 ## Database migrations
 
-Migrations live in `migrations/` as `NNNN_name.up.sql` / `NNNN_name.down.sql`.
+Migrations live in `migrations/` as `NNNN_name.up.sql` / `NNNN_name.down.sql`,
+one per table:
+
+| Version | Creates |
+| --- | --- |
+| 0001 | `schema_info` (pipeline check) |
+| 0002 | `providers`, seeded with `provider-a` and `provider-b` |
+| 0003 | `wallets` |
+| 0004 | `wager_transactions` |
+| 0005 | `wallet_ledger_entries` (append-only) |
+| 0006 | `inbox_messages` |
+| 0007 | `outbox_events` |
+
+Each migration carries its table's constraints, trigger guards and grants for
+`wallet_app` (see ARCHITECTURE.md §16).
+
 They are embedded in the binaries and applied with
 [golang-migrate](https://github.com/golang-migrate/migrate) through
 `cmd/migrate`. Migrations always run as the schema owner role `wallet_owner`.
@@ -156,7 +171,7 @@ integration tests.
 | `go test -race ./...` | the same with the race detector | Go + gcc (cgo) |
 | `go vet ./...` | vet (add `-tags=integration` to vet integration code too) | Go |
 | `gofmt -l .` | lists unformatted files (should print nothing) | Go |
-| `go test -tags=integration -count=1 ./test/integration/...` | real Postgres via testcontainers: migrations up/down, Fx start/stop with goroutine-leak check | Docker |
+| `go test -tags=integration -count=1 ./test/integration/...` | real Postgres via testcontainers: migrations up/down, Fx start/stop with goroutine-leak check, every schema constraint, trigger and grant | Docker |
 | `go test -tags=integration -race -count=1 ./test/integration/...` | the same with the race detector | Docker + gcc |
 
 With no local C toolchain (for example, on Windows without gcc), run the race
