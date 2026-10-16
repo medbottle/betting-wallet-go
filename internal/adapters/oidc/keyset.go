@@ -21,6 +21,11 @@ const maxJWKSBytes = 1 << 20
 // refresh is not allowed yet (rate limit) or did not provide it.
 var ErrUnknownKey = errors.New("oidc: unknown signing key")
 
+// ErrKeysUnavailable means the token's kid is not cached and the JWKS could
+// not be fetched (the IdP is down): the token may be valid, so the request
+// is retryable (503), not rejected (ARCHITECTURE §24, Q5).
+var ErrKeysUnavailable = errors.New("oidc: signing keys unavailable")
+
 // KeySet caches the IdP's RS256 signing keys and refetches the JWKS when a
 // token carries an unknown kid, at most once per minInterval
 // (ARCHITECTURE §11/§19). The first unknown kid after a quiet period
@@ -35,6 +40,7 @@ type KeySet struct {
 	mu        sync.RWMutex
 	keys      []jose.JSONWebKey
 	lastFetch time.Time // last attempt, successful or not
+	lastErr   error     // outcome of the last attempt
 
 	fetchMu sync.Mutex // one fetch at a time
 }
@@ -106,51 +112,64 @@ func (k *KeySet) refreshForUnknownKid(ctx context.Context) error {
 	defer k.fetchMu.Unlock()
 
 	k.mu.RLock()
-	last := k.lastFetch
+	last, lastErr := k.lastFetch, k.lastErr
 	k.mu.RUnlock()
 	if !last.Before(started) {
 		// Another request fetched while we waited; use its result.
-		return nil
+		return unavailable(lastErr)
 	}
 	if !last.IsZero() && k.now().Sub(last) < k.minInterval {
+		// Rate limited: if the last attempt failed the IdP is still
+		// considered down; otherwise the kid is simply unknown.
+		if lastErr != nil {
+			return unavailable(lastErr)
+		}
 		return ErrUnknownKey
 	}
-	if err := k.fetch(ctx); err != nil {
-		return fmt.Errorf("%w: refresh failed: %w", ErrUnknownKey, err)
-	}
-	return nil
+	return unavailable(k.fetch(ctx))
 }
 
-// fetch downloads the JWKS. Callers hold fetchMu.
+func unavailable(fetchErr error) error {
+	if fetchErr == nil {
+		return nil
+	}
+	return fmt.Errorf("%w: refresh failed: %w", ErrKeysUnavailable, fetchErr)
+}
+
+// fetch downloads the JWKS and records the outcome. Callers hold fetchMu.
 func (k *KeySet) fetch(ctx context.Context) error {
 	k.mu.Lock()
 	k.lastFetch = k.now()
 	k.mu.Unlock()
+	keys, err := k.download(ctx)
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	k.lastErr = err
+	if err == nil {
+		k.keys = keys
+	}
+	return err
+}
+
+func (k *KeySet) download(ctx context.Context) ([]jose.JSONWebKey, error) {
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, k.url, nil)
 	if err != nil {
-		return fmt.Errorf("oidc: jwks request: %w", err)
+		return nil, fmt.Errorf("oidc: jwks request: %w", err)
 	}
 	resp, err := k.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("oidc: fetch jwks: %w", err)
+		return nil, fmt.Errorf("oidc: fetch jwks: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("oidc: fetch jwks: status %d", resp.StatusCode)
+		return nil, fmt.Errorf("oidc: fetch jwks: status %d", resp.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxJWKSBytes))
 	if err != nil {
-		return fmt.Errorf("oidc: read jwks: %w", err)
+		return nil, fmt.Errorf("oidc: read jwks: %w", err)
 	}
-	keys, err := parseSigningKeys(body)
-	if err != nil {
-		return err
-	}
-	k.mu.Lock()
-	k.keys = keys
-	k.mu.Unlock()
-	return nil
+	return parseSigningKeys(body)
 }
 
 // parseSigningKeys keeps the RSA signature keys (use "sig" or unset).

@@ -15,6 +15,7 @@ import (
 
 	jose "github.com/go-jose/go-jose/v4"
 
+	"github.com/medbottle/betting-wallet-go/internal/app"
 	"github.com/medbottle/betting-wallet-go/internal/app/authz"
 )
 
@@ -301,11 +302,48 @@ func TestFailedRefreshKeepsCachedKeys(t *testing.T) {
 	f.clock.Add(time.Minute)
 	f.idp.fail.Store(true)
 	forged := signWith(t, jose.SigningKey{Algorithm: jose.RS256, Key: mustKey(t)}, "unknown", providerClaims(f.clock.Now()))
-	if _, err := f.v.Verify(context.Background(), forged); !errors.Is(err, ErrInvalidToken) {
+	if _, err := f.v.Verify(context.Background(), forged); !errors.Is(err, app.ErrTransient) {
 		t.Fatalf("err = %v", err)
 	}
 	if _, err := f.v.Verify(context.Background(), f.idp.sign(t, "k1", providerClaims(f.clock.Now()))); err != nil {
 		t.Fatalf("cached key lost after a failed refresh: %v", err)
+	}
+}
+
+// TestUnknownKidWhileIdPDown is ARCHITECTURE §24, Q5: an unknown kid that
+// cannot be checked because the JWKS fetch fails is transient (503), also
+// inside the rate-limit window; once the IdP answers again an unknown kid
+// is an invalid token (401). Tokens signed with cached keys keep working.
+func TestUnknownKidWhileIdPDown(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	f.clock.Add(time.Minute)
+	f.idp.fail.Store(true)
+	forged := func() string {
+		return signWith(t, jose.SigningKey{Algorithm: jose.RS256, Key: mustKey(t)}, "unknown", providerClaims(f.clock.Now()))
+	}
+	for i := 0; i < 3; i++ { // first: a failed fetch; then: rate limited, last fetch failed
+		_, err := f.v.Verify(ctx, forged())
+		if !errors.Is(err, app.ErrTransient) || !errors.Is(err, ErrKeysUnavailable) || errors.Is(err, ErrInvalidToken) {
+			t.Fatalf("attempt %d: err = %v, want transient ErrKeysUnavailable", i, err)
+		}
+	}
+	if got := f.idp.fetches.Load(); got != 2 {
+		t.Fatalf("fetches = %d: the rate limit must still apply while the IdP is down", got)
+	}
+	if _, err := f.v.Verify(ctx, f.idp.sign(t, "k1", providerClaims(f.clock.Now()))); err != nil {
+		t.Fatalf("cached key rejected during the outage: %v", err)
+	}
+	// A bad signature with a cached kid is invalid, outage or not.
+	bad := signWith(t, jose.SigningKey{Algorithm: jose.RS256, Key: mustKey(t)}, "k1", providerClaims(f.clock.Now()))
+	if _, err := f.v.Verify(ctx, bad); !errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("forged cached kid: err = %v, want ErrInvalidToken", err)
+	}
+
+	f.idp.fail.Store(false)
+	f.clock.Add(31 * time.Second)
+	if _, err := f.v.Verify(ctx, forged()); !errors.Is(err, ErrInvalidToken) || errors.Is(err, app.ErrTransient) {
+		t.Fatalf("after recovery: err = %v, want ErrInvalidToken", err)
 	}
 }
 

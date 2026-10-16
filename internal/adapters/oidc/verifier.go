@@ -11,6 +11,7 @@ import (
 
 	gooidc "github.com/coreos/go-oidc/v3/oidc"
 
+	"github.com/medbottle/betting-wallet-go/internal/app"
 	"github.com/medbottle/betting-wallet-go/internal/app/authz"
 )
 
@@ -20,6 +21,28 @@ const Leeway = 30 * time.Second
 // ErrInvalidToken means the token must be rejected with 401. The wrapped
 // cause is for logs only; never log the token itself.
 var ErrInvalidToken = errors.New("oidc: invalid token")
+
+// Verify returns app.ErrTransient (with ErrKeysUnavailable) instead of
+// ErrInvalidToken when the token's key could not be checked because the
+// IdP is unreachable (ARCHITECTURE §24, Q5).
+
+// keyErrSlot carries the key set's error out of go-oidc, which formats it
+// with %v and loses the chain.
+type keyErrSlot struct{ err error }
+
+type keyErrSlotKey struct{}
+
+// recordingKeySet stores the inner key set's error in the slot of the
+// request's context.
+type recordingKeySet struct{ inner gooidc.KeySet }
+
+func (r recordingKeySet) VerifySignature(ctx context.Context, jwt string) ([]byte, error) {
+	payload, err := r.inner.VerifySignature(ctx, jwt)
+	if slot, ok := ctx.Value(keyErrSlotKey{}).(*keyErrSlot); ok && err != nil {
+		slot.err = err
+	}
+	return payload, err
+}
 
 // Config identifies the expected issuer and audience.
 type Config struct {
@@ -45,7 +68,7 @@ func NewVerifier(cfg Config, keys gooidc.KeySet, now func() time.Time) *Verifier
 		now = time.Now
 	}
 	return &Verifier{
-		inner: gooidc.NewVerifier(cfg.Issuer, keys, &gooidc.Config{
+		inner: gooidc.NewVerifier(cfg.Issuer, recordingKeySet{inner: keys}, &gooidc.Config{
 			ClientID:             cfg.Audience,
 			SupportedSigningAlgs: []string{gooidc.RS256},
 			// go-oidc checks exp without leeway and nbf with a fixed 5
@@ -74,8 +97,12 @@ func (v *Verifier) Verify(ctx context.Context, raw string) (authz.Principal, err
 	if raw == "" {
 		return authz.Principal{}, fmt.Errorf("%w: missing token", ErrInvalidToken)
 	}
-	tok, err := v.inner.Verify(ctx, raw)
+	slot := &keyErrSlot{}
+	tok, err := v.inner.Verify(context.WithValue(ctx, keyErrSlotKey{}, slot), raw)
 	if err != nil {
+		if errors.Is(slot.err, ErrKeysUnavailable) {
+			return authz.Principal{}, fmt.Errorf("%w: %w", app.ErrTransient, slot.err)
+		}
 		return authz.Principal{}, fmt.Errorf("%w: %w", ErrInvalidToken, err)
 	}
 	var c claims

@@ -4,14 +4,21 @@ package integration
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	jose "github.com/go-jose/go-jose/v4"
 
 	"github.com/medbottle/betting-wallet-go/internal/adapters/httpapi"
 	"github.com/medbottle/betting-wallet-go/internal/adapters/oidc"
@@ -144,4 +151,106 @@ func TestAuthMiddlewareWithKeycloak(t *testing.T) {
 	if resp.StatusCode != http.StatusOK || body["providerId"] != "provider-b" || body["azp"] != "provider-b" {
 		t.Errorf("valid token: %d %v", resp.StatusCode, body)
 	}
+}
+
+// TestIdPOutageUnknownKid is ARCHITECTURE §24, Q5 against the real
+// Keycloak: while the JWKS endpoint is unreachable, a token with an
+// unknown kid (a rotated key) cannot be checked and the middleware answers
+// 503 retryable; tokens signed with the cached key keep working. Once the
+// endpoint is back, the same unknown kid is a plain 401.
+func TestIdPOutageUnknownKid(t *testing.T) {
+	t.Parallel()
+	kc := startKeycloak(t)
+	var down atomic.Bool
+	jwks := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if down.Load() {
+			http.Error(w, "idp down", http.StatusBadGateway)
+			return
+		}
+		resp, err := http.Get(kc.JWKSURL)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+		w.WriteHeader(resp.StatusCode)
+		_, _ = io.Copy(w, resp.Body)
+	}))
+	defer jwks.Close()
+	keys := oidc.NewKeySet(jwks.URL, &http.Client{Timeout: 5 * time.Second}, time.Second, nil)
+	if err := keys.Refresh(ctxT(t)); err != nil {
+		t.Fatal(err)
+	}
+	v := oidc.NewVerifier(oidc.Config{Issuer: kc.Issuer, Audience: "wallet-api"}, keys, nil)
+	srv := httptest.NewServer(httpapi.RequireAuth(v, slog.New(slog.NewJSONHandler(io.Discard, nil)))(
+		http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })))
+	defer srv.Close()
+	status := func(token string) (int, string) {
+		req, _ := http.NewRequestWithContext(ctxT(t), http.MethodGet, srv.URL, nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var body struct {
+			Error struct {
+				Code      string `json:"code"`
+				Retryable bool   `json:"retryable"`
+			} `json:"error"`
+		}
+		_ = json.NewDecoder(resp.Body).Decode(&body)
+		return resp.StatusCode, body.Error.Code
+	}
+
+	real := mustToken(t, kc, "provider-a")
+	rotated := resignWithUnknownKid(t, real)
+
+	down.Store(true)
+	// Past the refresh interval since the startup fetch, so the unknown kid
+	// triggers a fetch (which fails) instead of being rate limited.
+	time.Sleep(1100 * time.Millisecond)
+	if code, ec := status(rotated); code != http.StatusServiceUnavailable || ec != "TEMPORARILY_UNAVAILABLE" {
+		t.Fatalf("unknown kid during outage: %d %s, want 503 TEMPORARILY_UNAVAILABLE", code, ec)
+	}
+	if code, _ := status(real); code != http.StatusNoContent {
+		t.Fatalf("cached key during outage: %d, want 204", code)
+	}
+	down.Store(false)
+	time.Sleep(1100 * time.Millisecond) // past the 1s refresh interval of this key set
+	if code, ec := status(rotated); code != http.StatusUnauthorized || ec != "UNAUTHENTICATED" {
+		t.Fatalf("unknown kid after recovery: %d %s, want 401", code, ec)
+	}
+}
+
+// resignWithUnknownKid keeps a real token's claims and signs them with a
+// fresh key under a kid Keycloak never published.
+func resignWithUnknownKid(t *testing.T, token string) string {
+	t.Helper()
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		t.Fatal("not a JWT")
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signer, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.RS256, Key: key},
+		(&jose.SignerOptions{}).WithType("JWT").WithHeader("kid", "rotated-key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	jws, err := signer.Sign(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := jws.CompactSerialize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
 }
