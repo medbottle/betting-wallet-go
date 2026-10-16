@@ -132,6 +132,11 @@ docker compose run --rm migrate down
 docker compose run --rm migrate version
 ```
 
+`migrate` is a dependency of `app`, so `docker compose up` and
+`docker compose start app` run `migrate up` again before the app starts. To
+start the app against a rolled-back schema (for example, to watch it refuse to
+start), use `docker start wager-wallet-app-1`.
+
 If a migration fails halfway, `version` reports `dirty: true` and the app will
 not start. Fix the cause, repair the schema by hand, then reset the recorded
 version with the upstream golang-migrate CLI (`migrate -path migrations
@@ -153,6 +158,18 @@ integration tests.
 | `gofmt -l .` | lists unformatted files (should print nothing) | Go |
 | `go test -tags=integration -count=1 ./test/integration/...` | real Postgres via testcontainers: migrations up/down, Fx start/stop with goroutine-leak check | Docker |
 | `go test -tags=integration -race -count=1 ./test/integration/...` | the same with the race detector | Docker + gcc |
+
+With no local C toolchain (for example, on Windows without gcc), run the race
+detector in a Linux Go container. The Docker socket lets testcontainers start
+its sibling containers:
+
+```sh
+docker run --rm -v "$PWD:/src" -w /src \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -e TESTCONTAINERS_HOST_OVERRIDE=host.docker.internal \
+  --add-host=host.docker.internal:host-gateway \
+  golang:1.27.2-bookworm go test -race -tags=integration -count=1 ./...
+```
 
 Build tags:
 
