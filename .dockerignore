@@ -1,0 +1,8 @@
+.git
+.cursor
+.claude
+.env
+*.md
+!README.md
+deploy
+test

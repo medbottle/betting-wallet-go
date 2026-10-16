@@ -1,0 +1,106 @@
+# Local stack: `docker compose up --build` works from a clean checkout.
+# Every variable has a local default; copy .env.example to .env to override.
+name: wager-wallet
+
+services:
+  postgres:
+    image: postgres:18.6-alpine3.24
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: postgres
+      WALLET_DB: wallet
+      WALLET_OWNER_PASSWORD: ${WALLET_OWNER_PASSWORD:-wallet_owner_local}
+      WALLET_APP_PASSWORD: ${WALLET_APP_PASSWORD:-wallet_app_local}
+    volumes:
+      - ./deploy/postgres/init:/docker-entrypoint-initdb.d:ro
+      - pgdata:/var/lib/postgresql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      # -h forces TCP: the entrypoint's temporary init server listens on the
+      # socket only, so this cannot report healthy before init finishes.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d wallet"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.7.5
+    command: ["start-dev"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN:-admin}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+      # Fixed issuer (ARCHITECTURE §11): tokens always carry
+      # iss=http://localhost:8080/realms/wagering, whether obtained from the
+      # host or from inside the Docker network.
+      KC_HOSTNAME: http://localhost:8080
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
+      KC_HEALTH_ENABLED: "true"
+    ports:
+      - "8080:8080"
+    healthcheck:
+      # The image has no curl/wget; probe the management port with bash.
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/9000 && printf 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && grep -q UP <&3"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  ministack:
+    image: ministackorg/ministack:1.5.27
+    environment:
+      MINISTACK_REGION: ${AWS_REGION:-us-east-1}
+    volumes:
+      - ./deploy/ministack/init-queues.sh:/etc/localstack/init/ready.d/init-queues.sh:ro
+    ports:
+      - "4566:4566"
+    healthcheck:
+      # Healthy only once the gateway answers AND the init script finished.
+      test: ["CMD-SHELL", "test -f /tmp/wager-queues-ready && python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:4566/_ministack/health', timeout=2)\""]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+
+  migrate:
+    build: .
+    image: wager-wallet:local
+    entrypoint: ["/app/migrate"]
+    command: ["up"]
+    environment:
+      MIGRATE_DATABASE_URL: postgres://wallet_owner:${WALLET_OWNER_PASSWORD:-wallet_owner_local}@postgres:5432/wallet?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  app:
+    # Same image as migrate; declaring build here too stops compose from
+    # trying to pull the local tag.
+    build: .
+    image: wager-wallet:local
+    environment:
+      DATABASE_URL: postgres://wallet_app:${WALLET_APP_PASSWORD:-wallet_app_local}@postgres:5432/wallet?sslmode=disable
+      HTTP_ADDR: ":8081"
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      RUN_HTTP: "true"
+      RUN_CONSUMER: "true"
+      RUN_OUTBOX: "true"
+      RUN_REFERENCE_WORKER: "true"
+    ports:
+      - "8081:8081"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      keycloak:
+        condition: service_healthy
+      ministack:
+        condition: service_healthy
+    # Above fx.StopTimeout (30s), ARCHITECTURE §14.
+    stop_grace_period: 35s
+    restart: unless-stopped
+
+volumes:
+  pgdata:
