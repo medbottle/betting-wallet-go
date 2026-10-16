@@ -19,7 +19,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/medbottle/wager-wallet-service/internal/adapters/postgres"
+	"github.com/medbottle/betting-wallet-go/internal/adapters/postgres"
 )
 
 const usage = "usage: migrate up | down [N] | version"

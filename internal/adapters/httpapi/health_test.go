@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/medbottle/wager-wallet-service/internal/platform/health"
+	"github.com/medbottle/betting-wallet-go/internal/platform/health"
 )
 
 type fakeReporter struct{ rep health.Report }

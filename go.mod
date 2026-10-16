@@ -1,4 +1,4 @@
-module github.com/medbottle/wager-wallet-service
+module github.com/medbottle/betting-wallet-go
 
 go 1.27.2
 

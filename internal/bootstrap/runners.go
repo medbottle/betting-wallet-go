@@ -8,9 +8,9 @@ import (
 	"go.uber.org/fx"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/medbottle/wager-wallet-service/internal/adapters/httpapi"
-	"github.com/medbottle/wager-wallet-service/internal/platform/config"
-	"github.com/medbottle/wager-wallet-service/internal/platform/health"
+	"github.com/medbottle/betting-wallet-go/internal/adapters/httpapi"
+	"github.com/medbottle/betting-wallet-go/internal/platform/config"
+	"github.com/medbottle/betting-wallet-go/internal/platform/health"
 )
 
 // runnersShutdownBudget bounds the parallel shutdown group (§14: 2s-22s).

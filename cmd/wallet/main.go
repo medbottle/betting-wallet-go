@@ -5,7 +5,7 @@ package main
 import (
 	"go.uber.org/fx"
 
-	"github.com/medbottle/wager-wallet-service/internal/bootstrap"
+	"github.com/medbottle/betting-wallet-go/internal/bootstrap"
 )
 
 func main() {

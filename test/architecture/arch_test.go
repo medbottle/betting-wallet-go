@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-const module = "github.com/medbottle/wager-wallet-service"
+const module = "github.com/medbottle/betting-wallet-go"
 
 // forbiddenInDomain are import path prefixes the domain must never reach,
 // directly or transitively.

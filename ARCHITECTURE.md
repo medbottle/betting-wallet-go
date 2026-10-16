@@ -612,6 +612,8 @@ Versão do Go: a última estável no momento da implementação, fixada em `go.m
 | Emulador SQS | `ministackorg/ministack:1.5.27` |
 | Bibliotecas | `go.uber.org/fx v1.24.0`, `jackc/pgx/v5 v5.11.0`, `golang-migrate/migrate/v4 v4.20.1`, `caarlos0/env/v11 v11.4.1`, `golang.org/x/sync` (errgroup), `go.uber.org/goleak v1.3.0`, `testcontainers-go v0.44.0` |
 
+**Módulo Go**: `github.com/medbottle/betting-wallet-go`, igual ao remote do repositório.
+
 **MiniStack no lugar do LocalStack**: desde março de 2026 a imagem do LocalStack exige `LOCALSTACK_AUTH_TOKEN`. O MiniStack é MIT, roda sem token, é compatível com a API SQS (FIFO e DLQ) e executa scripts de `/etc/localstack/init/ready.d` com `sh`. O script `deploy/ministack/init-queues.sh` usa o `aws` CLI incluído na imagem e grava `/tmp/wager-queues-ready` ao terminar; o healthcheck do compose só passa com esse marcador.
 
 **Configuração das filas** (o que a seção 10 não fixava):

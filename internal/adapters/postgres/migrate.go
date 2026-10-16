@@ -11,7 +11,7 @@ import (
 	_ "github.com/golang-migrate/migrate/v4/database/pgx/v5"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
 
-	"github.com/medbottle/wager-wallet-service/migrations"
+	"github.com/medbottle/betting-wallet-go/migrations"
 )
 
 // ErrNoVersion means no migration has ever been applied.

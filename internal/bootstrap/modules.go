@@ -11,12 +11,12 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/fx"
 
-	"github.com/medbottle/wager-wallet-service/internal/adapters/httpapi"
-	"github.com/medbottle/wager-wallet-service/internal/adapters/postgres"
-	"github.com/medbottle/wager-wallet-service/internal/platform/config"
-	"github.com/medbottle/wager-wallet-service/internal/platform/health"
-	"github.com/medbottle/wager-wallet-service/internal/platform/logging"
-	"github.com/medbottle/wager-wallet-service/migrations"
+	"github.com/medbottle/betting-wallet-go/internal/adapters/httpapi"
+	"github.com/medbottle/betting-wallet-go/internal/adapters/postgres"
+	"github.com/medbottle/betting-wallet-go/internal/platform/config"
+	"github.com/medbottle/betting-wallet-go/internal/platform/health"
+	"github.com/medbottle/betting-wallet-go/internal/platform/logging"
+	"github.com/medbottle/betting-wallet-go/migrations"
 )
 
 // poolCloseTimeout is the pool close budget (ARCHITECTURE §14).

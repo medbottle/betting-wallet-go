@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 
-	"github.com/medbottle/wager-wallet-service/internal/platform/health"
+	"github.com/medbottle/betting-wallet-go/internal/platform/health"
 )
 
 // ReadinessReporter exposes the cached readiness snapshot.

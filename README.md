@@ -1,4 +1,4 @@
-# wager-wallet-service
+# betting-wallet-go
 
 Distributed processing of bets and wallet movements in Go (Uber Fx, PostgreSQL,
 SQS, Keycloak). Spec: [docs/CHALLENGE.md](docs/CHALLENGE.md). Design decisions:

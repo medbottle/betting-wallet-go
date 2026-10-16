@@ -10,8 +10,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/medbottle/wager-wallet-service/internal/adapters/postgres"
-	"github.com/medbottle/wager-wallet-service/migrations"
+	"github.com/medbottle/betting-wallet-go/internal/adapters/postgres"
+	"github.com/medbottle/betting-wallet-go/migrations"
 )
 
 func TestMigrationsUpDownUp(t *testing.T) {

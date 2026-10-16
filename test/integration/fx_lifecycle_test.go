@@ -14,9 +14,9 @@ import (
 	"go.uber.org/fx"
 	"go.uber.org/goleak"
 
-	"github.com/medbottle/wager-wallet-service/internal/adapters/httpapi"
-	"github.com/medbottle/wager-wallet-service/internal/adapters/postgres"
-	"github.com/medbottle/wager-wallet-service/internal/bootstrap"
+	"github.com/medbottle/betting-wallet-go/internal/adapters/httpapi"
+	"github.com/medbottle/betting-wallet-go/internal/adapters/postgres"
+	"github.com/medbottle/betting-wallet-go/internal/bootstrap"
 )
 
 func setAppEnv(t *testing.T, databaseURL string) {
