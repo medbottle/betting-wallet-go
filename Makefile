@@ -1,4 +1,4 @@
-.PHONY: build test test-race vet fmt fmt-check integration integration-race migrate-up migrate-down migrate-version up down
+.PHONY: build test test-race vet fmt fmt-check integration integration-race multiinstance migrate-up migrate-down migrate-version up down
 
 GO ?= go
 
@@ -15,6 +15,7 @@ test-race:
 vet:
 	$(GO) vet ./...
 	$(GO) vet -tags=integration ./...
+	$(GO) vet -tags=multiinstance ./...
 
 fmt:
 	gofmt -w .
@@ -29,6 +30,10 @@ integration:
 
 integration-race:
 	$(GO) test -tags=integration -race -count=1 -v ./test/integration/...
+
+# Starts its own three-instance compose stack; the dev stack must be down.
+multiinstance:
+	$(GO) test -tags=multiinstance -count=1 -v -timeout 40m ./test/multiinstance/...
 
 # Needs MIGRATE_DATABASE_URL (see .env.example).
 migrate-up:

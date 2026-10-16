@@ -1,0 +1,42 @@
+# Three independent app processes on the shared Postgres, Keycloak and
+# MiniStack (CHALLENGE §8 and §13 item 4; ARCHITECTURE §25, G3). Used with
+# the base file:
+#
+#   docker compose -p wager-wallet-multi -f docker-compose.yml -f docker-compose.multi.yml up -d --build
+#
+# Each instance has its own process, connection pool and memory, and runs
+# every role (HTTP, consumer, outbox relay, reference worker). The test
+# suite in test/multiinstance starts and stops this stack itself.
+
+x-multi-env: &multi-env
+  # Short reference TTL and backoff so expiry and resolution after a kill
+  # run in seconds (ARCHITECTURE §8 uses short values in tests).
+  REFERENCE_TTL: 8s
+  REFERENCE_BACKOFF_BASE: 200ms
+  REFERENCE_BACKOFF_MAX: 1s
+  LOG_LEVEL: warn
+
+services:
+  app:
+    environment:
+      <<: *multi-env
+
+  app-2:
+    extends:
+      file: docker-compose.yml
+      service: app
+    environment:
+      <<: *multi-env
+    ports: !override
+      - "8082:8081"
+      - "9091:9090"
+
+  app-3:
+    extends:
+      file: docker-compose.yml
+      service: app
+    environment:
+      <<: *multi-env
+    ports: !override
+      - "8083:8081"
+      - "9092:9090"
