@@ -61,7 +61,8 @@ type Outcome struct {
 //     REFERENCE_UNRESOLVED_TIMEOUT; a reference that became resolvable is
 //     applied even after the deadline;
 //   - a resolved reference is checked in this order: status, kind,
-//     provider/wallet/round, amount, already reversed; then funds;
+//     provider/player/wallet/currency/round, amount, already reversed;
+//     then funds;
 //   - BET debits; WIN and REFUND credit; LOSS moves nothing; ROLLBACK
 //     credits a BET back and debits a WIN or REFUND back.
 //
@@ -134,7 +135,11 @@ func checkReference(t, ref *WagerTransaction, reversed bool) FailureCode {
 	if !referenceKindAllowed(t.kind, ref) {
 		return CodeReferenceKindNotAllowed
 	}
-	if ref.providerID != t.providerID || ref.walletID != t.walletID || ref.roundID != t.roundID {
+	// CHALLENGE §7: provider, player, wallet, currency and round must all
+	// agree. Player and currency also follow from the wallet in the schema;
+	// they are compared here so the rule holds for in-memory values too.
+	if ref.providerID != t.providerID || ref.playerID != t.playerID || ref.walletID != t.walletID ||
+		ref.money.Currency() != t.money.Currency() || ref.roundID != t.roundID {
 		return CodeReferenceMismatch
 	}
 	if t.kind.IsReversal() {

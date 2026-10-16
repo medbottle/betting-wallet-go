@@ -315,6 +315,18 @@ func TestApplyReferenceRejections(t *testing.T) {
 			bet := w.processed(w.tx("BET", "25.00", ""), nil)
 			return w.tx("WIN", "5.00", bet.ExternalTransactionID()), withSnapshot(w, bet, func(s *Snapshot) { s.ProviderID = strp("provider-b") }), false
 		}, CodeReferenceMismatch},
+		{"reference of another player", func(w *world) (*WagerTransaction, *WagerTransaction, bool) {
+			bet := w.processed(w.tx("BET", "25.00", ""), nil)
+			return w.tx("REFUND", "25.00", bet.ExternalTransactionID()), withSnapshot(w, bet, func(s *Snapshot) { s.PlayerID = uuid.New() }), false
+		}, CodeReferenceMismatch},
+		{"reference in another currency", func(w *world) (*WagerTransaction, *WagerTransaction, bool) {
+			bet := w.processed(w.tx("BET", "25.00", ""), nil)
+			return w.tx("WIN", "5.00", bet.ExternalTransactionID()), withSnapshot(w, bet, func(s *Snapshot) {
+				s.Money, _ = money.Parse("25.00", "USD")
+				usd, _ := money.Parse("75.00", "USD")
+				s.ResultBalance = &usd
+			}), false
+		}, CodeReferenceMismatch},
 		{"partial refund", func(w *world) (*WagerTransaction, *WagerTransaction, bool) {
 			bet := w.processed(w.tx("BET", "25.00", ""), nil)
 			return w.tx("REFUND", "10.00", bet.ExternalTransactionID()), bet, false
