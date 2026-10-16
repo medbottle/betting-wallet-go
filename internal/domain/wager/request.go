@@ -65,24 +65,21 @@ func NewRequest(r RawRequest) (Request, error) {
 			return Request{}, invalid(CodeInvalidRequest, f.name, "must be 1-255 printable ASCII characters without spaces")
 		}
 	}
-	playerID, err := parseUUID(r.PlayerID)
+	playerID, err := ParseID("playerId", r.PlayerID)
 	if err != nil {
-		return Request{}, invalid(CodeInvalidRequest, "playerId", "%v", err)
+		return Request{}, err
 	}
-	walletID, err := parseUUID(r.WalletID)
+	walletID, err := ParseID("walletId", r.WalletID)
 	if err != nil {
-		return Request{}, invalid(CodeInvalidRequest, "walletId", "%v", err)
+		return Request{}, err
 	}
 	if r.ReferenceExternalTransactionID != nil && !isIdentifier(*r.ReferenceExternalTransactionID) {
 		return Request{}, invalid(CodeInvalidRequest, "referenceExternalTransactionId", "must be 1-255 printable ASCII characters without spaces")
 	}
 
-	m, err := money.Parse(r.Amount, r.Currency)
-	switch {
-	case errors.Is(err, money.ErrUnsupportedCurrency):
-		return Request{}, invalid(CodeUnsupportedCurrency, "money.currency", "%v", err)
-	case err != nil:
-		return Request{}, invalid(CodeInvalidMoney, "money", "%v", err)
+	m, err := ParseMoney("money", r.Amount, r.Currency)
+	if err != nil {
+		return Request{}, err
 	}
 
 	kind := Kind(r.Kind)
@@ -138,6 +135,30 @@ func (r Request) ReferenceExternalTransactionID() (string, bool) {
 		return "", false
 	}
 	return *r.referenceExternalID, true
+}
+
+// ParseID validates an external UUID field (36-character hyphenated form,
+// either case, not nil). Failures are INVALID_REQUEST on field.
+func ParseID(field, s string) (uuid.UUID, error) {
+	id, err := parseUUID(s)
+	if err != nil {
+		return uuid.Nil, invalid(CodeInvalidRequest, field, "%v", err)
+	}
+	return id, nil
+}
+
+// ParseMoney validates an external money value with the strict rules of
+// ARCHITECTURE §2: UNSUPPORTED_CURRENCY for a well-formed code outside the
+// allow-list, INVALID_MONEY for anything else.
+func ParseMoney(field, amount, currency string) (money.Money, error) {
+	m, err := money.Parse(amount, currency)
+	switch {
+	case errors.Is(err, money.ErrUnsupportedCurrency):
+		return money.Money{}, invalid(CodeUnsupportedCurrency, field+".currency", "%v", err)
+	case err != nil:
+		return money.Money{}, invalid(CodeInvalidMoney, field, "%v", err)
+	}
+	return m, nil
 }
 
 // valid reports whether r was built by NewRequest.
