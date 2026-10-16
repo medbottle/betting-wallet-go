@@ -1,0 +1,48 @@
+{
+  "_comment": "Least-privilege IAM policies for the three broker identities of ARCHITECTURE.md §10/§23, for a real AWS account. Replace REGION and ACCOUNT_ID. MiniStack does not enforce IAM, so these are not applied locally (ARCHITECTURE §22, assumption A12).",
+  "wallet-consumer": {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Sid": "ConsumeInbound",
+        "Effect": "Allow",
+        "Action": ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:ChangeMessageVisibility", "sqs:GetQueueUrl", "sqs:GetQueueAttributes"],
+        "Resource": "arn:aws:sqs:REGION:ACCOUNT_ID:wager-transactions.fifo"
+      },
+      {
+        "Sid": "DeadLetterPermanentFailures",
+        "Effect": "Allow",
+        "Action": ["sqs:SendMessage", "sqs:GetQueueUrl"],
+        "Resource": "arn:aws:sqs:REGION:ACCOUNT_ID:wager-transactions-dlq.fifo"
+      }
+    ]
+  },
+  "wallet-publisher": {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Sid": "PublishEvents",
+        "Effect": "Allow",
+        "Action": ["sqs:SendMessage", "sqs:GetQueueUrl", "sqs:GetQueueAttributes"],
+        "Resource": "arn:aws:sqs:REGION:ACCOUNT_ID:wallet-events.fifo"
+      }
+    ]
+  },
+  "wallet-operator": {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Sid": "ReadAndDrainInboundDLQ",
+        "Effect": "Allow",
+        "Action": ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueUrl"],
+        "Resource": "arn:aws:sqs:REGION:ACCOUNT_ID:wager-transactions-dlq.fifo"
+      },
+      {
+        "Sid": "RedriveToInbound",
+        "Effect": "Allow",
+        "Action": ["sqs:SendMessage", "sqs:GetQueueUrl"],
+        "Resource": "arn:aws:sqs:REGION:ACCOUNT_ID:wager-transactions.fifo"
+      }
+    ]
+  }
+}

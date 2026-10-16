@@ -394,6 +394,7 @@ stateDiagram-v2
 **Controle de acesso no broker**:
 - Credenciais separadas para consumidor e publisher.
 - Políticas de fila: o consumidor recebe `ReceiveMessage`, `DeleteMessage` e `ChangeMessageVisibility` na entrada, e `SendMessage` na DLQ de entrada. O publisher recebe somente `SendMessage` em `wallet-events.fifo`.
+- As políticas de menor privilégio de cada identidade (consumidor, publisher e operador do `dlqredrive`) estão em `deploy/aws/iam-policies.json`, para uma conta AWS real.
 - **Não afirmamos** que o emulador aplica IAM. Há um teste negativo planejado: as credenciais do publisher não conseguem `ReceiveMessage` na entrada.
   - Se o emulador escolhido não aplicar IAM, o teste é marcado como `t.Skip` com a razão explícita, e isso fica registrado como limitação. O emulador adotado é o MiniStack (seção 15); verificado no slice 8: ele não aplica IAM, e o teste é pulado com essa razão (seção 22).
 
@@ -650,7 +651,7 @@ Versão do Go: a última estável no momento da implementação, fixada em `go.m
 
 **Roteador**: `net/http.ServeMux` com padrões de método (`GET /health/live`), envolvido por `http.TimeoutHandler` com o handler timeout.
 
-**Hook "runners"**: no slice 1 ele só contém o servidor HTTP. O listen é síncrono no `OnStart`, então porta ocupada falha o start. Os papéis `RUN_CONSUMER`, `RUN_OUTBOX` e `RUN_REFERENCE_WORKER` existem na config e só logam "not implemented yet".
+**Hook "runners"**: no slice 1 ele só contém o servidor HTTP. O listen é síncrono no `OnStart`, então porta ocupada falha o start. Os papéis `RUN_CONSUMER`, `RUN_OUTBOX` e `RUN_REFERENCE_WORKER` existiam na config e só logavam "not implemented yet" (implementados nos slices 7, 8 e 9).
 
 **Falha no start**: o Fx não chama `OnStop` de um hook cujo `OnStart` falhou. Por isso o hook do Postgres fecha o pool no próprio caminho de erro. O teste de integração verifica isso com `goleak`.
 
@@ -1127,7 +1128,19 @@ Todo teste termina com os invariantes: nenhuma operação pendente, reconciliaç
 - **Vários `WIN` podem referenciar a mesma `BET`**, e o valor do `WIN` não é comparado ao da aposta.
 - **Precedência de erros**: erro de entrada prevalece sobre conflito de idempotência (seção 6).
 - **Ordem dos eventos de saída**: não é garantida entre publishers. Os consumidores usam `walletVersion`.
-- **IAM no emulador**: pode não ser aplicado; nesse caso, o teste negativo é pulado com justificativa.
+- **IAM no emulador**: verificado no slice 8: o MiniStack não aplica IAM nem políticas de fila. As credenciais separadas estão configuradas e os testes negativos (publisher e consumidor) são pulados com essa razão. As políticas de menor privilégio de cada identidade para uma conta AWS real estão em `deploy/aws/iam-policies.json` (seção 10), sem aplicação local.
 - **`StartMessageMoveTask`**: o suporte a FIFO no emulador não é garantido. Usamos `cmd/dlqredrive`.
 - **Retenção**: sem limpeza de `inbox_messages` e `outbox_events` publicados neste escopo, já que a aplicação não tem `DELETE`. Uma rotina de retenção ficaria para trabalho futuro, executada com outro papel.
 - **Keycloak em testcontainers**: o issuer é a URL mapeada no host, sem `KC_HOSTNAME` fixo.
+- **SQS indisponível no emulador**: simulado com `docker compose pause`, porque reiniciar o MiniStack apaga as filas em memória (seção 25).
+- **`-race` na suíte de múltiplas instâncias**: não roda neste ambiente (sem gcc no host; a imagem Go usada para `-race` não tem o CLI do Docker). Os binários testados não são instrumentados em nenhum caso; unitários e integração rodam com `-race` (seção 25).
+- **Atraso da outbox**: valor global, igual em todas as instâncias; agregue com `max` (seção 25).
+
+## Trabalho não concluído
+
+- **Teste de carga** (diferencial da seção 14 do desafio): sem comando, throughput nem p50/p95/p99. A pilha de três instâncias e as métricas da seção 25 são a base para ele.
+- **Tracing com OpenTelemetry e dashboards** (diferenciais da seção 12): não implementados. Os logs JSON carregam `correlationId`, `messageId`, `transactionId`, `walletId` e `providerId`.
+- **Regras de alerta**: as séries a alertar estão na seção 25; as regras dependem de uma stack de monitoramento fora do escopo.
+- **Políticas do broker aplicadas**: definidas em `deploy/aws/iam-policies.json`, mas não provisionadas nem verificáveis no emulador.
+- **Retenção de `inbox_messages` e `outbox_events`**: sem rotina de limpeza (ver acima).
+- **Ledger de partidas dobradas** (opcional na seção 6.4 do desafio): não adotado; o ledger é de lançamentos simples por carteira.

@@ -11,7 +11,9 @@ SQS, Keycloak). Spec: [docs/CHALLENGE.md](docs/CHALLENGE.md). Design decisions:
 > published to `wallet-events.fifo`; Prometheus metrics are served on
 > `:9090`; the CHALLENGE §13 scenarios run against three instances. Questions the documents
 > left open, all resolved: [docs/OPEN-QUESTIONS.md](docs/OPEN-QUESTIONS.md); parked
-> assumptions: [docs/ASSUMPTIONS.md](docs/ASSUMPTIONS.md).
+> assumptions: [docs/ASSUMPTIONS.md](docs/ASSUMPTIONS.md); limitations and
+> unfinished work: ARCHITECTURE.md, "Premissas e limitações" and "Trabalho
+> não concluído".
 
 ## Prerequisites
 
@@ -62,6 +64,13 @@ On startup, `deploy/ministack/init-queues.sh` (run by MiniStack from
 
 All queues are FIFO and have content-based deduplication turned off. Producers
 always send an explicit `MessageDeduplicationId`.
+
+Each role uses its own broker credentials: the consumer, the outbox
+publisher and the `dlqredrive` operator. Their least-privilege IAM policies
+for a real AWS account are in
+[deploy/aws/iam-policies.json](deploy/aws/iam-policies.json). MiniStack
+accepts any credentials and does not enforce policies, so locally the
+separation is configured but not enforced (ARCHITECTURE.md §10, §22).
 
 To list them from the host (any AWS CLI, with dummy credentials):
 
