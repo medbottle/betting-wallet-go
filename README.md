@@ -4,9 +4,10 @@ Distributed processing of bets and wallet movements in Go (Uber Fx, PostgreSQL,
 SQS, Keycloak). Spec: [docs/CHALLENGE.md](docs/CHALLENGE.md). Design decisions:
 [ARCHITECTURE.md](ARCHITECTURE.md).
 
-> **Status: slice 2 (schema).** The infrastructure, health endpoints, migration
-> tooling and the full database schema exist, with constraints, triggers and
-> grants. There is no domain logic, business API or SQS consumer yet.
+> **Status: slice 3 (domain).** The infrastructure, health endpoints, migration
+> tooling, the full database schema and the pure-Go domain (Money, Wallet,
+> ledger, WagerTransaction rules, events, payload hashes) exist. There is no
+> persistence adapter, business API or SQS consumer yet.
 
 ## Prerequisites
 
@@ -192,9 +193,21 @@ Build tags:
 - `multiinstance` (planned): three-process tests on the compose stack.
 
 The architecture test (`test/architecture`) runs with the plain `go test ./...`.
-It fails if `internal/domain` depends on fx, net/http, the AWS SDK, pgx or
-database/sql, if `internal/app` depends on `internal/adapters`, or if any
-package other than `internal/bootstrap` and `cmd/*` imports fx.
+It fails if:
+
+- `internal/domain` depends on fx, net/http, the AWS SDK, pgx or database/sql,
+  or on anything outside the standard library, google/uuid and itself;
+- domain code (outside tests) uses `float32`/`float64`, `strconv` float
+  functions or `panic`;
+- `internal/app` depends on `internal/adapters`;
+- any package other than `internal/bootstrap` and `cmd/*` imports fx.
+
+The fuzz test for Money parsing runs its seed corpus under `go test`; to fuzz
+for longer:
+
+```sh
+go test -run=^$ -fuzz=FuzzParseRoundTrip -fuzztime=1m ./internal/domain/money/
+```
 
 ### Make shortcuts
 

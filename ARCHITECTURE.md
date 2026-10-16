@@ -300,7 +300,7 @@ stateDiagram-v2
 - Tabela `outbox_events(event_id UUID PK, aggregate_type, aggregate_id, event_type, event_version, correlation_id, causation_id, occurred_at, payload JSONB, attempts, next_attempt_at, locked_by, locked_until, last_error, published_at, parked_at)`.
 - `payload` é o snapshot completo do envelope.
 - Um trigger impede alterar `event_id`, `payload`, `event_type`, `event_version`, `aggregate_id` e `occurred_at`, e impede `DELETE`.
-- **`eventId` estável**: UUIDv7 gerado pelo construtor do evento no domínio e persistido no insert. É reutilizado em todas as republicações e também serve de `MessageDeduplicationId` na fila de saída.
+- **`eventId` estável**: UUIDv7 gerado pelo `IDGenerator` da aplicação, recebido pelo construtor do evento no domínio (seção 17) e persistido no insert. É reutilizado em todas as republicações e também serve de `MessageDeduplicationId` na fila de saída.
 - **Claim por lease** (nunca publicar dentro de uma transação):
   1. Transação curta com o `UPDATE` abaixo, seguida de commit.
 
@@ -484,7 +484,7 @@ stateDiagram-v2
 
 **Autenticação**: `UNAUTHENTICATED` (401), `FORBIDDEN` (403), `PROVIDER_MISMATCH` (403).
 
-**Em Go**: constantes `domain.FailureCode` e erros tipados (`*domain.RejectionError{Code}`, `*domain.ValidationError{Code}`) ou sentinelas, verificados com `errors.As`/`errors.Is`. O mapeamento para o transporte acontece somente nos adapters.
+**Em Go**: constantes `wager.FailureCode` (pacote `internal/domain/wager`) e erros tipados (`*wager.ValidationError{Code}`, `*wager.RejectionError{Code}`, `*wager.ConflictError{Code}`) ou sentinelas, verificados com `errors.As`/`errors.Is`. O mapeamento para o transporte acontece somente nos adapters.
 
 ---
 
@@ -691,6 +691,52 @@ Versão do Go: a última estável no momento da implementação, fixada em `go.m
 | `providers`, `schema_info`, `schema_migrations` | `SELECT` |
 
 **Testes**: `test/integration/schema_*_test.go` (tag `integration`) sobem um Postgres por tabela e verificam cada CHECK, unicidade, FK e trigger pelo SQLSTATE e pelo nome da constraint. Triggers são exercitados como `wallet_owner`; privilégios, como `wallet_app`. Cada caso roda numa transação desfeita ao final.
+
+---
+
+## 17. Decisões do slice 3 (domínio)
+
+**Pacotes e dependências**: `money` ← `wallet` ← `wager` → `event` (`event` depende só de `money` e `uuid`). O domínio importa apenas a stdlib, `google/uuid` e os próprios pacotes; um teste de arquitetura usa allow-list para isso.
+
+**`google/uuid` e `database/sql/driver`** (aprovado): `google/uuid` importa `database/sql/driver` para seus métodos `Value`/`Scan`, então esse pacote (só interfaces) entra no fechamento de dependências do domínio. O teste de arquitetura continua proibindo `database/sql` em si e qualquer import direto de `database/sql/*` por código do domínio; `database/sql/driver` só é tolerado quando trazido por `google/uuid`.
+
+**IDs vêm de quem chama** (aprovado): construtores e regras recebem os IDs (carteira, transação, lançamento) e uma função `newID func() uuid.UUID` para lançamentos e eventos. Em produção ela é o `IDGenerator` (UUIDv7) da aplicação; nos testes, uma sequência determinística. O domínio não gera IDs nem lê o relógio: o instante `now` também é parâmetro.
+
+**Regras verificadas mecanicamente**: o teste de arquitetura analisa o AST de `internal/domain` (fora de testes) e falha com `float32`/`float64`, `strconv.ParseFloat`/`FormatFloat`/`AppendFloat` ou chamadas a `panic`. Um teste de integração compara os códigos das categorias B e D com o CHECK `wager_transactions_failure_code`.
+
+**Money**:
+- `Parse` aplica a regra estrita da seção 2 com multiplicação-soma checada (overflow é verificado mesmo sendo impossível com 12 dígitos).
+- Moeda com formato inválido (ex.: `brl`) é `ErrInvalidMoney` → `INVALID_MONEY`; formato válido fora da allow-list (ex.: `EUR`) é `ErrUnsupportedCurrency` → `UNSUPPORTED_CURRENCY`.
+- `FromMinor` aceita todo o `int64` (reidratação e cálculos internos). `String()` trata negativos, inclusive `MinInt64`.
+- JSON: leitura estrita (regras externas, sem sinal, `amount` string); escrita com sinal, para o `difference` da reconciliação.
+- Um teste de fuzz garante que toda entrada aceita satisfaz `Parse(s).String() == s`.
+
+**Wallet**: `Open` cria a versão 1 e, com saldo inicial positivo, o lançamento de crédito do `OPENING` (0 → saldo, versão 1). `Debit`/`Credit` validam valor positivo e moeda, devolvem o `LedgerEntry` e incrementam a versão em exatamente 1; nada muda se alguma checagem falha. Erros: `ErrInsufficientFunds`, `ErrAmountOverflow`, `money.ErrCurrencyMismatch`, `ErrInvalidAmount`.
+
+**Request** (comando validado, igual para HTTP e SQS):
+- Identificadores (`providerId`, `externalTransactionId`, `roundId`, `gameId`, `referenceExternalTransactionId`): 1 a 255 caracteres ASCII imprimíveis sem espaço (`^[!-~]{1,255}$`).
+- UUIDs: só a forma de 36 caracteres com hífens, em qualquer caixa, normalizada para minúsculas; chaves, `urn:`, forma sem hífen e o UUID nulo são rejeitados.
+- `kind` diferencia maiúsculas (`bet` → `UNSUPPORTED_KIND`).
+- Ordem das checagens (o primeiro erro vence): chave → identificadores e UUIDs → money → kind → valor por kind → referências. Formato inválido de identificador ou de chave é `INVALID_REQUEST`; chave ausente é `MISSING_IDEMPOTENCY_KEY`.
+
+**Hash canônico**: `money` é um objeto aninhado (`{"amount","currency"}`), as chaves seguem ordem lexicográfica (garantida pela ordem dos campos e verificada contra um mapa reordenado), sem escape HTML, sem `\n` final. O digest de um exemplo fixo está fixado em teste e foi conferido com `sha256sum`. `MessageHash` acrescenta `idempotencyKey`.
+
+**`CheckReplay`**: implementa as regras de conflito da seção 6 de forma pura e devolve `*ConflictError` (categoria C). Uma linha existente de outro provedor, ou que não bate nem por chave nem por ID externo, é erro de programação (`ErrInvalidTransaction`).
+
+**WagerTransaction**:
+- `NewExternal` cria em `PENDING`. O `OPENING` também nasce em `PENDING` e passa a `PROCESSED` em memória dentro de `OpenWallet`, então até ele passa por uma transição validada.
+- `MarkProcessed(result)`, `Reject(code, result)` (só categoria B; o `result` é exigido pelo schema), `Fail(code)` (só categoria D), `AwaitReference(deadline, next)` e `Reschedule(next)`. Estado terminal recusa tudo com `ErrInvalidTransition`.
+- `Rehydrate` aplica as mesmas regras do schema (seção 16) sem transição nem eventos; `Snapshot()` devolve o estado coluna a coluna.
+
+**`Apply`** (regras da seção 7):
+- Valida antes de tudo que a carteira é a da transação (senão erro de programação) e que jogador e moeda batem (`PLAYER_WALLET_MISMATCH`/`CURRENCY_MISMATCH`, categoria A), inclusive para `LOSS`.
+- Referência ausente ou ainda não terminal (`PENDING` ou `PENDING_REFERENCE`): espera até o deadline (`created_at + TTL`); `WagerTransactionPendingReference` só na entrada; `Reschedule` não emite evento. No deadline: `REFERENCE_NOT_FOUND` (nunca chegou) ou `REFERENCE_UNRESOLVED_TIMEOUT` (existe mas pendente). Referência resolvível é aplicada mesmo após o deadline.
+- Ordem das checagens da referência: status → kind → provedor/carteira/rodada → valor → já revertida → saldo. `WIN` com referência que não seja `BET`, ou referência a operação `INTERNAL`, é `REFERENCE_KIND_NOT_ALLOWED`.
+- Uma referência encontrada e terminal é gravada em `reference_transaction_id` mesmo quando a operação é rejeitada, para auditoria.
+- O cálculo do backoff (com jitter) fica no worker: o domínio só recebe `NextAttemptAt`.
+- Rejeições de negócio são `Outcome`, não erros. Um erro significa que nada deve ser persistido; quem chama descarta transação e carteira em memória e faz rollback.
+
+**Eventos**: um construtor por tipo, que fixa `eventType` e `version = 1` e congela o JSON na construção (`Payload()` devolve cópia). `aggregateId` = `walletId`. `occurredAt` e datas em `data` usam RFC 3339 em UTC com milissegundos (`2026-09-08T12:00:00.000Z`). Eventos de origem interna omitem os campos externos. `Fail` não emite evento (a especificação não define evento de falha).
 
 ---
 
