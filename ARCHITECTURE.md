@@ -395,7 +395,7 @@ stateDiagram-v2
 - Credenciais separadas para consumidor e publisher.
 - Políticas de fila: o consumidor recebe `ReceiveMessage`, `DeleteMessage` e `ChangeMessageVisibility` na entrada, e `SendMessage` na DLQ de entrada. O publisher recebe somente `SendMessage` em `wallet-events.fifo`.
 - **Não afirmamos** que o emulador aplica IAM. Há um teste negativo planejado: as credenciais do publisher não conseguem `ReceiveMessage` na entrada.
-  - Se o emulador escolhido não aplicar IAM, o teste é marcado como `t.Skip` com a razão explícita, e isso fica registrado como limitação. O emulador adotado é o MiniStack (seção 15); não verificamos ainda se ele aplica IAM.
+  - Se o emulador escolhido não aplicar IAM, o teste é marcado como `t.Skip` com a razão explícita, e isso fica registrado como limitação. O emulador adotado é o MiniStack (seção 15); verificado no slice 8: ele não aplica IAM, e o teste é pulado com essa razão (seção 22).
 
 ---
 
@@ -871,6 +871,51 @@ Tudo abaixo segue as seções 3, 4, 6, 8 e 9; os pontos que os documentos não d
 - Recuperação: uma linha reivindicada por um worker "morto" é pulada sem bloquear os outros e, quando a transação dele aborta, outro worker a resolve.
 - Item 8: com o Fx, a instância A para com uma operação pendente, a referência chega sem nenhuma instância no ar, e a instância B retoma e resolve; nenhum dos dois stops deixa goroutines (`goleak`).
 - Todos terminam conferindo o saldo armazenado contra o ledger.
+
+---
+
+## 22. Decisões do slice 8 (relay da outbox e publicação no SQS)
+
+**Seguido da seção 9, sem mudança**: claim por lease numa transação curta que comita antes de qualquer envio (`locked_until = now() + 30s`, `attempts + 1`, até 10 linhas, `FOR UPDATE SKIP LOCKED`); `SendMessageBatch` fora de qualquer transação com timeout de 5s; por entrada, `published_at` só se este dono ainda detém a linha, ou reagendamento com `last_error`; falha da chamada inteira reagenda o lote; `parked_at` ao atingir `OUTBOX_MAX_ATTEMPTS = 20`; nada é removido. Lease expirado volta a ser elegível e a republicação mantém o `eventId`. Todos os valores são configuráveis por env com os padrões da seção 9, para os testes poderem encurtar lease e limite.
+
+**Respostas às lacunas** (aprovadas):
+- **G1**: `OUTBOX_POLL_INTERVAL = 1s` de espera ociosa, como o worker de referências; atraso típico da outbox ~1s.
+- **G2**: `OUTBOX_RELAY_CONCURRENCY = 1` goroutine por instância; lotes de 10 bastam e várias instâncias já disputam as linhas.
+- **G3**: `locked_by = <hostname>-<UUIDv7>`, gerado uma vez por processo, único mesmo com vários processos no mesmo host.
+- **G4**: atributos de mensagem `eventType` (String) e `eventVersion` (Number), para rotear sem ler o corpo.
+
+**Interpretações**:
+- O "+ jitter" da fórmula de backoff é aditivo e sorteado em `[0, base)`: `now + min(1s·2^attempts, 5m) + U[0, 1s)` (premissa A10). `attempts` já inclui o claim atual.
+- O corpo publicado é o `payload` lido do banco. Como a coluna é `JSONB` (seção 9), o conteúdo é idêntico ao snapshot do evento, mas a ordem das chaves e os espaços são os do Postgres (premissa A11).
+- Sem métricas ainda: um evento estacionado gera log de erro com `eventId`, tipo, tentativas, `senderFault` e erro; `outbox_parked_total` chega com o slice de métricas.
+
+**Credenciais do broker** (seção 10): o publisher usa só `SQS_PUBLISHER_ACCESS_KEY_ID`/`SECRET`, sem ler arquivos de configuração da AWS nem o ambiente; o consumidor terá as suas no próximo slice. O teste negativo existe e foi executado: o MiniStack **não aplica IAM** (as credenciais do publisher conseguem `ReceiveMessage` na fila de entrada, e até credenciais desconhecidas são aceitas), então o teste é pulado com essa razão explícita. A separação está configurada, mas não é verificável neste emulador (limitação, premissa A12).
+
+**Readiness e startup**: a readiness agora checa PostgreSQL e SQS (`GetQueueAttributes` na fila de eventos, timeout de 1s por checagem, a cada 2s). A URL da fila é resolvida no `OnStart` (passo 4 da seção 14); fila ausente faz o start falhar. Nesse caminho de erro as conexões ociosas do cliente HTTP do SQS são fechadas no próprio `OnStart` (o Fx não chama o `OnStop` de um hook que falhou; o `goleak` pegou isso).
+
+**Lifecycle**: o relay inicia no hook "runners" depois do worker de referências e antes do HTTP, e para em paralelo com eles. Um publish em andamento mantém seus 5s; a gravação do resultado roda com um contexto sem cancelamento (limitado ao mesmo timeout), para que um shutdown não deixe sem marcar um lote já publicado. Se a marcação não acontecer, o lease expira e há republicação com o mesmo `eventId`.
+
+**Contrato de roteamento e consumo** (`wallet-events.fifo`):
+
+| Item | Valor |
+| --- | --- |
+| Fila | `wallet-events.fifo` (FIFO, `ContentBasedDeduplication=false`, visibility 30s, retenção 4 dias); DLQ `wallet-events-dlq.fifo` após 10 recebimentos, para consumidores downstream |
+| `MessageGroupId` | `aggregateId` = `walletId`: ordem por carteira dentro de um publisher |
+| `MessageDeduplicationId` | `eventId`: republicações dentro de 5 min são colapsadas pelo SQS |
+| Atributos | `eventType`, `eventVersion` |
+| Corpo | o envelope: `eventId`, `eventType`, `aggregateId`, `correlationId`, `causationId` (opcional), `occurredAt` (RFC 3339 UTC, ms), `version`, `data` tipado (seção 9 e slice 3) |
+| Tipos | `WagerTransactionProcessed`, `WagerTransactionRejected`, `WalletBalanceChanged` (com `walletId`, `transactionId`, `direction`, `money`, `balanceBefore`, `balanceAfter`, `walletVersion`), `WagerTransactionPendingReference` |
+
+Regras para consumidores: a entrega é at-least-once, então deduplicar por `eventId`; a ordem entre publishers ou após falha parcial não é garantida, então ordenar o que é por carteira pelo `walletVersion` (`WalletBalanceChanged`) e tratar cada evento como idempotente; valores monetários são strings decimais; ignorar campos desconhecidos dentro da mesma `version`.
+
+**Testes** (Postgres e MiniStack reais, mesmo script de init do compose, uma fila própria por teste):
+- Publicação: abertura e aposta pela API chegam à fila com `MessageGroupId`, `MessageDeduplicationId`, atributos e corpo corretos, e as linhas ficam publicadas pelo dono certo.
+- Nunca antes do commit: linhas de uma transação aberta não são vistas pelo relay; após o commit, são publicadas.
+- Item 6 da seção 13 do desafio, com queda entre commit e publicação: 100 eventos gravados sem relay no ar; dois relays com pools próprios os assumem; cada linha publicada uma vez, ambos participam, 100 mensagens com 100 `eventId` distintos.
+- Queda entre publicação e confirmação: um relay "morto" reivindica com lease curto, publica e não marca; dentro do lease ninguém pega as linhas; depois dele outro relay republica com o mesmo `eventId` (o SQS colapsou as cópias: 2 mensagens para 2 eventos) e o morto não consegue mais marcar.
+- Backoff e estacionamento: com o broker inacessível, as tentativas crescem com `last_error` e, no limite, a linha é estacionada e não é mais reivindicada.
+- Falha parcial do lote: um publisher roteirizado (o único lugar com broker simulado; Postgres é real) rejeita entradas alternadas; as aceitas são marcadas e as rejeitadas reagendadas, sem novo claim antes do backoff.
+- Readiness do SQS, fila ausente falhando o start sem vazar goroutines, e o teste negativo de credenciais (pulado com a razão acima).
 
 ---
 

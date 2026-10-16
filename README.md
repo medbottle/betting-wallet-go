@@ -4,13 +4,12 @@ Distributed processing of bets and wallet movements in Go (Uber Fx, PostgreSQL,
 SQS, Keycloak). Spec: [docs/CHALLENGE.md](docs/CHALLENGE.md). Design decisions:
 [ARCHITECTURE.md](ARCHITECTURE.md).
 
-> **Status: slice 7 (reference worker).** The authenticated HTTP API runs
-> on the full schema, domain and persistence adapter, and the reference
-> worker resumes operations waiting for a reference (also after a restart).
-> The SQS consumer, the outbox relay and metrics are not built yet: outbox
-> events are stored but not published. Open points:
-> [docs/OPEN-QUESTIONS.md](docs/OPEN-QUESTIONS.md); parked assumptions:
-> [docs/ASSUMPTIONS.md](docs/ASSUMPTIONS.md).
+> **Status: slice 8 (outbox relay).** The authenticated HTTP API, the
+> reference worker and the outbox relay run on the full schema, domain and
+> persistence adapter: committed events are published to
+> `wallet-events.fifo`. The SQS consumer and metrics are not built yet. Open
+> points: [docs/OPEN-QUESTIONS.md](docs/OPEN-QUESTIONS.md); parked
+> assumptions: [docs/ASSUMPTIONS.md](docs/ASSUMPTIONS.md).
 
 ## Prerequisites
 
@@ -68,6 +67,22 @@ To list them from the host (any AWS CLI, with dummy credentials):
 AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test aws --endpoint-url http://localhost:4566 --region us-east-1 sqs list-queues
 ```
 
+### Outbound events
+
+Committed outbox rows are published to `wallet-events.fifo` by the outbox
+relay: `MessageGroupId` is the wallet id, `MessageDeduplicationId` the
+`eventId`, the body is the event envelope and `eventType`/`eventVersion` are
+message attributes. Delivery is at-least-once; deduplicate by `eventId` and
+order per wallet by `walletVersion`. Full contract: ARCHITECTURE.md §22.
+
+Read them from the host:
+
+```sh
+AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test aws --endpoint-url http://localhost:4566 --region us-east-1 sqs receive-message --queue-url http://localhost:4566/000000000000/wallet-events.fifo --max-number-of-messages 10 --attribute-names All --message-attribute-names All
+```
+
+`/health/ready` reports both `postgres` and `sqs`.
+
 ### Keycloak and test identities
 
 Keycloak (admin console `admin`/`admin` at http://localhost:8080) imports the
@@ -111,6 +126,17 @@ from the `provider_id` claim. `/health/*` needs no token.
 | `REFERENCE_BACKOFF_MAX` | `60s` | app | longest retry delay |
 | `REFERENCE_WORKER_CONCURRENCY` | `4` | app | reference worker goroutines per instance |
 | `REFERENCE_WORKER_POLL_INTERVAL` | `1s` | app | idle wait before the worker looks for due operations again |
+| `SQS_ENDPOINT` | — (AWS) | app | broker endpoint override (compose: `http://ministack:4566`) |
+| `AWS_REGION` | `us-east-1` | app | broker region |
+| `SQS_EVENTS_QUEUE` | `wallet-events.fifo` | app | outbound events queue |
+| `SQS_PUBLISHER_ACCESS_KEY_ID` / `SQS_PUBLISHER_SECRET_ACCESS_KEY` | — (required) | app | publisher-only credentials (ARCHITECTURE §10) |
+| `OUTBOX_LEASE` | `30s` | app | claim lease (ARCHITECTURE §9) |
+| `OUTBOX_BATCH_SIZE` | `10` | app | events per `SendMessageBatch` (max 10) |
+| `OUTBOX_PUBLISH_TIMEOUT` | `5s` | app | timeout of one publish call |
+| `OUTBOX_BACKOFF_BASE` / `OUTBOX_BACKOFF_MAX` | `1s` / `5m` | app | retry backoff |
+| `OUTBOX_MAX_ATTEMPTS` | `20` | app | attempts before an event is parked |
+| `OUTBOX_POLL_INTERVAL` | `1s` | app | idle wait of the relay |
+| `OUTBOX_RELAY_CONCURRENCY` | `1` | app | relay goroutines per instance |
 | `HTTP_ADDR` | `:8081` | app | listen address |
 | `HTTP_READ_HEADER_TIMEOUT` | `5s` | app | header read timeout |
 | `HTTP_HANDLER_TIMEOUT` | `10s` | app | per-request handler timeout |
@@ -120,7 +146,7 @@ from the `provider_id` claim. `/health/*` needs no token.
 | `LOG_LEVEL` | `info` | app | `debug`, `info`, `warn`, `error` |
 | `RUN_HTTP` | `true` | app | serve HTTP |
 | `RUN_CONSUMER` | `true` | app | SQS consumer (not implemented yet) |
-| `RUN_OUTBOX` | `true` | app | outbox relay (not implemented yet) |
+| `RUN_OUTBOX` | `true` | app | outbox relay |
 | `RUN_REFERENCE_WORKER` | `true` | app | PENDING_REFERENCE worker |
 
 Invalid configuration makes the app exit at startup and lists every problem it
@@ -240,7 +266,7 @@ integration tests.
 | `go test -race ./...` | the same with the race detector | Go + gcc (cgo) |
 | `go vet ./...` | vet (add `-tags=integration` to vet integration code too) | Go |
 | `gofmt -l .` | lists unformatted files (should print nothing) | Go |
-| `go test -tags=integration -count=1 ./test/integration/...` | real Postgres via testcontainers: migrations up/down, Fx start/stop with goroutine-leak check, every schema constraint, trigger and grant, the repositories, wallet locking and transaction atomicity, token verification against a real Keycloak (started once per run), the HTTP API end to end including the concurrency scenarios of CHALLENGE §13, the reference worker (late references, expiry, contention, abandoned claims, restart) | Docker |
+| `go test -tags=integration -count=1 ./test/integration/...` | real Postgres via testcontainers: migrations up/down, Fx start/stop with goroutine-leak check, every schema constraint, trigger and grant, the repositories, wallet locking and transaction atomicity, token verification against a real Keycloak (started once per run), the HTTP API end to end including the concurrency scenarios of CHALLENGE §13, the reference worker (late references, expiry, contention, abandoned claims, restart), the outbox relay against a real MiniStack (publishing, contention, crash recovery, backoff, parking) | Docker |
 | `go test -tags=integration -race -count=1 ./test/integration/...` | the same with the race detector | Docker + gcc |
 
 With no local C toolchain (for example, on Windows without gcc), run the race
