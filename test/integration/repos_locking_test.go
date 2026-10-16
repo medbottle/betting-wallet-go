@@ -111,7 +111,7 @@ func TestWalletLocking(t *testing.T) {
 			_, err := r.Wallets().GetForUpdate(ctx, w.ID())
 			return err
 		})
-		// 57014 is deliberately unclassified for now (docs/OPEN-QUESTIONS.md Q2).
+		// query_canceled; classified as transient (ARCHITECTURE §24, Q2).
 		if pgCode(err) != "57014" {
 			t.Fatalf("err = %v, want SQLSTATE 57014", err)
 		}

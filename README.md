@@ -9,11 +9,10 @@ SQS, Keycloak). Spec: [docs/CHALLENGE.md](docs/CHALLENGE.md). Design decisions:
 > `dlqredrive` tool), the reference worker and the outbox relay run on the
 > full schema, domain and persistence adapter; committed events are
 > published to `wallet-events.fifo`; Prometheus metrics are served on
-> `:9090`; the CHALLENGE §13 scenarios run against three instances. Questions the documents
-> left open, all resolved: [docs/OPEN-QUESTIONS.md](docs/OPEN-QUESTIONS.md); parked
-> assumptions: [docs/ASSUMPTIONS.md](docs/ASSUMPTIONS.md); limitations and
-> unfinished work: ARCHITECTURE.md, "Premissas e limitações" and "Trabalho
-> não concluído".
+> `:9090`; the CHALLENGE §13 scenarios run against three instances.
+> Interpretations, limitations and unfinished work: ARCHITECTURE.md,
+> "Interpretações adotadas", "Premissas e limitações" and "Trabalho não
+> concluído".
 
 ## Prerequisites
 

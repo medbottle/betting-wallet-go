@@ -750,7 +750,7 @@ Versão do Go: a última estável no momento da implementação, fixada em `go.m
 
 ## 18. Decisões do slice 4 (adapter de persistência)
 
-Tudo abaixo segue as seções 3, 4, 6, 8 e 9; os pontos que os documentos não decidem estão em [docs/OPEN-QUESTIONS.md](docs/OPEN-QUESTIONS.md) e **não** foram decididos no código naquele slice (Q1 e Q2 foram decididos depois, na seção 24).
+Tudo abaixo segue as seções 3, 4, 6, 8 e 9; os pontos que os documentos não decidiam (Q1 e Q2) não foram decididos no código naquele slice; foram decididos depois, na seção 24.
 
 **Ports** (`internal/app`, só depende do domínio): `TxRunner.InTx(ctx, TxOptions, func(ctx, Repos) error)` como na seção 3; `Repos` com `Wallets()`, `Transactions()`, `Ledger()`, `Inbox()` e `Outbox()`; `WalletReader` para a pré-leitura; `Clock`; `IDGenerator`. Sentinelas: `ErrNotFound`, `ErrWalletAlreadyExists`, `ErrTransient` (categoria E), `ErrInvariantViolation` (categoria D). O erro original continua embrulhado, para os logs.
 
@@ -826,7 +826,7 @@ Tudo abaixo segue as seções 3, 4, 6, 8 e 9; os pontos que os documentos não d
 - **Q6, correlationId**: o header `X-Correlation-Id` é aceito quando tem de 1 a 255 caracteres ASCII imprimíveis; senão um UUIDv7 é gerado. O valor volta no mesmo header da resposta, vai para os logs e é gravado na transação e nos eventos.
 - **Q7, formato dos GET**: o recurso de transação traz o que a seção 9 do desafio pede para acompanhar pendências e consultar falhas: ids interno e externos, origem, tipo, status, carteira, jogador, `money`, provedor, rodada, jogo, referências, `failureCode`, o resultado devolvido ao provedor (`balance`, `walletVersion`), `referenceDeadlineAt` enquanto pendente e os timestamps. Campos que não se aplicam são omitidos. A carteira usa exatamente o formato do desafio (`id`, `playerId`, `balance`, `version`). O ledger é `{walletId, entries, nextCursor}`, com os campos de lançamento da seção 6.4 do desafio.
 - **Q8, Retry-After**: `2` segundos em todo 503. 1s seria curto: os 503 vêm sobretudo de espera de lock além do `lock_timeout` (5s) ou de falha do banco, que a readiness checa a cada 2s; 2s garante ao menos mais uma checagem antes do retry.
-- **Q9, paginação e corpo**: `limit` padrão 50 (o exemplo do desafio); teto de 200 por página, para limitar o custo de uma requisição (premissa A5 em docs/ASSUMPTIONS.md). Corpo de requisição limitado a 64 KiB.
+- **Q9, paginação e corpo**: `limit` padrão 50 (o exemplo do desafio); teto de 200 por página, para limitar o custo de uma requisição (premissa A5). Corpo de requisição limitado a 64 KiB.
 
 **Casos de uso**:
 - `wallets.Open`: valida `playerId` e `initialBalance`, roda `wager.OpenWallet` e grava carteira, `OPENING`, lançamento e eventos numa transação. Duplicata → `WALLET_ALREADY_EXISTS`.
@@ -964,7 +964,7 @@ Regras para consumidores: a entrega é at-least-once, então deduplicar por `eve
 
 ## 24. Decisões das questões em aberto (Q1, Q2, Q5 e premissa A5)
 
-Aprovadas depois do slice 9, todas com a recomendação proposta. Nenhuma muda as garantias do desafio; elas fecham comportamentos que os documentos deixavam abertos (docs/OPEN-QUESTIONS.md).
+Aprovadas depois do slice 9, todas com a recomendação proposta. Nenhuma muda as garantias do desafio; elas fecham comportamentos que os documentos deixavam abertos.
 
 **Q1, `statement_timeout` padrão**: toda transação aplica `SET LOCAL statement_timeout`, com padrão `DB_STATEMENT_TIMEOUT = 10s` (o dobro do `lock_timeout` de 5s, igual à iteração do worker de referências da seção 14). `TxOptions.StatementTimeout` positivo continua sobrescrevendo. **Por quê**: sem limite, um comando travado (plano ruim, I/O lento) seguraria o lock de uma carteira até o fim do contexto do chamador, e o worker e a outbox não têm deadline de requisição HTTP. Com 10s, o `lock_timeout` (5s) continua sendo o primeiro a disparar numa espera de lock, e nenhum comando legítimo do serviço chega perto disso. A reconciliação (`REPEATABLE READ READ ONLY`) usa o mesmo limite por comando.
 
@@ -1120,6 +1120,35 @@ Todo teste termina com os invariantes: nenhuma operação pendente, reconciliaç
 - **Idioma**: documento em português, identificadores em inglês.
 
 ---
+
+## Interpretações adotadas
+
+Pontos que os documentos deixam abertos e como foram lidos. As seções citadas trazem o contexto; os rótulos (A1, N7...) são os usados no texto acima.
+
+- **A1. O serviço interno lê as duas rotas de transação** (seção 11, "leitura de qualquer transação"): `GET /wagering/transactions/{id}` e `GET /providers/{providerId}/wagering/transactions/{externalId}` para qualquer provedor.
+- **A2. Provedores recebem 404 para transações internas**: um `OPENING` não tem provedor, então a resposta é a mesma de uma transação de outro provedor.
+- **A3. Um replay que encontra `PENDING` responde 202**, como `PENDING_REFERENCE`: o caminho síncrono nunca commita `PENDING` (seção 5), então só uma linha antiga deixada para o worker chega aqui, e 202 ("processamento pendente") é o mais próximo.
+- **A4. Campos JSON desconhecidos são recusados** com `INVALID_REQUEST` (violação de schema, seção 12); eles não afetariam o hash.
+- **A5. Teto de 200 por página do ledger**: o desafio só mostra `limit=50` (o padrão); um `limit` acima do teto é recusado, não truncado (seção 24).
+- **A6. Erros não classificados respondem 503, retryable**: não persistiram nada e toda escrita é idempotente, então repetir é seguro; são logados em nível de erro. No SQS, o equivalente é o erro transitório (seção 23, G8).
+- **A7. `TRANSACTION_NOT_FOUND` é um código estável novo** (seção 12, "Leitura"), porque o corpo de erro exige um código.
+- **A8. O reagendamento do worker conta a tentativa em curso**: usa `attempts + 1` na fórmula da seção 8, então as esperas crescem 1s, 2s, 4s... até 60s (antes do jitter).
+- **A9. Qualquer falha não transitória no worker grava `FAILED`** (violação de invariante, ou erro de domínio que não deveria acontecer para uma linha persistida), para uma linha quebrada não ser tentada para sempre.
+- **A10. O jitter da outbox é aditivo, até uma base**: sorteado em `[0, OUTBOX_BACKOFF_BASE)` (seção 22).
+- **A11. O corpo publicado é o JSONB armazenado**: mesmo conteúdo do snapshot, com ordem de chaves e espaços do Postgres; consumidores devem fazer parse, não comparar bytes.
+- **A12. Separação de credenciais do broker configurada, mas não verificável no MiniStack**: o emulador aceita qualquer credencial e não aplica políticas; os testes negativos são pulados com essa razão. As políticas para uma conta AWS real estão definidas em `deploy/aws/iam-policies.json`, sem aplicação local.
+- **A13. O `messageId` do envelope é o `correlationId` no SQS**: o envelope do desafio não tem campo de correlação; o `messageId` vai como `correlationId` e `causationId` da transação e dos eventos.
+- **A14. Os códigos da DLQ reutilizam os existentes**: provedor desconhecido ou inativo é `FORBIDDEN` (o mesmo do HTTP); hash divergente na inbox é `INVALID_REQUEST`.
+- **A15. Replay sobre uma linha `PENDING` antiga é transitório no SQS**: a inbox só aceita resultados terminais ou `PENDING_REFERENCE`, então a mensagem volta até o worker mover a linha.
+- **A16. Durante o shutdown, falha transitória libera a mensagem na hora** (visibility 0, em vez do backoff), para outra instância assumir (seção 14).
+- **A17. Nomes e rótulos das métricas são deste projeto**: o desafio lista o que medir, não nomes (seção 25).
+- **A18. Indisponibilidade do SQS é simulada com pausa, não restart**: reiniciar o MiniStack apagaria as filas em memória, o que o SQS real não faz.
+- **A19. O atraso da outbox é global**: igual em todas as instâncias; agregue com `max`.
+
+**Notas de teste**:
+- **N4.** A liberação do restante do grupo após falha transitória é testada só com SQS falso (quais mensagens vêm num lote é decisão do broker); os caminhos com broker real (DLQ, redrive, queda antes do delete, pausa, parada) são testes de integração.
+- **N6.** O `dlqredrive` pode deixar mensagens posteriores de um grupo para uma segunda execução, porque as `PERMANENT` ignoradas ficam em voo até o visibility timeout da DLQ (seção 23 e README).
+- **N7.** A suíte `multiinstance` roda sem `-race` (seção 25).
 
 ## Premissas e limitações
 
