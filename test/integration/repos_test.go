@@ -12,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/medbottle/betting-wallet-go/internal/adapters/postgres"
 	"github.com/medbottle/betting-wallet-go/internal/app"
 	"github.com/medbottle/betting-wallet-go/internal/domain/event"
 	"github.com/medbottle/betting-wallet-go/internal/domain/wager"
@@ -66,6 +67,30 @@ func TestTxRunner(t *testing.T) {
 		}
 		if exists(t, w.ID()) {
 			t.Fatal("rolled back wallet is visible")
+		}
+	})
+
+	t.Run("default statement timeout cancels a stuck statement as transient", func(t *testing.T) {
+		w := newWallet(t)
+		if err := env.runner.InTx(ctxT(t), app.TxOptions{}, func(ctx context.Context, r app.Repos) error {
+			return r.Wallets().Insert(ctx, w)
+		}); err != nil {
+			t.Fatal(err)
+		}
+		holdTx(t, env.db.app, `SELECT 1 FROM wallets WHERE id = $1 FOR NO KEY UPDATE`, w.ID())
+		// Lock timeout well above the runner's statement timeout: the wait
+		// is cut by statement_timeout (57014), not lock_timeout (55P03).
+		runner := postgres.NewTxRunner(env.db.app, 5*time.Second, 300*time.Millisecond)
+		start := time.Now()
+		err := runner.InTx(ctxT(t), app.TxOptions{}, func(ctx context.Context, r app.Repos) error {
+			_, err := r.Wallets().GetForUpdate(ctx, w.ID())
+			return err
+		})
+		if !errors.Is(err, app.ErrTransient) || pgCode(err) != "57014" {
+			t.Fatalf("err = %v (sqlstate %q), want transient 57014", err, pgCode(err))
+		}
+		if waited := time.Since(start); waited > 3*time.Second {
+			t.Fatalf("statement_timeout not applied by default: waited %v", waited)
 		}
 	})
 

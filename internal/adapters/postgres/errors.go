@@ -19,6 +19,7 @@ var transientCodes = map[string]bool{
 	"40001": true, // serialization_failure
 	"40P01": true, // deadlock_detected
 	"55P03": true, // lock_not_available (lock_timeout)
+	"57014": true, // query_canceled (statement_timeout or a cancel; ARCHITECTURE §24, Q2)
 }
 
 // constraintSentinels maps unique constraints that carry a business meaning

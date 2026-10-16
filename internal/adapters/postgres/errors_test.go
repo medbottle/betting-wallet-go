@@ -24,6 +24,7 @@ func TestClassify(t *testing.T) {
 		{"serialization failure", pg("40001", ""), app.ErrTransient},
 		{"deadlock", pg("40P01", ""), app.ErrTransient},
 		{"lock timeout", pg("55P03", ""), app.ErrTransient},
+		{"query canceled (statement_timeout)", pg("57014", ""), app.ErrTransient},
 		{"connection exception", pg("08006", ""), app.ErrTransient},
 		{"context cancelled", fmt.Errorf("query: %w", context.Canceled), app.ErrTransient},
 		{"context deadline", fmt.Errorf("query: %w", context.DeadlineExceeded), app.ErrTransient},
@@ -33,7 +34,6 @@ func TestClassify(t *testing.T) {
 		{"foreign key", pg("23503", "wager_transactions_wallet_fk"), app.ErrInvariantViolation},
 		{"trigger guard", pg("23000", ""), app.ErrInvariantViolation},
 		{"read only transaction", pg("25006", ""), nil},
-		{"query canceled (open question Q2)", pg("57014", ""), nil},
 		{"plain error", errors.New("boom"), nil},
 	}
 	for _, tt := range tests {
