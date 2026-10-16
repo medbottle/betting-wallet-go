@@ -113,6 +113,12 @@ func build(m Meta, t Type, version int, data any) (Envelope, error) {
 	}, nil
 }
 
+// Valid reports whether e was built by one of the constructors. The outbox
+// must refuse an envelope that is not valid (the zero value).
+func (e Envelope) Valid() bool {
+	return e.eventID != uuid.Nil && e.aggregateID != uuid.Nil && e.eventType != "" && e.version >= 1 && len(e.payload) > 0
+}
+
 func (e Envelope) EventID() uuid.UUID     { return e.eventID }
 func (e Envelope) Type() Type             { return e.eventType }
 func (e Envelope) Version() int           { return e.version }

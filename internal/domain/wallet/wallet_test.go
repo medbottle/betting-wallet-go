@@ -259,3 +259,18 @@ func TestLedgerEntryInvariants(t *testing.T) {
 		t.Errorf("lowercase direction: %v", err)
 	}
 }
+
+func TestLedgerEntryValid(t *testing.T) {
+	w := openWith(t, "100.00")
+	e, err := w.Debit(uuid.New(), uuid.New(), brl(t, "1.00"), t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !e.Valid() {
+		t.Error("constructed entry must be valid")
+	}
+	var zero LedgerEntry
+	if zero.Valid() {
+		t.Error("zero entry must not be valid")
+	}
+}

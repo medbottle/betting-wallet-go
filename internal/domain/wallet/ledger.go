@@ -127,6 +127,19 @@ func validateEntry(p LedgerEntryParams) error {
 	return nil
 }
 
+// Valid reports whether e was built by NewLedgerEntry or
+// RehydrateLedgerEntry. Persistence must refuse an entry that is not valid
+// (the zero value).
+func (e LedgerEntry) Valid() bool { return validateEntry(e.params()) == nil }
+
+func (e LedgerEntry) params() LedgerEntryParams {
+	return LedgerEntryParams{
+		ID: e.id, WalletID: e.walletID, TransactionID: e.transactionID, Direction: e.direction,
+		Amount: e.amount, BalanceBefore: e.balanceBefore, BalanceAfter: e.balanceAfter,
+		WalletVersion: e.walletVersion, CreatedAt: e.createdAt,
+	}
+}
+
 func (e LedgerEntry) ID() uuid.UUID              { return e.id }
 func (e LedgerEntry) WalletID() uuid.UUID        { return e.walletID }
 func (e LedgerEntry) TransactionID() uuid.UUID   { return e.transactionID }

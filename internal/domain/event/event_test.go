@@ -163,3 +163,20 @@ func TestConstructorsReject(t *testing.T) {
 }
 
 func ptr(s string) *string { return &s }
+
+func TestEnvelopeValid(t *testing.T) {
+	e, err := NewWalletBalanceChanged(meta(), WalletBalanceChangedData{
+		WalletID: walletID, TransactionID: txID, Direction: "CREDIT",
+		Money: brl(t, "1.00"), BalanceBefore: brl(t, "0.00"), BalanceAfter: brl(t, "1.00"), WalletVersion: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !e.Valid() {
+		t.Error("constructed envelope must be valid")
+	}
+	var zero Envelope
+	if zero.Valid() {
+		t.Error("zero envelope must not be valid")
+	}
+}
