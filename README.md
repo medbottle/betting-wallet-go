@@ -8,8 +8,8 @@ SQS, Keycloak). Spec: [docs/CHALLENGE.md](docs/CHALLENGE.md). Design decisions:
 > consumer (with inbox, DLQ and the `dlqredrive` tool), the reference worker
 > and the outbox relay run on the full schema, domain and persistence
 > adapter; committed events are published to `wallet-events.fifo`. Metrics
-> and the multi-instance tests are not built yet. Open
-> points: [docs/OPEN-QUESTIONS.md](docs/OPEN-QUESTIONS.md); parked
+> and the multi-instance tests are not built yet. Questions the documents
+> left open, all resolved: [docs/OPEN-QUESTIONS.md](docs/OPEN-QUESTIONS.md); parked
 > assumptions: [docs/ASSUMPTIONS.md](docs/ASSUMPTIONS.md).
 
 ## Prerequisites
@@ -175,7 +175,10 @@ curl -s -d grant_type=client_credentials -d client_id=provider-a -d client_secre
 
 Send it as `Authorization: Bearer <access_token>`. Business endpoints answer
 401 with `WWW-Authenticate: Bearer error="invalid_token"` when the token is
-missing, invalid or expired. The providerId a provider may act for comes only
+missing, invalid or expired. If the token is signed with a key the service
+has not cached and Keycloak cannot be reached to fetch it, the answer is
+503 `TEMPORARILY_UNAVAILABLE` (retryable, `Retry-After: 2`) instead
+(ARCHITECTURE §24). The providerId a provider may act for comes only
 from the `provider_id` claim. `/health/*` needs no token.
 
 ## Environment variables
@@ -189,6 +192,7 @@ from the `provider_id` claim. `/health/*` needs no token.
 | `DB_MAX_CONNS` | `10` | app | pgxpool size |
 | `DB_STARTUP_TIMEOUT` | `10s` | app | bound on the startup ping and schema check |
 | `DB_LOCK_TIMEOUT` | `5s` | app | default `lock_timeout` of business transactions (ARCHITECTURE §4) |
+| `DB_STATEMENT_TIMEOUT` | `10s` | app | default `statement_timeout` of every transaction; a cancelled statement is transient (ARCHITECTURE §24) |
 | `OIDC_ISSUER` | — (required) | app | exact expected `iss` |
 | `OIDC_JWKS_URL` | — (required) | app | JWKS endpoint (inside compose: `http://keycloak:8080/...`) |
 | `OIDC_AUDIENCE` | `wallet-api` | app | required `aud` value |

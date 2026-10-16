@@ -115,7 +115,7 @@ flowchart LR
 
 **Por que `FOR NO KEY UPDATE` e não `FOR UPDATE`** (corrigido no slice 6): o `INSERT` da própria linha no passo 1 verifica a FK `wager_transactions → wallets`, e essa verificação toma `FOR KEY SHARE` na linha da carteira até o fim da transação. `FOR UPDATE` conflita com `FOR KEY SHARE`; `FOR NO KEY UPDATE` não. Com `FOR UPDATE`, duas operações diferentes na mesma carteira inseriam suas linhas (cada uma com `KEY SHARE` na carteira) e depois esperavam uma pela outra no passo 2: deadlock em 35 de 40 disputas medidas, com uma das apostas do caso 100.00 vs. 2 x 80.00 recebendo 503 em vez de `INSUFFICIENT_FUNDS`. O argumento acima, de que inserts antes do lock só disputam índices únicos, ignorava esse lock da FK. `FOR NO KEY UPDATE` continua sendo lock pessimista por carteira (conflita consigo mesmo, então escritores da mesma carteira entram em fila) e é o lock que o próprio Postgres toma num `UPDATE` de colunas que não são chave, como o do saldo. O que `FOR UPDATE` acrescentaria é proteção contra `DELETE` ou alteração de chave da carteira, já proibidos por trigger. O teste `TestNoDeadlockBetweenOperationsOnOneWallet` disputa duas operações na mesma carteira 40 vezes e exige zero `40P01`; ele falha se o lock voltar a ser `FOR UPDATE`.
 
-**Timeouts**: `lock_timeout = 5s`. Os códigos `55P03`, `40P01`, `40001`, erro de conexão e deadline de contexto são tratados como transitórios: rollback e retry.
+**Timeouts**: `lock_timeout = 5s` e `statement_timeout = 10s` (padrão de toda transação, seção 24). Os códigos `55P03`, `40P01`, `40001`, `57014` (comando cancelado, seção 24), erro de conexão e deadline de contexto são tratados como transitórios: rollback e retry.
 
 **Por quê**: o agregado faz a aritmética e produz `balanceBefore`/`balanceAfter`. Com 50 duplicatas em paralelo, o lock enfileira as requisições sem as tempestades de retry do controle otimista. Carteiras distintas não competem entre si.
 
@@ -423,6 +423,7 @@ stateDiagram-v2
   - `exp`/`nbf` com leeway de 30s;
   - `azp` presente.
 - Falhas retornam `401` com `WWW-Authenticate: Bearer error="invalid_token"`. Tokens nunca são logados.
+- Exceção: um `kid` desconhecido que não pode ser checado porque o JWKS está inacessível responde `503 TEMPORARILY_UNAVAILABLE`, retryable (seção 24, Q5).
 - Na inicialização, o primeiro fetch do JWKS precisa funcionar (fail fast).
 
 **Permissões**: client roles em `resource_access.wallet-api.roles`.
@@ -509,7 +510,7 @@ Há dois corpos de resposta:
 | Entrada inválida (categoria A) | `400` (`WALLET_NOT_FOUND`: `404`) | Erro |
 | Conflito (categoria C) | `409` | Erro |
 | Indisponibilidade transitória | `503` | Erro com `retryable: true` e `Retry-After` |
-| Autenticação/autorização | `401`/`403` | Erro (recurso de outro provedor: `404`) |
+| Autenticação/autorização | `401`/`403` | Erro (recurso de outro provedor: `404`); IdP inacessível para um `kid` desconhecido: `503` (seção 24) |
 
 **Outros endpoints**:
 - `POST /wallets`: `201`; conflito `409 WALLET_ALREADY_EXISTS`; entrada inválida `400`.
@@ -748,7 +749,7 @@ Versão do Go: a última estável no momento da implementação, fixada em `go.m
 
 ## 18. Decisões do slice 4 (adapter de persistência)
 
-Tudo abaixo segue as seções 3, 4, 6, 8 e 9; os pontos que os documentos não decidem estão em [docs/OPEN-QUESTIONS.md](docs/OPEN-QUESTIONS.md) e **não** foram decididos no código.
+Tudo abaixo segue as seções 3, 4, 6, 8 e 9; os pontos que os documentos não decidem estão em [docs/OPEN-QUESTIONS.md](docs/OPEN-QUESTIONS.md) e **não** foram decididos no código naquele slice (Q1 e Q2 foram decididos depois, na seção 24).
 
 **Ports** (`internal/app`, só depende do domínio): `TxRunner.InTx(ctx, TxOptions, func(ctx, Repos) error)` como na seção 3; `Repos` com `Wallets()`, `Transactions()`, `Ledger()`, `Inbox()` e `Outbox()`; `WalletReader` para a pré-leitura; `Clock`; `IDGenerator`. Sentinelas: `ErrNotFound`, `ErrWalletAlreadyExists`, `ErrTransient` (categoria E), `ErrInvariantViolation` (categoria D). O erro original continua embrulhado, para os logs.
 
@@ -756,11 +757,11 @@ Tudo abaixo segue as seções 3, 4, 6, 8 e 9; os pontos que os documentos não d
 
 **`InTx`**:
 - `READ COMMITTED` leitura-escrita por padrão; `RepeatableReadReadOnly` para a reconciliação (seção 3).
-- `SET LOCAL lock_timeout` sempre (padrão `DB_LOCK_TIMEOUT=5s`, seção 4); `statement_timeout` só quando `TxOptions.StatementTimeout > 0` (Q1 em aberto). `SET` não aceita parâmetros, então o valor vai como milissegundos inteiros formatados pelo código.
+- `SET LOCAL lock_timeout` sempre (padrão `DB_LOCK_TIMEOUT=5s`, seção 4); `statement_timeout` sempre também (padrão `DB_STATEMENT_TIMEOUT=10s`, decidido em Q1, seção 24). `SET` não aceita parâmetros, então o valor vai como milissegundos inteiros formatados pelo código.
 - Retorno `nil` faz commit; erro ou panic faz rollback (o panic é relançado). O rollback usa um contexto sem cancelamento, para funcionar mesmo com o contexto do chamador já cancelado.
 - Sem retry interno: um erro transitório faz rollback e volta como `ErrTransient`; quem repete é o transporte (HTTP 503, reentrega do SQS; seção 5). Um commit cuja conexão caiu tem resultado desconhecido e também é `ErrTransient`; repetir é seguro pela idempotência.
 
-**Classificação de erros**: `40001`, `40P01`, `55P03`, classe `08`, erros de conexão e deadline/cancelamento de contexto → `ErrTransient` (seção 4). `23505` em `wallets_player_currency_key` → `ErrWalletAlreadyExists`. Qualquer outro `23xxx` (CHECKs, FKs, índices únicos de salvaguarda, triggers `23000`) → `ErrInvariantViolation` (seção 5). O resto volta sem classificação, incluindo `57014` (Q2 em aberto).
+**Classificação de erros**: `40001`, `40P01`, `55P03`, `57014` (decidido em Q2, seção 24), classe `08`, erros de conexão e deadline/cancelamento de contexto → `ErrTransient` (seção 4). `23505` em `wallets_player_currency_key` → `ErrWalletAlreadyExists`. Qualquer outro `23xxx` (CHECKs, FKs, índices únicos de salvaguarda, triggers `23000`) → `ErrInvariantViolation` (seção 5). O resto volta sem classificação, incluindo `57014` (Q2 em aberto).
 
 **Repositórios** (só o que os fluxos de submit, abertura e reconciliação usam):
 - Carteira: `Insert`, `GetForUpdate` (`FOR NO KEY UPDATE`, seção 4), `UpdateBalance` com `WHERE version = $esperada` (0 linhas = violação de invariante, seção 4).
@@ -812,7 +813,7 @@ Tudo abaixo segue as seções 3, 4, 6, 8 e 9; os pontos que os documentos não d
 - Unitários com uma chave RSA local atrás de um JWKS `httptest`, para regras que o Keycloak não produz sob demanda: `azp` ausente, HS256/RS512, tolerância de `exp`/`nbf` nos dois lados, `aud` em lista, rotação, rate limit, busca compartilhada, falha mantendo o cache, chave de cifragem ignorada.
 - Integração com Keycloak real (testcontainers, mesmo arquivo de realm, um container compartilhado pelo pacote): tokens reais de `client_credentials` dos três clientes; recusa de token ausente, assinatura adulterada, issuer errado, audiência errada e token expirado (o mesmo token real, verificado com o relógio adiantado além de `exp` + 30s); segredo errado não obtém token; middleware com rota protegida e `/health` público; o teste de lifecycle do Fx sobe Keycloak e o app não inicia sem JWKS.
 
-**Em aberto**: Q5 em [docs/OPEN-QUESTIONS.md](docs/OPEN-QUESTIONS.md) (`kid` desconhecido com o IdP fora do ar: hoje 401).
+**Q5 decidida** (seção 24): `kid` desconhecido com o IdP fora do ar responde 503 retryable.
 
 ---
 
@@ -957,6 +958,22 @@ Regras para consumidores: a entrega é at-least-once, então deduplicar por `eve
 **Testes**:
 - Unitários (`internal/adapters/sqsconsumer`, com `-race` e `goleak`, SQS falso só aqui): regras do envelope; classificação dos erros e atributos da DLQ; fallback de grupo; falha no envio à DLQ; backoff com teto; ordem dentro do grupo e paralelismo entre grupos; liberação após falha transitória; pausa sem readiness; `Stop` esperando o handler em voo e liberando o resto; lógica do redrive.
 - Integração (Postgres, MiniStack e Keycloak reais, uma fila de entrada e uma DLQ próprias por teste): mensagem do exemplo processada com inbox concluída e eventos com `causationId`; item 4 da seção 13 do desafio (três entregas com dedup diferentes do SQS, um efeito); DLQ explícita para hash divergente, JSON inválido, `OPENING`, provedor desconhecido, valor numérico e conflito de chave, sem linhas de domínio, e o redrive deixando essas mensagens na DLQ; rejeição de negócio; `PENDING_REFERENCE` concluindo a inbox e o worker resolvendo depois; cruzamento HTTP e SQS nas duas ordens e concorrente; item 5 da seção 13 (commit e queda antes do delete, reentrega como duplicata); falhas transitórias até o redrive da fila mandar para a DLQ sem `failureClass`, seguidas do redrive pela ferramenta e do processamento; pausa sem readiness; `Stop` com handler em voo; teste negativo de credenciais (pulado). O teste de lifecycle do Fx roda com o consumidor ligado e verifica `goleak`.
+
+---
+
+## 24. Decisões das questões em aberto (Q1, Q2, Q5 e premissa A5)
+
+Aprovadas depois do slice 9, todas com a recomendação proposta. Nenhuma muda as garantias do desafio; elas fecham comportamentos que os documentos deixavam abertos (docs/OPEN-QUESTIONS.md).
+
+**Q1, `statement_timeout` padrão**: toda transação aplica `SET LOCAL statement_timeout`, com padrão `DB_STATEMENT_TIMEOUT = 10s` (o dobro do `lock_timeout` de 5s, igual à iteração do worker de referências da seção 14). `TxOptions.StatementTimeout` positivo continua sobrescrevendo. **Por quê**: sem limite, um comando travado (plano ruim, I/O lento) seguraria o lock de uma carteira até o fim do contexto do chamador, e o worker e a outbox não têm deadline de requisição HTTP. Com 10s, o `lock_timeout` (5s) continua sendo o primeiro a disparar numa espera de lock, e nenhum comando legítimo do serviço chega perto disso. A reconciliação (`REPEATABLE READ READ ONLY`) usa o mesmo limite por comando.
+
+**Q2, SQLSTATE `57014` (`query_canceled`)**: classificado como transitório (`ErrTransient`), ao lado de `55P03`, `40P01`, `40001` e da classe `08`. HTTP responde `503 TEMPORARILY_UNAVAILABLE` com `Retry-After`, e o consumidor SQS aplica o backoff de visibilidade. **Por quê**: um comando cancelado (pelo `statement_timeout` de Q1 ou por um cancelamento administrativo) faz rollback da transação inteira; nada foi persistido e toda escrita é idempotente, então repetir é seguro, exatamente como numa espera de lock esgotada.
+
+**Q5, `kid` desconhecido com o IdP fora do ar**: se o token traz um `kid` fora do cache e a busca do JWKS falha, a verificação devolve `ErrTransient` (com `oidc.ErrKeysUnavailable`), e o middleware responde `503 TEMPORARILY_UNAVAILABLE`, `retryable: true`, `Retry-After: 2`, sem `WWW-Authenticate`. Dentro da janela de rate limit (30s), se a última busca falhou, a resposta continua 503; se a última busca deu certo e o `kid` não estava lá, é 401. Tokens assinados com chaves em cache continuam aceitos durante a queda, e uma assinatura inválida com `kid` conhecido continua 401. **Por quê**: o token pode ser válido (rotação de chave no Keycloak), então 401 diria ao cliente que a credencial dele é ruim quando o problema é nosso; 503 é o contrato de indisponibilidade transitória da seção 13. O rate limit continua valendo durante a queda, então tokens forjados com `kid` aleatório não multiplicam as buscas. Nenhum efeito acontece antes da autenticação, então o 503 não tem efeitos colaterais. Detalhe de implementação: o go-oidc formata o erro do `KeySet` com `%v` e perde a cadeia, então o `Verifier` registra o erro do `KeySet` num slot do contexto da própria chamada.
+
+**A5, teto da página do ledger**: mantido como está: `limit` padrão 50 (o exemplo do desafio) e teto de 200; um `limit` acima do teto é recusado com `INVALID_REQUEST`, não truncado. O desafio só mostra `limit=50` e não fixa máximo.
+
+**Testes**: unitários para a classificação de `57014`, o padrão e a validação de `DB_STATEMENT_TIMEOUT`, o `KeySet` durante a queda (busca falha, janela de rate limit, chave em cache, assinatura inválida, recuperação) e o middleware respondendo 503. Integração: uma espera de lock cortada pelo `statement_timeout` padrão do `TxRunner` vira `ErrTransient` com `57014`; contra o Keycloak real, um JWKS indisponível faz um `kid` rotacionado responder 503, o token com a chave em cache continuar 204, e o mesmo `kid` responder 401 depois da recuperação.
 
 ---
 
