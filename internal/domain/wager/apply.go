@@ -61,8 +61,8 @@ type Outcome struct {
 //     REFERENCE_UNRESOLVED_TIMEOUT; a reference that became resolvable is
 //     applied even after the deadline;
 //   - a resolved reference is checked in this order: status, kind,
-//     provider/player/wallet/currency/round, amount, already reversed;
-//     then funds;
+//     provider/player/wallet/currency/round, amount, already reversed (a
+//     WIN on a reversed BET is REFERENCE_NOT_PROCESSED); then funds;
 //   - BET debits; WIN and REFUND credit; LOSS moves nothing; ROLLBACK
 //     credits a BET back and debits a WIN or REFUND back.
 //
@@ -149,6 +149,11 @@ func checkReference(t, ref *WagerTransaction, reversed bool) FailureCode {
 		if reversed {
 			return CodeAlreadyReversed
 		}
+	}
+	// A WIN pays out on a BET that still stands: a refunded or rolled-back
+	// BET no longer counts as processed (ARCHITECTURE §7, §27 L-1).
+	if t.kind == KindWin && reversed {
+		return CodeReferenceNotProcessed
 	}
 	return ""
 }

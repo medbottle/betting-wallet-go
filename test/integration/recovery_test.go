@@ -221,3 +221,37 @@ func TestCancelledContextPersistsNothing(t *testing.T) {
 	}
 	e.assertConsistent(t, w, "75.00")
 }
+
+// TestAPIWinOfReversedBet: a WIN that references a BET already refunded or
+// rolled back is rejected with REFERENCE_NOT_PROCESSED and pays nothing
+// (ARCHITECTURE §7, §27 L-1); a WIN on a standing BET is still paid.
+func TestAPIWinOfReversedBet(t *testing.T) {
+	t.Parallel()
+	e := newAPIEnv(t)
+	w := e.openWallet(t, "100.00")
+	for _, s := range []struct{ kind, ext, ref string }{
+		{"BET", "wr-bet", ""}, {"REFUND", "wr-refund", "wr-bet"},
+		{"BET", "wr-bet2", ""}, {"ROLLBACK", "wr-rollback", "wr-bet2"},
+		{"BET", "wr-bet3", ""},
+	} {
+		var body map[string]any
+		if s.ref == "" {
+			body = op(w, "provider-a", s.kind, "25.00", s.ext)
+		} else {
+			body = op(w, "provider-a", s.kind, "25.00", s.ext, s.ref)
+		}
+		if r := e.submit(t, "provider-a", body); r.Status != http.StatusOK {
+			t.Fatalf("%s: %d %s", s.ext, r.Status, r.Raw)
+		}
+	}
+	for _, ref := range []string{"wr-bet", "wr-bet2"} {
+		r := e.submit(t, "provider-a", op(w, "provider-a", "WIN", "50.00", "win-of-"+ref, ref))
+		if r.Status != http.StatusUnprocessableEntity || r.str("failureCode") != "REFERENCE_NOT_PROCESSED" || r.amount("balance") != "75.00" {
+			t.Fatalf("win of reversed %s: %d %s", ref, r.Status, r.Raw)
+		}
+	}
+	if r := e.submit(t, "provider-a", op(w, "provider-a", "WIN", "50.00", "win-of-wr-bet3", "wr-bet3")); r.Status != http.StatusOK || r.amount("balance") != "125.00" {
+		t.Fatalf("win of standing bet: %d %s", r.Status, r.Raw)
+	}
+	e.assertConsistent(t, w, "125.00")
+}

@@ -343,6 +343,14 @@ func TestApplyReferenceRejections(t *testing.T) {
 			bet := w.processed(w.tx("BET", "25.00", ""), nil)
 			return w.tx("ROLLBACK", "25.00", bet.ExternalTransactionID()), bet, true
 		}, CodeAlreadyReversed},
+		{"win of refunded bet", func(w *world) (*WagerTransaction, *WagerTransaction, bool) {
+			bet := w.processed(w.tx("BET", "25.00", ""), nil)
+			return w.tx("WIN", "50.00", bet.ExternalTransactionID()), bet, true
+		}, CodeReferenceNotProcessed},
+		{"win of reversed bet in another round: match first", func(w *world) (*WagerTransaction, *WagerTransaction, bool) {
+			bet := w.processed(w.tx("BET", "25.00", ""), nil)
+			return w.tx("WIN", "50.00", bet.ExternalTransactionID()), withSnapshot(w, bet, func(s *Snapshot) { s.RoundID = strp("round-1") }), true
+		}, CodeReferenceMismatch},
 		// Precedence: status > kind > match > amount > reversed > funds.
 		{"rejected win referenced by refund: status first", func(w *world) (*WagerTransaction, *WagerTransaction, bool) {
 			win := w.tx("WIN", "25.00", "")

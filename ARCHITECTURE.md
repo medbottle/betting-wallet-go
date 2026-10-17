@@ -220,6 +220,8 @@ stateDiagram-v2
 
 **`WIN` não conta como reversão**: vários `WIN` podem referenciar a mesma `BET` (premissa, ver o final do documento).
 
+**`WIN` de `BET` já revertida**: uma `BET` com `REFUND` ou `ROLLBACK` processado deixou de valer, então um `WIN` que a referencia vira `REJECTED` com `REFERENCE_NOT_PROCESSED` e não paga nada (seção 27, L-1). A checagem vem depois da concordância de carteira e rodada, na mesma posição de `ALREADY_REVERSED` nas reversões.
+
 **Saldo insuficiente**: um `ROLLBACK` de `WIN` ou `REFUND` que deixaria o saldo negativo vira `REJECTED` com `REVERSAL_INSUFFICIENT_FUNDS`, distinto de `INSUFFICIENT_FUNDS`, e fica auditável.
 
 **Estado da referência no momento da avaliação** (vale para `WIN`, `REFUND` e `ROLLBACK`):
@@ -508,7 +510,7 @@ stateDiagram-v2
 | `REVERSAL_INSUFFICIENT_FUNDS` | `ROLLBACK` de `WIN`/`REFUND` sem saldo |
 | `REFERENCE_NOT_FOUND` | TTL esgotado e a referência nunca apareceu |
 | `REFERENCE_UNRESOLVED_TIMEOUT` | TTL esgotado com a referência ainda em `PENDING_REFERENCE` |
-| `REFERENCE_NOT_PROCESSED` | Referência em `REJECTED`/`FAILED` (vale para reversões e para `WIN`) |
+| `REFERENCE_NOT_PROCESSED` | Referência em `REJECTED`/`FAILED` (vale para reversões e para `WIN`), ou `WIN` de uma `BET` já revertida |
 | `REFERENCE_KIND_NOT_ALLOWED` | Combinação de tipos inválida |
 | `REFERENCE_MISMATCH` | Carteira ou rodada divergentes |
 | `REFERENCE_AMOUNT_MISMATCH` | Valor da reversão diferente do valor referenciado |
@@ -775,7 +777,7 @@ Versão do Go: a última estável no momento da implementação, fixada em `go.m
 **`Apply`** (regras da seção 7):
 - Valida antes de tudo que a carteira é a da transação (senão erro de programação) e que jogador e moeda batem (`PLAYER_WALLET_MISMATCH`/`CURRENCY_MISMATCH`, categoria A), inclusive para `LOSS`.
 - Referência ausente ou ainda não terminal (`PENDING` ou `PENDING_REFERENCE`): espera até o deadline (`created_at + TTL`); `WagerTransactionPendingReference` só na entrada; `Reschedule` não emite evento. No deadline: `REFERENCE_NOT_FOUND` (nunca chegou) ou `REFERENCE_UNRESOLVED_TIMEOUT` (existe mas pendente). Referência resolvível é aplicada mesmo após o deadline.
-- Ordem das checagens da referência: status → kind → provedor/jogador/carteira/moeda/rodada → valor → já revertida → saldo. Jogador e moeda também decorrem da carteira no schema (FKs compostas), mas são comparados explicitamente para que a regra do CHALLENGE §7 valha para valores em memória. `WIN` com referência que não seja `BET`, ou referência a operação `INTERNAL`, é `REFERENCE_KIND_NOT_ALLOWED`.
+- Ordem das checagens da referência: status → kind → provedor/jogador/carteira/moeda/rodada → valor → já revertida (para `WIN`, `REFERENCE_NOT_PROCESSED`; seção 27) → saldo. Jogador e moeda também decorrem da carteira no schema (FKs compostas), mas são comparados explicitamente para que a regra do CHALLENGE §7 valha para valores em memória. `WIN` com referência que não seja `BET`, ou referência a operação `INTERNAL`, é `REFERENCE_KIND_NOT_ALLOWED`.
 - Uma referência encontrada e terminal é gravada em `reference_transaction_id` mesmo quando a operação é rejeitada, para auditoria.
 - O cálculo do backoff (com jitter) fica no worker: o domínio só recebe `NextAttemptAt`.
 - Rejeições de negócio são `Outcome`, não erros. Um erro significa que nada deve ser persistido; quem chama descarta transação e carteira em memória e faz rollback.
@@ -1132,6 +1134,8 @@ Uma revisão independente, feita como um avaliador estrito a partir de um clone 
 - O relay agora só reivindica quando a checagem `sqs` da readiness está `ok`, como o consumidor pausa o polling (seção 10). Vale só a checagem do SQS: o draining não interrompe a publicação, e uma queda do Postgres já faz o claim falhar sem consumir tentativas. A transição é logada (`outbox relay paused`/`resumed`).
 - O estacionamento continua como proteção para falhas por entrada (por exemplo `SenderFault`) e o README traz o comando que devolve os eventos estacionados à fila, zerando `parked_at` e `attempts`; o `eventId` não muda.
 - Testes: unitário `TestRelayPausesWhileBrokerNotReady`; na suíte de múltiplas instâncias, `TestSQSOutage` agora exige que nenhum evento da carteira tenha tentativa consumida durante a queda.
+
+**L-1, `WIN` pago sobre `BET` revertida** (seção 7 do desafio, coerência financeira): `BET` 25.00, `ROLLBACK` dela e depois um `WIN` referenciando a mesma `BET` creditava o prêmio de uma aposta desfeita; a seção 7 tratava `ROLLBACK` depois de `WIN`, não o contrário. Agora o `WIN` é rejeitado com `REFERENCE_NOT_PROCESSED` (código existente; o CHECK do schema já o aceita, nenhuma migration). `WIN` sobre `BET` que continua valendo não muda. Testes: dois casos em `TestApplyReferenceRejections` (inclusive a precedência da concordância de rodada) e `TestAPIWinOfReversedBet` (depois de `REFUND` e de `ROLLBACK`, saldo inalterado, e um `WIN` válido ainda pago).
 
 ---
 
