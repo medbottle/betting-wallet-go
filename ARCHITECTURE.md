@@ -1055,7 +1055,7 @@ Séries para alertar: `wager_transactions_total{status="FAILED"}`, `outbox_parke
 
 Todo teste termina com os invariantes: nenhuma operação pendente, reconciliação consistente com o saldo esperado, um lançamento por operação processada que move dinheiro, outbox esvaziada sem estacionados e cada `eventId` commitado recebido em `wallet-events.fifo` (repetições são permitidas e logadas).
 
-**`-race`**: a suíte roda no host, sem `-race` se o host não tem gcc. Para o detector de corrida ela roda num container Linux com gcc e o CLI do Docker (`test/multiinstance/race.Dockerfile`, comando no README e `make multiinstance-race`), que dirige a mesma pilha pelo socket do Docker, alcança as portas por `host.docker.internal` (`MULTIINSTANCE_HOST`) e monta o checkout no próprio caminho para os bind mounts do compose resolverem no host do Docker. Verificado em 2026-10-17 no Docker Desktop (checkout montado no caminho da VM, `/run/desktop/mnt/host/c/...`): os 10 testes passam com `-race` e nenhum data race. O detector instrumenta o processo de teste (clientes HTTP, SQS e Postgres e as goroutines dos cenários concorrentes); os três processos da aplicação são os binários da imagem, sem `-race` (premissa N7).
+**`-race`**: a suíte roda no host, sem `-race` se o host não tem gcc. Para o detector de corrida ela roda num container Linux com gcc e o CLI do Docker (`test/multiinstance/race.Dockerfile`, comando no README e `make multiinstance-race`), que dirige a mesma pilha pelo socket do Docker, alcança as portas por `host.docker.internal` (`MULTIINSTANCE_HOST`) e monta o checkout no próprio caminho para os bind mounts do compose resolverem no host do Docker. Verificado em 2026-10-17 no Docker Desktop (checkout montado no caminho da VM, `/run/desktop/mnt/host/c/...`): os 10 testes passam com `-race` e nenhum data race. O detector instrumenta o processo de teste (clientes HTTP, SQS e Postgres e as goroutines dos cenários concorrentes); os três processos da aplicação são os binários da imagem, sem `-race` (premissa N7), a menos que se ligue o extra `MULTIINSTANCE_RACE=1` da seção 26.
 
 ---
 
@@ -1095,6 +1095,13 @@ Uma revisão independente contra o desafio apontou um risco eliminatório (H1, "
 - **Contexto cancelado** (seção 6 do desafio): um contexto cancelado no meio da transação de negócio, depois das gravações de saldo e ledger, desfaz tudo (`503` retryable, nenhuma linha, lançamento ou evento, carteira intacta); um contexto já cancelado antes da chamada também não grava nada; o retry aplica a operação uma vez.
 
 **M1, `-race` no caminho de múltiplos processos** (seção 13 do desafio: `-race` nos testes aplicáveis): a suíte `multiinstance` só rodava sem o detector, porque o host não tem gcc e a imagem Go usada para `-race` não tinha o CLI do Docker. Agora `test/multiinstance/race.Dockerfile` acrescenta o CLI do Docker e os plugins Compose e Buildx à imagem `golang:1.27.2-bookworm` (que tem gcc), e a suíte lê o host das portas publicadas de `MULTIINSTANCE_HOST` (padrão `localhost`). O comando do README (`make multiinstance-race`) roda a suíte com `-race` dentro desse container; verificado: 10 testes passam, sem data race (seção 25).
+
+**Extra, não exigido pelo desafio: processos da aplicação com `-race`**. O `-race` da seção 13 do desafio vale para os testes aplicáveis e está atendido pelos unitários, pela integração e pela suíte de múltiplas instâncias acima (M1). Como extra, feito depois da verificação final, os três processos da aplicação também podem rodar instrumentados sob carga:
+- o Dockerfile ganhou os estágios `build-race` (`golang:1.27.2-bookworm`, `CGO_ENABLED=1`, `go build -race`) e `race` (`debian:12.15-slim`, mesma glibc 2.36, usuário 65532), construídos só quando pedidos; o alvo padrão continua sendo a imagem distroless de produção;
+- `docker-compose.race.yml` põe `migrate`, `app`, `app-2` e `app-3` na imagem `wager-wallet:race`;
+- com `MULTIINSTANCE_RACE=1`, a suíte usa esse override, confere com `go version -m` que o binário de `app` tem `-race=true` e, depois dos testes, falha se os logs de `app`, `app-2` e `app-3` (de todas as execuções de cada container, inclusive as mortas e reiniciadas) tiverem `WARNING: DATA RACE`;
+- verificado que o relatório do detector chega aos logs do container: um programa com corrida, compilado igual e rodado na mesma imagem base, escreve `WARNING: DATA RACE` no `docker logs` e sai com 66.
+- Sem pipeline de CI: não está nos documentos e consumiria minutos do GitHub Actions a cada push ("Trabalho não concluído").
 
 ---
 
@@ -1215,7 +1222,7 @@ Pontos que os documentos deixam abertos e como foram lidos. As seções citadas 
 **Notas de teste**:
 - **N4.** A liberação do restante do grupo após falha transitória é testada só com SQS falso (quais mensagens vêm num lote é decisão do broker); os caminhos com broker real (DLQ, redrive, queda antes do delete, pausa, parada) são testes de integração.
 - **N6.** O `dlqredrive` pode deixar mensagens posteriores de um grupo para uma segunda execução, porque as `PERMANENT` ignoradas ficam em voo até o visibility timeout da DLQ (seção 23 e README).
-- **N7.** A suíte `multiinstance` roda com `-race` no container Linux da seção 25; os processos da aplicação testados são os binários da imagem de produção, sem `-race`, a menos que se construa o extra das imagens instrumentadas ("Trabalho não concluído").
+- **N7.** A suíte `multiinstance` roda com `-race` no container Linux da seção 25. Os processos da aplicação testados são os binários da imagem de produção, sem `-race`, a menos que se ligue o extra `MULTIINSTANCE_RACE=1` (seção 26), que usa imagens compiladas com o detector.
 
 ## Premissas e limitações
 
@@ -1232,14 +1239,13 @@ Pontos que os documentos deixam abertos e como foram lidos. As seções citadas 
 - **Retenção**: sem limpeza de `inbox_messages` e `outbox_events` publicados neste escopo, já que a aplicação não tem `DELETE`. Uma rotina de retenção ficaria para trabalho futuro, executada com outro papel.
 - **Keycloak em testcontainers**: o issuer é a URL mapeada no host, sem `KC_HOSTNAME` fixo.
 - **SQS indisponível no emulador**: simulado com `docker compose pause`, porque reiniciar o MiniStack apaga as filas em memória (seção 25).
-- **`-race` nos processos da aplicação**: a suíte de múltiplas instâncias roda com `-race` num container Linux (seção 25), mas os três processos testados são os binários da imagem, compilados sem o detector; unitários, integração e o processo de teste da suíte rodam com `-race`.
+- **`-race` nos processos da aplicação**: a suíte de múltiplas instâncias roda com `-race` num container Linux (seção 25); por padrão os três processos testados são os binários da imagem de produção, sem o detector, e só o extra `MULTIINSTANCE_RACE=1` (seção 26) os instrumenta.
 - **Atraso da outbox**: valor global, igual em todas as instâncias; agregue com `max` (seção 25).
 
 ## Trabalho não concluído
 
 - **Teste de carga** (diferencial da seção 14 do desafio): sem comando, throughput nem p50/p95/p99. A pilha de três instâncias e as métricas da seção 25 são a base para ele.
 - **Tracing com OpenTelemetry e dashboards** (diferenciais da seção 12): não implementados. Os logs JSON carregam `correlationId`, `messageId`, `transactionId`, `walletId` e `providerId`.
-- **Extra opcional: imagens da aplicação compiladas com `-race`** (não exigidas pelo desafio, como os diferenciais da seção 14): o `-race` da seção 13 do desafio vale para os testes aplicáveis e está atendido pelos testes unitários e de integração e pela suíte de múltiplas instâncias rodada com `-race` no container Linux (seção 25, commit `d482e28`). Na suíte de múltiplas instâncias, os três processos da aplicação são os binários da imagem de produção, sem o detector (premissa N7); instrumentá-los também sob carga é um extra, feito à parte depois da verificação final.
 - **Regras de alerta**: as séries a alertar estão na seção 25; as regras dependem de uma stack de monitoramento fora do escopo.
 - **Políticas do broker aplicadas**: definidas em `deploy/aws/iam-policies.json`, mas não provisionadas nem verificadas localmente: o MiniStack só as aplicaria com `AUTH=true` (premissa A12).
 - **Retenção de `inbox_messages` e `outbox_events`**: sem rotina de limpeza (ver acima).

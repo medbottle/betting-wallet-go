@@ -1,0 +1,24 @@
+# Extra, not required by the challenge (ARCHITECTURE §26): the app processes
+# of the multi-instance stack built with the race detector (Dockerfile target
+# "race"). Used on top of the other two files:
+#
+#   docker compose -p wager-wallet-multi -f docker-compose.yml -f docker-compose.multi.yml -f docker-compose.race.yml up -d --build
+#
+# test/multiinstance opts in with MULTIINSTANCE_RACE=1 and then fails on any
+# "WARNING: DATA RACE" in the logs of app, app-2 and app-3.
+
+x-race-image: &race-image
+  build:
+    context: .
+    target: race
+  image: wager-wallet:race
+
+services:
+  migrate:
+    <<: *race-image
+  app:
+    <<: *race-image
+  app-2:
+    <<: *race-image
+  app-3:
+    <<: *race-image

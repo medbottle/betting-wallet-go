@@ -126,7 +126,66 @@ func run(m *testing.M) int {
 			return 1
 		}
 	}
-	return m.Run()
+	if raceApps {
+		if err := checkRaceBuilt(); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+	}
+	code := m.Run()
+	if raceApps {
+		// Read before the deferred down removes the containers.
+		if reports, err := raceReports(); err != nil || reports != "" {
+			fmt.Fprintf(os.Stderr, "data races in the app instances (MULTIINSTANCE_RACE=1): %v\n%s\n", err, reports)
+			code = 1
+		} else {
+			fmt.Println("MULTIINSTANCE_RACE: no data race in the logs of app, app-2 and app-3")
+		}
+	}
+	return code
+}
+
+// raceApps is the extra of ARCHITECTURE §26, not required by the challenge:
+// with MULTIINSTANCE_RACE=1 the app instances run the race-built image
+// (docker-compose.race.yml), and the suite fails on any data race they
+// report.
+var raceApps = os.Getenv("MULTIINSTANCE_RACE") == "1"
+
+// checkRaceBuilt makes sure the instances really run race-built binaries:
+// it copies app's binary out and reads its build settings.
+func checkRaceBuilt() error {
+	dir, err := os.MkdirTemp("", "race-binary")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(dir)
+	bin := filepath.Join(dir, "wallet")
+	if out, err := compose("cp", "app:/app/wallet", bin); err != nil {
+		return fmt.Errorf("copy the app binary: %v\n%s", err, out)
+	}
+	out, err := exec.Command("go", "version", "-m", bin).CombinedOutput()
+	if err != nil || !strings.Contains(string(out), "-race=true") {
+		return fmt.Errorf("the app binary is not race-built (go version -m: %v)\n%s", err, out)
+	}
+	return nil
+}
+
+// raceReports returns the race detector's reports from the logs of the
+// three instances, across every run of each container (kills and restarts
+// keep the container and its log), or "" when there are none.
+func raceReports() (string, error) {
+	out, err := compose("logs", "--no-color", "app", "app-2", "app-3")
+	if err != nil {
+		return "", fmt.Errorf("compose logs: %w\n%s", err, out)
+	}
+	var reports []string
+	lines := strings.Split(out, "\n")
+	for i, line := range lines {
+		if strings.Contains(line, "WARNING: DATA RACE") {
+			reports = append(reports, strings.Join(lines[i:min(i+40, len(lines))], "\n"))
+		}
+	}
+	return strings.Join(reports, "\n...\n"), nil
 }
 
 func repoRoot() (string, error) {
@@ -146,9 +205,14 @@ func repoRoot() (string, error) {
 	}
 }
 
-// compose runs docker compose on the multi-instance project.
+// compose runs docker compose on the multi-instance project, with the
+// race-built app images when raceApps is set.
 func compose(args ...string) (string, error) {
-	full := append([]string{"compose", "-p", project, "-f", "docker-compose.yml", "-f", "docker-compose.multi.yml"}, args...)
+	full := []string{"compose", "-p", project, "-f", "docker-compose.yml", "-f", "docker-compose.multi.yml"}
+	if raceApps {
+		full = append(full, "-f", "docker-compose.race.yml")
+	}
+	full = append(full, args...)
 	cmd := exec.Command("docker", full...)
 	cmd.Dir = root
 	out, err := cmd.CombinedOutput()

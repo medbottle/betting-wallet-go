@@ -520,6 +520,16 @@ detector instruments the test process: its HTTP, SQS and Postgres clients
 and the goroutines of the concurrent scenarios. The three app processes are
 the image's binaries, built without `-race` (ARCHITECTURE §25, N7).
 
+Extra, not required by the challenge: the three app processes can run
+race-built binaries too (Dockerfile target `race`,
+[docker-compose.race.yml](docker-compose.race.yml)). Set
+`MULTIINSTANCE_RACE=1`, for example by adding `-e MULTIINSTANCE_RACE=1` to
+the container command above. It also works from the host, since Docker
+builds the images. The suite then checks that the app binary is race-built
+and fails on any `WARNING: DATA RACE` in the logs of `app`, `app-2` and
+`app-3` (ARCHITECTURE §26). Race-built processes are slower and use more
+memory.
+
 The architecture test (`test/architecture`) runs with the plain `go test ./...`.
 It fails if:
 
