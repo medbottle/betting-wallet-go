@@ -37,6 +37,15 @@ SQS, Keycloak). Spec: [docs/CHALLENGE.md](docs/CHALLENGE.md). Design decisions:
 | curl and jq | any | the authenticated API examples (`jq` extracts the token) |
 | AWS CLI v2 | optional | the SQS examples from the host; without it, run them inside the MiniStack container (see "Queues") |
 
+**Shell and platform.** Every command in this README is for a POSIX shell
+(bash): Linux, macOS, or on Windows Git Bash or WSL. PowerShell and `cmd`
+do not run them as written (bash quoting, `$(...)`, `\` line
+continuations). In Git Bash, prefix the `docker` commands that pass a
+container path (`-w /src`, `--entrypoint /app/dlqredrive`) with
+`MSYS_NO_PATHCONV=1`, or MSYS rewrites the path. The race-detector command
+under "Tests" also has a PowerShell form. `docker compose up --build`,
+`go test ./...` and `go vet ./...` work in any shell.
+
 ## Local stack
 
 ```sh
