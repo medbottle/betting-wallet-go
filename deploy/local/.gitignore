@@ -1,0 +1,4 @@
+# Local copies of generated secrets, such as the broker credentials file
+# copied out of MiniStack (README, "Queues"). Never committed.
+*
+!.gitignore

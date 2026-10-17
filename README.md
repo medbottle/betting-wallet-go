@@ -4,16 +4,25 @@ Distributed processing of bets and wallet movements in Go (Uber Fx, PostgreSQL,
 SQS, Keycloak). Spec: [docs/CHALLENGE.md](docs/CHALLENGE.md). Design decisions:
 [ARCHITECTURE.md](ARCHITECTURE.md).
 
-> **Status: complete: all ten slices and the compliance-review fixes.**
-> The authenticated HTTP API, the SQS consumer (with inbox, DLQ and the
-> `dlqredrive` tool), the reference worker and the outbox relay run on the
-> full schema, domain and persistence adapter; committed events are
+> **Status: complete: all ten slices and the fixes from two independent
+> reviews.** The authenticated HTTP API, the SQS consumer (with inbox, DLQ
+> and the `dlqredrive` tool), the reference worker and the outbox relay run
+> on the full schema, domain and persistence adapter; committed events are
 > published to `wallet-events.fifo`; Prometheus metrics are served on
-> `:9090`; the CHALLENGE §13 scenarios run against three instances. The
-> fixes from the independent compliance review (SQS provider bound to the
-> sender's broker identity, balance tied to the ledger in the database,
-> and the rest) are in ARCHITECTURE.md §26.
-> Interpretations, limitations and unfinished work: ARCHITECTURE.md,
+> `:9090`; the CHALLENGE §13 scenarios run against three instances. Where
+> the review fixes are recorded in ARCHITECTURE.md:
+>
+> - §26, compliance review: SQS provider bound to the sender's broker
+>   identity, balance tied to the ledger in the database, and the rest;
+> - §27, strict grader review: the reference worker retries transient
+>   database errors instead of recording `FAILED`, the outbox relay pauses
+>   while SQS is down, a WIN on a reversed BET is rejected, the inbox is
+>   keyed per provider, the timeout 503 keeps the contract;
+> - §28: broker credentials and policies enforced in MiniStack
+>   (`AUTH=true`).
+>
+> Known limitations are listed below ("Known limitations"); all
+> interpretations, limitations and unfinished work are in ARCHITECTURE.md,
 > "Interpretações adotadas", "Premissas e limitações" and "Trabalho não
 > concluído".
 
@@ -102,10 +111,11 @@ policies for a real AWS account are in
 The keys change whenever MiniStack starts, since it keeps its state in
 memory (as it does the queues): restart the app after restarting
 `ministack`. To run the binaries on the host, copy the file out and point
-`SQS_CREDENTIALS_FILE` at it:
+`SQS_CREDENTIALS_FILE` at it. `deploy/local/` ignores everything in it
+except its own `.gitignore`, so the copied keys never reach git:
 
 ```sh
-docker compose cp ministack:/var/lib/wager-credentials/sqs-credentials.json ./sqs-credentials.json
+docker compose cp ministack:/var/lib/wager-credentials/sqs-credentials.json ./deploy/local/sqs-credentials.json
 ```
 
 `test` / `test` is the queue owner's root key, the emulator's
@@ -308,6 +318,33 @@ has not cached and Keycloak cannot be reached to fetch it, the answer is
 503 `TEMPORARILY_UNAVAILABLE` (retryable, `Retry-After: 2`) instead
 (ARCHITECTURE §24). The providerId a provider may act for comes only
 from the `provider_id` claim. `/health/*` needs no token.
+
+## Known limitations
+
+The full list is in ARCHITECTURE.md, "Premissas e limitações". The ones that
+show when running the stack locally:
+
+- **MiniStack does not authenticate account root keys.** Even with
+  `AUTH=true`, the emulator never checks the secret of an account's root
+  key (`test`, or a 12-digit account id). Sending straight to the inbound
+  queue with a provider's account id and any secret is refused by the
+  queue policy, but someone who knows this can use that account's root key
+  to change its IAM (for example the role's trust policy) and then send
+  through the provider's role. Locally, the provider identity is therefore
+  enforced by the broker against ordinary credentials, not against this
+  emulator behaviour; in AWS root credentials are secret and IAM
+  authenticates the role (ARCHITECTURE §28). The consumer still checks
+  that `data.providerId` matches the sender's provider either way.
+- **Broker keys change when MiniStack restarts.** It keeps its state
+  (queues, IAM users, keys) in memory, so a restart of `ministack` loses
+  the queues and generates new keys: restart the app after it.
+- **SQS outages are simulated with `docker compose pause`**, not a restart,
+  for the same reason (ARCHITECTURE §25).
+- **The broker policies used locally are broader than the AWS ones.**
+  MiniStack checks a role from another account against the queue ARN in
+  the caller's account, so the local policies use an account wildcard and
+  the per-test queue names; `deploy/aws/iam-policies.json` has the exact
+  ARNs for AWS.
 
 ## Environment variables
 
