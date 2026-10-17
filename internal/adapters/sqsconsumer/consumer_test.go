@@ -158,7 +158,7 @@ func (s *fakeSubmitter) Submit(ctx context.Context, cmd wagering.SubmitCommand) 
 			return wagering.SubmitResult{}, fmt.Errorf("%w: %w", app.ErrTransient, ctx.Err())
 		}
 	}
-	if cmd.Inbox.ConsumerName != ConsumerName || cmd.CorrelationID != id || cmd.CausationID == nil || *cmd.CausationID != id {
+	if cmd.Inbox.ConsumerName != InboxConsumer(cmd.Raw.ProviderID) || cmd.CorrelationID != id || cmd.CausationID == nil || *cmd.CausationID != id {
 		return wagering.SubmitResult{}, errors.New("command not built from the envelope")
 	}
 	return wagering.SubmitResult{Duplicate: dup}, err

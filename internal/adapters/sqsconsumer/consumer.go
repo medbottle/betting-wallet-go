@@ -28,8 +28,14 @@ import (
 	"github.com/medbottle/betting-wallet-go/internal/platform/health"
 )
 
-// ConsumerName is the inbox consumer_name (ARCHITECTURE §23, G3).
+// ConsumerName prefixes the inbox consumer_name (ARCHITECTURE §23, G3).
 const ConsumerName = "wager-transactions"
+
+// InboxConsumer is the inbox consumer_name of one provider's messages. The
+// inbox key stays (consumerName, messageId) (CHALLENGE §6.5), but a
+// provider's messageIds can no longer collide with another provider's
+// (ARCHITECTURE §27, L-2).
+func InboxConsumer(providerID string) string { return ConsumerName + ":" + providerID }
 
 // fallbackGroup is the DLQ MessageGroupId when the received message has
 // none (ARCHITECTURE §10).
@@ -364,7 +370,7 @@ func (c *Consumer) handle(stop, settle context.Context, m types.Message) bool {
 		Raw:           p.Raw,
 		CorrelationID: p.MessageID,
 		CausationID:   &p.MessageID,
-		Inbox:         &wagering.InboxEntry{ConsumerName: ConsumerName, MessageID: p.MessageID, ReceivedAt: c.clock.Now()},
+		Inbox:         &wagering.InboxEntry{ConsumerName: InboxConsumer(providerID), MessageID: p.MessageID, ReceivedAt: c.clock.Now()},
 	})
 	cancel()
 	if err == nil {

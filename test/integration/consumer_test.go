@@ -240,11 +240,17 @@ type consumedInbox struct {
 	Processed     bool
 }
 
+// inbox reads provider-a's inbox row for messageID.
 func (e apiEnv) inbox(t *testing.T, messageID string) (consumedInbox, bool) {
+	t.Helper()
+	return e.inboxOf(t, "provider-a", messageID)
+}
+
+func (e apiEnv) inboxOf(t *testing.T, providerID, messageID string) (consumedInbox, bool) {
 	t.Helper()
 	var r consumedInbox
 	err := e.repo.db.owner.QueryRow(ctxT(t), `SELECT transaction_id::text, outcome, processed_at IS NOT NULL
-		FROM inbox_messages WHERE consumer_name = $1 AND message_id = $2`, sqsconsumer.ConsumerName, messageID).
+		FROM inbox_messages WHERE consumer_name = $1 AND message_id = $2`, sqsconsumer.InboxConsumer(providerID), messageID).
 		Scan(&r.TransactionID, &r.Outcome, &r.Processed)
 	if err != nil {
 		return consumedInbox{}, false
@@ -840,4 +846,30 @@ func sqsconsumerResolve(t *testing.T, client *sqs.Client, queue string) (string,
 		return "", err
 	}
 	return aws.ToString(out.QueueUrl), nil
+}
+
+// TestConsumerInboxIsPerProvider: two providers that pick the same
+// envelope messageId each get their operation applied; one cannot block
+// the other's message by sending first (ARCHITECTURE §27, L-2).
+func TestConsumerInboxIsPerProvider(t *testing.T) {
+	t.Parallel()
+	e := newAPIEnv(t)
+	q := newInboundQueues(t, 60, 10)
+	c, _ := startConsumer(t, e, q, consumerOpts{})
+	w := e.openWallet(t, "100.00")
+
+	q.sendAs(t, providerBKey, providerBSecret, envelope(t, "msg-shared", op(w, "provider-b", "BET", "10.00", "shared-b")), w.ID, "")
+	e.waitStatus(t, "provider-b", "provider-b", "shared-b", "PROCESSED", 15*time.Second)
+	q.sendAs(t, providerAKey, providerASecret, envelope(t, "msg-shared", op(w, "provider-a", "BET", "15.00", "shared-a")), w.ID, "")
+	e.waitStatus(t, "provider-a", "provider-a", "shared-a", "PROCESSED", 15*time.Second)
+
+	if s := c.Stats(); s.Handled != 2 || s.DeadLetter != 0 {
+		t.Fatalf("stats %+v: want both messages handled, none dead-lettered", s)
+	}
+	for _, p := range []string{"provider-a", "provider-b"} {
+		if row, ok := e.inboxOf(t, p, "msg-shared"); !ok || row.Outcome == nil || *row.Outcome != "PROCESSED" {
+			t.Fatalf("%s inbox: %+v %v", p, row, ok)
+		}
+	}
+	e.assertConsistent(t, w, "75.00")
 }

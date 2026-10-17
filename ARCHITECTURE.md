@@ -293,6 +293,7 @@ stateDiagram-v2
 
 **Inbox** (consumidor SQS):
 - Tabela `inbox_messages(consumer_name, message_id, payload_hash, transaction_id, outcome, received_at, processed_at)`, com `PRIMARY KEY (consumer_name, message_id)`.
+- `consumer_name` é por provedor (`wager-transactions:<providerId>`, o provedor autenticado pelo remetente), então o `messageId` de um provedor nunca colide com o de outro (seção 27, L-2).
 - **`payload_hash`**: SHA-256 sobre o JSON canônico (mesmas regras da seção 6) dos campos de negócio da seção 6 **mais** `idempotencyKey`.
   - Excluídos: `messageId` (que é a própria chave), `type`, `occurredAt` e todos os metadados de transporte (atributos SQS, `ReceiptHandle`, `ApproximateReceiveCount`).
   - Diferença em relação ao hash de idempotência: inclui a chave, então um `messageId` reaproveitado para outra operação ou outra chave é detectado.
@@ -966,7 +967,7 @@ Regras para consumidores: a entrega é at-least-once, então deduplicar por `eve
 **Respostas às lacunas** (aprovadas):
 - **G1**: um único poller por instância (`Consumer`), que termina ou libera o lote inteiro antes do próximo `ReceiveMessage`; no máximo 10 mensagens em voo por instância. Mais vazão vem de mais instâncias.
 - **G2**: `cmd/dlqredrive` usa credenciais próprias de operador (`SQS_OPERATOR_ACCESS_KEY_ID`/`SECRET`), separadas das do consumidor e do publisher, como a seção 10 faz para os outros papéis.
-- **G3**: `consumer_name = wager-transactions` na inbox.
+- **G3**: `consumer_name = wager-transactions` na inbox; desde a seção 27 (L-2), `wager-transactions:<providerId>`.
 - **G4**: consumidor pausado rechecando a readiness a cada 1s (`CONSUMER_PAUSE_INTERVAL`). Erro de `ReceiveMessage` também espera esse intervalo.
 - **G5**: erros de categoria A recebidos pelo SQS são permanentes: DLQ com o próprio código (`INVALID_MONEY`, `UNSUPPORTED_KIND`, `WALLET_NOT_FOUND` etc.). Reenviar a mesma mensagem não muda o resultado.
 - **G6**: `FAILED` pelo SQS segue a seção 5: a transação separada que grava `FAILED/INTERNAL_INVARIANT_VIOLATION` também insere e conclui a inbox com `outcome = FAILED`, e a mensagem é removida (o estado é terminal e persistido; um replay devolve o mesmo resultado).
@@ -1137,6 +1138,8 @@ Uma revisão independente, feita como um avaliador estrito a partir de um clone 
 
 **L-1, `WIN` pago sobre `BET` revertida** (seção 7 do desafio, coerência financeira): `BET` 25.00, `ROLLBACK` dela e depois um `WIN` referenciando a mesma `BET` creditava o prêmio de uma aposta desfeita; a seção 7 tratava `ROLLBACK` depois de `WIN`, não o contrário. Agora o `WIN` é rejeitado com `REFERENCE_NOT_PROCESSED` (código existente; o CHECK do schema já o aceita, nenhuma migration). `WIN` sobre `BET` que continua valendo não muda. Testes: dois casos em `TestApplyReferenceRejections` (inclusive a precedência da concordância de rodada) e `TestAPIWinOfReversedBet` (depois de `REFUND` e de `ROLLBACK`, saldo inalterado, e um `WIN` válido ainda pago).
 
+**L-2, `messageId` compartilhado entre provedores na inbox** (seção 6.5 do desafio): com um `consumer_name` fixo, a mensagem `msg-123` de um provedor bloqueava a `msg-123` de outro, que ia para a DLQ como hash divergente e nunca era aplicada. Agora o `consumer_name` é `wager-transactions:<providerId>`, com o provedor que o consumidor já autenticou pelo `SenderId` antes de qualquer acesso ao banco. A chave continua `(consumerName, messageId)`, sem migration. Linhas antigas com `consumer_name = wager-transactions` só importariam para mensagens reentregues durante a troca de versão; numa implantação nova não existem. Teste: `TestConsumerInboxIsPerProvider` (provider-b e provider-a com o mesmo `messageId`, as duas operações aplicadas, nada na DLQ); falha com o `consumer_name` fixo.
+
 ---
 
 ## Esboço do schema
@@ -1268,7 +1271,7 @@ Pontos que os documentos deixam abertos e como foram lidos. As seções citadas 
 - **Ordem dos eventos de saída**: não é garantida entre publishers. Os consumidores usam `walletVersion`.
 - **IAM no emulador**: o MiniStack só aplica IAM ao SQS com `AUTH=true` (verificado em 2026-10-17 com a imagem 1.5.27: um usuário IAM sem política recebe `AccessDenied` e uma chave desconhecida é recusada). O projeto usa o modo padrão, em que qualquer credencial é aceita e nenhuma política é avaliada, porque com `AUTH=true` as chaves seriam geradas pelo emulador e teriam de ser provisionadas para cada papel e lidas pela aplicação e pelos testes. As credenciais separadas estão configuradas e os testes negativos (publisher e consumidor) são pulados com essa razão. As políticas de menor privilégio de cada identidade para uma conta AWS real estão em `deploy/aws/iam-policies.json` (seção 10), sem aplicação local.
 - **Identidade do remetente no emulador**: no modo padrão o MiniStack aceita qualquer chave, então qualquer um pode apresentar a chave `111111111111` de `provider-a`. Os testes locais provam que o consumidor vincula o `SenderId` ao provedor e recusa o resto; que só o produtor de cada provedor consiga aquele `SenderId` é garantido pelo IAM na AWS (A12, A22).
-- **`messageId` global na inbox**: a seção 6.5 do desafio fixa a unicidade em `(consumerName, messageId)`, sem o provedor. Se um provedor reutiliza o `messageId` de outro, a mensagem que chega depois tem hash diferente e vai para a DLQ como `INVALID_REQUEST`, sem efeito; uma operação de outro provedor nunca é reproduzida por ela, porque o `providerId` é conferido antes. Produtores devem usar ids globalmente únicos (UUIDs).
+- **`messageId` por provedor na inbox**: a seção 6.5 do desafio fixa a unicidade em `(consumerName, messageId)`; o `consumer_name` leva o provedor autenticado (seção 27, L-2), então provedores diferentes podem usar o mesmo `messageId`. Dentro de um provedor, reutilizar um `messageId` para outra operação continua indo para a DLQ como `INVALID_REQUEST`.
 - **`StartMessageMoveTask`**: o suporte a FIFO no emulador não é garantido. Usamos `cmd/dlqredrive`.
 - **Retenção**: sem limpeza de `inbox_messages` e `outbox_events` publicados neste escopo, já que a aplicação não tem `DELETE`. Uma rotina de retenção ficaria para trabalho futuro, executada com outro papel.
 - **Keycloak em testcontainers**: o issuer é a URL mapeada no host, sem `KC_HOSTNAME` fixo.
