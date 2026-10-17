@@ -1,6 +1,34 @@
 # betting-wallet-go
 
-A wallet service for game providers, written in Go: it processes bets,
+**Português.** Serviço de carteiras para provedores de jogos, em Go: processa
+apostas, ganhos, perdas, reembolsos e estornos por uma API HTTP e por uma
+fila SQS, com as mesmas garantias nos dois caminhos. Usa Uber Fx,
+PostgreSQL, AWS SQS (MiniStack localmente) e Keycloak.
+
+Garantias:
+
+- **Dinheiro exato**: valores em unidades mínimas inteiras com moeda, nunca
+  em ponto flutuante.
+- **Ledger confiável**: toda mudança de saldo tem um lançamento append-only,
+  imposto pelo banco, e a reconciliação reconstrói o saldo a partir dele.
+- **Concorrência segura**: um lock por carteira, sem gasto duplo na mesma
+  carteira e com carteiras diferentes em paralelo, em qualquer número de
+  instâncias.
+- **Idempotência que sobrevive a reinícios**: reenvios e entregas
+  duplicadas devolvem o resultado original, sem mover dinheiro duas vezes.
+- **Mensageria confiável**: inbox no SQS, outbox transacional (eventos só
+  depois do commit), retries, DLQ e ferramenta de redrive.
+- **Autenticação em tudo**: OAuth 2.0 client credentials na API,
+  credenciais e políticas do broker no SQS; cada provedor só vê as próprias
+  transações.
+
+A especificação está em [docs/CHALLENGE.md](docs/CHALLENGE.md) e as
+decisões de arquitetura, com um resumo de uma página no início, em
+[ARCHITECTURE.md](ARCHITECTURE.md) (em português). Para começar:
+`docker compose up --build` e depois "API examples". O restante deste
+README está em inglês.
+
+**English.** A wallet service for game providers, written in Go: it processes bets,
 wins, losses, refunds and rollbacks over an HTTP API and an SQS queue, with
 the same guarantees on both paths. It is built with Uber Fx, PostgreSQL,
 AWS SQS (MiniStack locally) and Keycloak.
