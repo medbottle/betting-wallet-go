@@ -1215,7 +1215,7 @@ Pontos que os documentos deixam abertos e como foram lidos. As seções citadas 
 **Notas de teste**:
 - **N4.** A liberação do restante do grupo após falha transitória é testada só com SQS falso (quais mensagens vêm num lote é decisão do broker); os caminhos com broker real (DLQ, redrive, queda antes do delete, pausa, parada) são testes de integração.
 - **N6.** O `dlqredrive` pode deixar mensagens posteriores de um grupo para uma segunda execução, porque as `PERMANENT` ignoradas ficam em voo até o visibility timeout da DLQ (seção 23 e README).
-- **N7.** A suíte `multiinstance` roda com `-race` no container Linux da seção 25; os processos da aplicação testados são os binários da imagem, sem `-race`.
+- **N7.** A suíte `multiinstance` roda com `-race` no container Linux da seção 25; os processos da aplicação testados são os binários da imagem de produção, sem `-race`, a menos que se construa o extra das imagens instrumentadas ("Trabalho não concluído").
 
 ## Premissas e limitações
 
@@ -1239,9 +1239,9 @@ Pontos que os documentos deixam abertos e como foram lidos. As seções citadas 
 
 - **Teste de carga** (diferencial da seção 14 do desafio): sem comando, throughput nem p50/p95/p99. A pilha de três instâncias e as métricas da seção 25 são a base para ele.
 - **Tracing com OpenTelemetry e dashboards** (diferenciais da seção 12): não implementados. Os logs JSON carregam `correlationId`, `messageId`, `transactionId`, `walletId` e `providerId`.
+- **Extra opcional: imagens da aplicação compiladas com `-race`** (não exigidas pelo desafio, como os diferenciais da seção 14): o `-race` da seção 13 do desafio vale para os testes aplicáveis e está atendido pelos testes unitários e de integração e pela suíte de múltiplas instâncias rodada com `-race` no container Linux (seção 25, commit `d482e28`). Na suíte de múltiplas instâncias, os três processos da aplicação são os binários da imagem de produção, sem o detector (premissa N7); instrumentá-los também sob carga é um extra, feito à parte depois da verificação final.
 - **Regras de alerta**: as séries a alertar estão na seção 25; as regras dependem de uma stack de monitoramento fora do escopo.
 - **Políticas do broker aplicadas**: definidas em `deploy/aws/iam-policies.json`, mas não provisionadas nem verificadas localmente: o MiniStack só as aplicaria com `AUTH=true` (premissa A12).
 - **Retenção de `inbox_messages` e `outbox_events`**: sem rotina de limpeza (ver acima).
 - **Ledger de partidas dobradas** (opcional na seção 6.4 do desafio): não adotado; o ledger é de lançamentos simples por carteira.
 - **Integração contínua**: o repositório não tem pipeline. gofmt, vet, testes unitários, integração e múltiplas instâncias, com e sem `-race`, rodam pelos comandos do README.
-- **Binários da aplicação com `-race`**: na suíte de múltiplas instâncias, os processos testados são os da imagem de produção, sem o detector; só o processo de teste roda com `-race` (seção 25, premissa N7).
