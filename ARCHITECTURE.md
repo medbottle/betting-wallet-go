@@ -395,8 +395,9 @@ stateDiagram-v2
 - Credenciais separadas para consumidor e publisher.
 - Políticas de fila: o consumidor recebe `ReceiveMessage`, `DeleteMessage` e `ChangeMessageVisibility` na entrada, e `SendMessage` na DLQ de entrada. O publisher recebe somente `SendMessage` em `wallet-events.fifo`.
 - As políticas de menor privilégio de cada identidade (consumidor, publisher e operador do `dlqredrive`) estão em `deploy/aws/iam-policies.json`, para uma conta AWS real.
-- **Não afirmamos** que o emulador aplica IAM. Há um teste negativo planejado: as credenciais do publisher não conseguem `ReceiveMessage` na entrada.
-  - Se o emulador escolhido não aplicar IAM, o teste é marcado como `t.Skip` com a razão explícita, e isso fica registrado como limitação. O emulador adotado é o MiniStack (seção 15); verificado no slice 8: ele não aplica IAM, e o teste é pulado com essa razão (seção 22).
+- **IAM no emulador**: o MiniStack (seção 15) só aplica IAM ao SQS quando iniciado com `AUTH=true`, modo que este projeto não usa. Nesse modo as chaves de acesso são geradas pelo próprio emulador, então teriam de ser provisionadas para cada papel e lidas pela aplicação e pelos testes. No modo padrão, o adotado, ele aceita qualquer credencial e não avalia políticas.
+  - Os testes negativos (as credenciais do publisher não conseguem `ReceiveMessage` na entrada; as do consumidor não publicam numa fila de eventos) são pulados com essa razão explícita (seções 22 e 23, premissa A12).
+  - As políticas de `deploy/aws/iam-policies.json` continuam sendo a definição para a AWS.
 
 ---
 
@@ -891,7 +892,7 @@ Tudo abaixo segue as seções 3, 4, 6, 8 e 9; os pontos que os documentos não d
 - O corpo publicado é o `payload` lido do banco. Como a coluna é `JSONB` (seção 9), o conteúdo é idêntico ao snapshot do evento, mas a ordem das chaves e os espaços são os do Postgres (premissa A11).
 - Um evento estacionado gera log de erro com `eventId`, tipo, tentativas, `senderFault` e erro; `outbox_parked_total` veio no slice 10 (seção 25).
 
-**Credenciais do broker** (seção 10): o publisher usa só `SQS_PUBLISHER_ACCESS_KEY_ID`/`SECRET`, sem ler arquivos de configuração da AWS nem o ambiente; o consumidor ganhou as suas no slice 9 (seção 23). O teste negativo existe e foi executado: o MiniStack **não aplica IAM** (as credenciais do publisher conseguem `ReceiveMessage` na fila de entrada, e até credenciais desconhecidas são aceitas), então o teste é pulado com essa razão explícita. A separação está configurada, mas não é verificável neste emulador (limitação, premissa A12).
+**Credenciais do broker** (seção 10): o publisher usa só `SQS_PUBLISHER_ACCESS_KEY_ID`/`SECRET`, sem ler arquivos de configuração da AWS nem o ambiente; o consumidor ganhou as suas no slice 9 (seção 23). O teste negativo existe e foi executado: no modo padrão o MiniStack não aplica IAM (as credenciais do publisher conseguem `ReceiveMessage` na fila de entrada, e até credenciais desconhecidas são aceitas), então o teste é pulado com essa razão explícita. O emulador só aplica IAM com `AUTH=true`, modo que o projeto não usa (seção 10). A separação está configurada, mas não é verificada localmente (limitação, premissa A12).
 
 **Readiness e startup**: a readiness agora checa PostgreSQL e SQS (`GetQueueAttributes` na fila de eventos, timeout de 1s por checagem, a cada 2s). A URL da fila é resolvida no `OnStart` (passo 4 da seção 14); fila ausente faz o start falhar. Nesse caminho de erro as conexões ociosas do cliente HTTP do SQS são fechadas no próprio `OnStart` (o Fx não chama o `OnStop` de um hook que falhou; o `goleak` pegou isso).
 
@@ -954,7 +955,7 @@ Regras para consumidores: a entrega é at-least-once, então deduplicar por `eve
 
 **Lifecycle**: o consumidor inicia no hook "runners" depois do relay e antes do HTTP, e para em paralelo com os outros no orçamento de 20s. O draining da readiness já pausa o polling no instante 0.
 
-**Credenciais do broker**: o consumidor usa só as suas. O teste negativo do lado do consumidor (as credenciais dele não publicam numa fila de eventos) existe e é pulado no MiniStack, que não aplica IAM (premissa A12).
+**Credenciais do broker**: o consumidor usa só as suas. O teste negativo do lado do consumidor (as credenciais dele não publicam numa fila de eventos) existe e é pulado no MiniStack, que só aplica IAM com `AUTH=true`, modo que o projeto não usa (premissa A12).
 
 **Testes**:
 - Unitários (`internal/adapters/sqsconsumer`, com `-race` e `goleak`, SQS falso só aqui): regras do envelope; classificação dos erros e atributos da DLQ; fallback de grupo; falha no envio à DLQ; backoff com teto; ordem dentro do grupo e paralelismo entre grupos; liberação após falha transitória; pausa sem readiness; `Stop` esperando o handler em voo e liberando o resto; lógica do redrive.
@@ -1116,7 +1117,7 @@ Todo teste termina com os invariantes: nenhuma operação pendente, reconciliaç
 - **Erros de carteira, jogador e moeda**: erros de entrada não persistidos.
 - **TTL e backoff**: padrões mantidos, configuráveis por env. Os testes usam TTL de 2s.
 - **Destino dos eventos**: SQS FIFO `wallet-events.fifo`.
-- **IAM no emulador**: não afirmamos enforcement. Há um teste negativo, e o resultado é documentado com honestidade.
+- **IAM no emulador**: o MiniStack só aplica IAM com `AUTH=true`, modo que não usamos (seção 10). Os testes negativos são pulados com essa razão.
 - **Idioma**: documento em português, identificadores em inglês.
 
 ---
@@ -1136,7 +1137,7 @@ Pontos que os documentos deixam abertos e como foram lidos. As seções citadas 
 - **A9. Qualquer falha não transitória no worker grava `FAILED`** (violação de invariante, ou erro de domínio que não deveria acontecer para uma linha persistida), para uma linha quebrada não ser tentada para sempre.
 - **A10. O jitter da outbox é aditivo, até uma base**: sorteado em `[0, OUTBOX_BACKOFF_BASE)` (seção 22).
 - **A11. O corpo publicado é o JSONB armazenado**: mesmo conteúdo do snapshot, com ordem de chaves e espaços do Postgres; consumidores devem fazer parse, não comparar bytes.
-- **A12. Separação de credenciais do broker configurada, mas não verificável no MiniStack**: o emulador aceita qualquer credencial e não aplica políticas; os testes negativos são pulados com essa razão. As políticas para uma conta AWS real estão definidas em `deploy/aws/iam-policies.json`, sem aplicação local.
+- **A12. Separação de credenciais do broker configurada, mas não verificada localmente**: o MiniStack só aplica IAM ao SQS com `AUTH=true`, modo que o projeto não usa, porque nele as chaves são geradas pelo emulador e teriam de ser provisionadas para cada papel e lidas pela aplicação e pelos testes. No modo padrão ele aceita qualquer credencial e não aplica políticas; os testes negativos são pulados com essa razão. As políticas de `deploy/aws/iam-policies.json` continuam sendo a definição para a AWS, sem aplicação local.
 - **A13. O `messageId` do envelope é o `correlationId` no SQS**: o envelope do desafio não tem campo de correlação; o `messageId` vai como `correlationId` e `causationId` da transação e dos eventos.
 - **A14. Os códigos da DLQ reutilizam os existentes**: provedor desconhecido ou inativo é `FORBIDDEN` (o mesmo do HTTP); hash divergente na inbox é `INVALID_REQUEST`.
 - **A15. Replay sobre uma linha `PENDING` antiga é transitório no SQS**: a inbox só aceita resultados terminais ou `PENDING_REFERENCE`, então a mensagem volta até o worker mover a linha.
@@ -1157,7 +1158,7 @@ Pontos que os documentos deixam abertos e como foram lidos. As seções citadas 
 - **Vários `WIN` podem referenciar a mesma `BET`**, e o valor do `WIN` não é comparado ao da aposta.
 - **Precedência de erros**: erro de entrada prevalece sobre conflito de idempotência (seção 6).
 - **Ordem dos eventos de saída**: não é garantida entre publishers. Os consumidores usam `walletVersion`.
-- **IAM no emulador**: verificado no slice 8: o MiniStack não aplica IAM nem políticas de fila. As credenciais separadas estão configuradas e os testes negativos (publisher e consumidor) são pulados com essa razão. As políticas de menor privilégio de cada identidade para uma conta AWS real estão em `deploy/aws/iam-policies.json` (seção 10), sem aplicação local.
+- **IAM no emulador**: o MiniStack só aplica IAM ao SQS com `AUTH=true` (verificado em 2026-10-17 com a imagem 1.5.27: um usuário IAM sem política recebe `AccessDenied` e uma chave desconhecida é recusada). O projeto usa o modo padrão, em que qualquer credencial é aceita e nenhuma política é avaliada, porque com `AUTH=true` as chaves seriam geradas pelo emulador e teriam de ser provisionadas para cada papel e lidas pela aplicação e pelos testes. As credenciais separadas estão configuradas e os testes negativos (publisher e consumidor) são pulados com essa razão. As políticas de menor privilégio de cada identidade para uma conta AWS real estão em `deploy/aws/iam-policies.json` (seção 10), sem aplicação local.
 - **`StartMessageMoveTask`**: o suporte a FIFO no emulador não é garantido. Usamos `cmd/dlqredrive`.
 - **Retenção**: sem limpeza de `inbox_messages` e `outbox_events` publicados neste escopo, já que a aplicação não tem `DELETE`. Uma rotina de retenção ficaria para trabalho futuro, executada com outro papel.
 - **Keycloak em testcontainers**: o issuer é a URL mapeada no host, sem `KC_HOSTNAME` fixo.
@@ -1170,6 +1171,6 @@ Pontos que os documentos deixam abertos e como foram lidos. As seções citadas 
 - **Teste de carga** (diferencial da seção 14 do desafio): sem comando, throughput nem p50/p95/p99. A pilha de três instâncias e as métricas da seção 25 são a base para ele.
 - **Tracing com OpenTelemetry e dashboards** (diferenciais da seção 12): não implementados. Os logs JSON carregam `correlationId`, `messageId`, `transactionId`, `walletId` e `providerId`.
 - **Regras de alerta**: as séries a alertar estão na seção 25; as regras dependem de uma stack de monitoramento fora do escopo.
-- **Políticas do broker aplicadas**: definidas em `deploy/aws/iam-policies.json`, mas não provisionadas nem verificáveis no emulador.
+- **Políticas do broker aplicadas**: definidas em `deploy/aws/iam-policies.json`, mas não provisionadas nem verificadas localmente: o MiniStack só as aplicaria com `AUTH=true` (premissa A12).
 - **Retenção de `inbox_messages` e `outbox_events`**: sem rotina de limpeza (ver acima).
 - **Ledger de partidas dobradas** (opcional na seção 6.4 do desafio): não adotado; o ledger é de lançamentos simples por carteira.

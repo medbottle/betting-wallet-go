@@ -1,5 +1,5 @@
 {
-  "_comment": "Least-privilege IAM policies for the three broker identities of ARCHITECTURE.md §10/§23, for a real AWS account. Replace REGION and ACCOUNT_ID. MiniStack does not enforce IAM, so these are not applied locally (ARCHITECTURE §22, assumption A12).",
+  "_comment": "Least-privilege IAM policies for the three broker identities of ARCHITECTURE.md §10/§23, for a real AWS account. Replace REGION and ACCOUNT_ID. MiniStack enforces IAM for SQS only with AUTH=true, which this project does not use, so these are not applied locally; they stay the AWS definition (ARCHITECTURE §10, assumption A12).",
   "wallet-consumer": {
     "Version": "2012-10-17",
     "Statement": [

@@ -68,8 +68,13 @@ Each role uses its own broker credentials: the consumer, the outbox
 publisher and the `dlqredrive` operator. Their least-privilege IAM policies
 for a real AWS account are in
 [deploy/aws/iam-policies.json](deploy/aws/iam-policies.json). MiniStack
-accepts any credentials and does not enforce policies, so locally the
-separation is configured but not enforced (ARCHITECTURE.md §10, §22).
+enforces IAM for SQS only when started with `AUTH=true`, which this project
+does not use: in that mode the emulator generates the access keys, so they
+would have to be provisioned for every role and read by the app and the
+tests. In the default mode used here it accepts any credentials and
+evaluates no policy, so locally the separation is configured but not
+enforced, and the policies file stays the AWS definition (ARCHITECTURE.md
+§10, assumption A12).
 
 To list them from the host (any AWS CLI, with dummy credentials):
 

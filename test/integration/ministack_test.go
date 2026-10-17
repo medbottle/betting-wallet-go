@@ -24,8 +24,9 @@ import (
 // ministackImage must match docker-compose.yml.
 const ministackImage = "ministackorg/ministack:1.5.27"
 
-// Test credentials (local values; the emulator does not check them, see
-// TestBrokerCredentialSeparation and TestConsumerCredentialSeparation).
+// Test credentials (local values; MiniStack checks them only with AUTH=true,
+// which is not used, see TestBrokerCredentialSeparation and
+// TestConsumerCredentialSeparation).
 const (
 	publisherKey    = "wallet-publisher"
 	publisherSecret = "wallet-publisher-local-secret"

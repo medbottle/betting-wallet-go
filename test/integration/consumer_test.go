@@ -649,7 +649,8 @@ func TestConsumerStopFinishesInFlight(t *testing.T) {
 
 // TestConsumerCredentialSeparation is the consumer side of ARCHITECTURE
 // §10: the consumer's credentials must not publish to the events queue.
-// Skipped with the reason when the emulator does not enforce IAM.
+// MiniStack enforces IAM only with AUTH=true, which the project does not
+// use, so in the default mode the test is skipped with that reason (A12).
 func TestConsumerCredentialSeparation(t *testing.T) {
 	t.Parallel()
 	endpoint := startMiniStack(t)
@@ -661,8 +662,10 @@ func TestConsumerCredentialSeparation(t *testing.T) {
 			MessageGroupId: aws.String("g"), MessageDeduplicationId: aws.String(uuid.NewString())})
 	}
 	if err == nil {
-		t.Skip("MiniStack does not enforce IAM: the consumer's credentials could SendMessage to an events queue. " +
-			"Credential separation is configured but cannot be verified against this emulator (ARCHITECTURE §10/§23 limitation).")
+		t.Skip("MiniStack enforces IAM for SQS only with AUTH=true, which this project does not use: that mode generates the " +
+			"access keys, which would have to be provisioned for every role and read by the app and the tests. In the default mode the " +
+			"consumer's credentials could SendMessage to an events queue, so credential separation is configured but not verified " +
+			"locally (ARCHITECTURE §10, A12).")
 	}
 	t.Logf("send with consumer credentials refused: %v", err)
 }

@@ -430,9 +430,9 @@ func TestSQSReadiness(t *testing.T) {
 }
 
 // TestBrokerCredentialSeparation is the negative test of ARCHITECTURE §10:
-// the publisher's credentials must not receive from the inbound queue. The
-// emulator is checked first; if it does not enforce IAM the test is skipped
-// with that reason, as §10 requires.
+// the publisher's credentials must not receive from the inbound queue.
+// MiniStack enforces IAM only with AUTH=true, which the project does not
+// use, so in the default mode the test is skipped with that reason (A12).
 func TestBrokerCredentialSeparation(t *testing.T) {
 	t.Parallel()
 	endpoint := startMiniStack(t)
@@ -444,9 +444,10 @@ func TestBrokerCredentialSeparation(t *testing.T) {
 	if err == nil {
 		bogus := sqsClient(endpoint, "nobody-"+uuid.NewString(), "wrong-secret")
 		_, bogusErr := bogus.ListQueues(ctxT(t), &sqs.ListQueuesInput{})
-		t.Skip(fmt.Sprintf("MiniStack does not enforce IAM: the publisher's credentials could ReceiveMessage on the inbound queue "+
-			"(unknown credentials accepted too: %v). Credential separation is configured but cannot be verified against this emulator "+
-			"(ARCHITECTURE §10/§22 limitation).", bogusErr == nil))
+		t.Skip(fmt.Sprintf("MiniStack enforces IAM for SQS only with AUTH=true, which this project does not use: that mode generates the "+
+			"access keys, which would have to be provisioned for every role and read by the app and the tests. In the default mode the "+
+			"publisher's credentials could ReceiveMessage on the inbound queue (unknown credentials accepted too: %v), so credential "+
+			"separation is configured but not verified locally (ARCHITECTURE §10, A12).", bogusErr == nil))
 	}
 	t.Logf("receive with publisher credentials refused: %v", err)
 }
