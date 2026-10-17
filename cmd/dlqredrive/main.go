@@ -8,9 +8,11 @@
 //
 // Environment: SQS_ENDPOINT (empty for AWS), AWS_REGION, SQS_INBOUND_QUEUE,
 // SQS_INBOUND_DLQ, the operator credentials SQS_OPERATOR_ACCESS_KEY_ID /
-// SQS_OPERATOR_SECRET_ACCESS_KEY, the operator's own sender id
-// SQS_OPERATOR_SENDER_ID, and SQS_QUEUE_OWNER_ACCOUNT_ID when the queues
-// belong to another account than the operator's.
+// SQS_OPERATOR_SECRET_ACCESS_KEY and the role they assume,
+// SQS_OPERATOR_ROLE_ARN (each taken from SQS_CREDENTIALS_FILE when unset),
+// the operator's own sender id SQS_OPERATOR_SENDER_ID, and
+// SQS_QUEUE_OWNER_ACCOUNT_ID when the queues belong to another account than
+// the operator's (ARCHITECTURE §28).
 package main
 
 import (
@@ -26,6 +28,7 @@ import (
 
 	"github.com/medbottle/betting-wallet-go/internal/adapters/sqsconsumer"
 	"github.com/medbottle/betting-wallet-go/internal/adapters/sqspublisher"
+	appconfig "github.com/medbottle/betting-wallet-go/internal/platform/config"
 )
 
 type config struct {
@@ -33,8 +36,12 @@ type config struct {
 	Region          string `env:"AWS_REGION" envDefault:"us-east-1"`
 	Queue           string `env:"SQS_INBOUND_QUEUE" envDefault:"wager-transactions.fifo"`
 	DLQ             string `env:"SQS_INBOUND_DLQ" envDefault:"wager-transactions-dlq.fifo"`
-	AccessKeyID     string `env:"SQS_OPERATOR_ACCESS_KEY_ID,required,notEmpty"`
-	SecretAccessKey string `env:"SQS_OPERATOR_SECRET_ACCESS_KEY,required,notEmpty"`
+	CredentialsFile string `env:"SQS_CREDENTIALS_FILE"`
+	AccessKeyID     string `env:"SQS_OPERATOR_ACCESS_KEY_ID"`
+	SecretAccessKey string `env:"SQS_OPERATOR_SECRET_ACCESS_KEY"`
+	// RoleARN is the operator role the key assumes; empty acts as the key's
+	// own identity.
+	RoleARN string `env:"SQS_OPERATOR_ROLE_ARN"`
 	// SenderID is the SenderId SQS reports for the operator's messages:
 	// a DLQ message from it was resent before, and its originalSenderId is
 	// kept (ARCHITECTURE §10).
@@ -58,8 +65,24 @@ func run(ctx context.Context, out io.Writer) error {
 	if err != nil {
 		return err
 	}
+	if cfg.CredentialsFile != "" {
+		creds, err := appconfig.ReadBrokerCredentials(cfg.CredentialsFile)
+		if err != nil {
+			return err
+		}
+		if cfg.AccessKeyID == "" && cfg.SecretAccessKey == "" {
+			cfg.AccessKeyID, cfg.SecretAccessKey = creds.Operator.AccessKeyID, creds.Operator.SecretAccessKey
+		}
+		if cfg.RoleARN == "" {
+			cfg.RoleARN = creds.Operator.RoleARN
+		}
+	}
+	if cfg.AccessKeyID == "" || cfg.SecretAccessKey == "" {
+		return fmt.Errorf("SQS_OPERATOR_ACCESS_KEY_ID and SQS_OPERATOR_SECRET_ACCESS_KEY must be set, in the environment or in SQS_CREDENTIALS_FILE")
+	}
 	client := sqspublisher.NewClient(sqspublisher.ClientConfig{
 		Endpoint: cfg.Endpoint, Region: cfg.Region, AccessKeyID: cfg.AccessKeyID, SecretAccessKey: cfg.SecretAccessKey,
+		RoleARN: cfg.RoleARN, RoleSessionName: "dlqredrive",
 	})
 	queueURL, err := sqspublisher.ResolveQueueURLInAccount(ctx, client, cfg.Queue, cfg.QueueOwnerAccountID)
 	if err != nil {

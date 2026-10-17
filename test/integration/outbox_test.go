@@ -16,7 +16,8 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
-	"github.com/google/uuid"
+	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
+	"github.com/aws/smithy-go"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/medbottle/betting-wallet-go/internal/adapters/postgres"
@@ -30,7 +31,7 @@ import (
 // relayFor builds a relay on runner that publishes to queue at endpoint.
 func relayFor(t *testing.T, runner app.TxRunner, endpoint, queue, owner string, mutate ...func(*messaging.RelayConfig)) *messaging.Relay {
 	t.Helper()
-	pub := sqspublisher.New(sqsClient(endpoint, publisherKey, publisherSecret), queue)
+	pub := sqspublisher.New(sqsAs(t, asPublisher), queue)
 	if err := pub.Resolve(ctxT(t)); err != nil {
 		t.Fatal(err)
 	}
@@ -262,7 +263,7 @@ func TestOutboxRecoversBetweenPublishAndConfirm(t *testing.T) {
 	}); err != nil || len(claimed) != 2 {
 		t.Fatalf("claim: %d rows, %v", len(claimed), err)
 	}
-	pub := sqspublisher.New(sqsClient(endpoint, publisherKey, publisherSecret), queue)
+	pub := sqspublisher.New(sqsAs(t, asPublisher), queue)
 	if err := pub.Resolve(ctxT(t)); err != nil {
 		t.Fatal(err)
 	}
@@ -318,7 +319,7 @@ func TestOutboxBackoffAndPark(t *testing.T) {
 	t.Parallel()
 	env := newRepoEnv(t)
 	w := env.openWallet(t, "10.00")
-	unreachable := sqspublisher.New(sqsClient("http://127.0.0.1:1", publisherKey, publisherSecret), "wallet-events.fifo")
+	unreachable := sqspublisher.New(sqsClient("http://127.0.0.1:1", "unused", "unused"), "wallet-events.fifo")
 	// Resolution would fail too; publish against a stub URL to exercise the
 	// whole-call failure path.
 	relay := relayWith(env.runner, urlStub{unreachable}, "relay-1", func(c *messaging.RelayConfig) { c.MaxAttempts = 3 })
@@ -420,8 +421,8 @@ func (s *scriptedPublisher) PublishBatch(_ context.Context, events []app.Outboun
 // TestSQSReadiness: the readiness probe reports the queue.
 func TestSQSReadiness(t *testing.T) {
 	t.Parallel()
-	endpoint := startMiniStack(t)
-	ok := sqspublisher.New(sqsClient(endpoint, publisherKey, publisherSecret), "wallet-events.fifo")
+	startMiniStack(t)
+	ok := sqspublisher.New(sqsAs(t, asPublisher), "wallet-events.fifo")
 	if err := ok.Resolve(ctxT(t)); err != nil {
 		t.Fatal(err)
 	}
@@ -440,25 +441,47 @@ func TestSQSReadiness(t *testing.T) {
 	}
 }
 
-// TestBrokerCredentialSeparation is the negative test of ARCHITECTURE §10:
-// the publisher's credentials must not receive from the inbound queue.
-// MiniStack enforces IAM only with AUTH=true, which the project does not
-// use, so in the default mode the test is skipped with that reason (A12).
+// TestBrokerCredentialSeparation is the negative test of ARCHITECTURE §10
+// on the publisher's side, enforced by MiniStack with AUTH=true (§28): its
+// credentials publish events and nothing else; they cannot read the
+// inbound queue or the events queue, and a wrong secret is refused.
 func TestBrokerCredentialSeparation(t *testing.T) {
 	t.Parallel()
 	endpoint := startMiniStack(t)
-	client := sqsClient(endpoint, publisherKey, publisherSecret)
-	url, err := sqspublisher.ResolveQueueURL(ctxT(t), client, "wager-transactions.fifo")
-	if err == nil {
-		_, err = client.ReceiveMessage(ctxT(t), &sqs.ReceiveMessageInput{QueueUrl: aws.String(url), WaitTimeSeconds: 0})
+	admin := sqsAs(t, asAdmin)
+	inbound, err := sqspublisher.ResolveQueueURL(ctxT(t), admin, "wager-transactions.fifo")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if err == nil {
-		bogus := sqsClient(endpoint, "nobody-"+uuid.NewString(), "wrong-secret")
-		_, bogusErr := bogus.ListQueues(ctxT(t), &sqs.ListQueuesInput{})
-		t.Skip(fmt.Sprintf("MiniStack enforces IAM for SQS only with AUTH=true, which this project does not use: that mode generates the "+
-			"access keys, which would have to be provisioned for every role and read by the app and the tests. In the default mode the "+
-			"publisher's credentials could ReceiveMessage on the inbound queue (unknown credentials accepted too: %v), so credential "+
-			"separation is configured but not verified locally (ARCHITECTURE §10, A12).", bogusErr == nil))
+	events, err := sqspublisher.ResolveQueueURL(ctxT(t), admin, newEventsQueue(t, endpoint))
+	if err != nil {
+		t.Fatal(err)
 	}
-	t.Logf("receive with publisher credentials refused: %v", err)
+	publisher := brokerKey(t, asPublisher)
+	receive := func(c *sqs.Client, url string) error {
+		_, err := c.ReceiveMessage(ctxT(t), &sqs.ReceiveMessageInput{QueueUrl: aws.String(url), WaitTimeSeconds: 0})
+		return err
+	}
+	for name, tc := range map[string]struct {
+		call func() error
+		code string
+	}{
+		"publisher reads the inbound queue": {func() error { return receive(sqsAs(t, asPublisher), inbound) }, "AccessDeniedException"},
+		"publisher reads the events queue":  {func() error { return receive(sqsAs(t, asPublisher), events) }, "AccessDeniedException"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := tc.call()
+			var apiErr smithy.APIError
+			if !errors.As(err, &apiErr) || apiErr.ErrorCode() != tc.code {
+				t.Fatalf("got %v, want the broker to refuse with %s", err, tc.code)
+			}
+		})
+	}
+	// The wrong secret against the broker itself.
+	_, err = sqsClient(endpoint, publisher.AccessKeyID, "wrong-secret").GetQueueAttributes(ctxT(t),
+		&sqs.GetQueueAttributesInput{QueueUrl: aws.String(events), AttributeNames: []types.QueueAttributeName{types.QueueAttributeNameQueueArn}})
+	var apiErr smithy.APIError
+	if !errors.As(err, &apiErr) || apiErr.ErrorCode() != "SignatureDoesNotMatch" {
+		t.Fatalf("wrong secret: %v", err)
+	}
 }

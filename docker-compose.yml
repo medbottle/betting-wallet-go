@@ -56,8 +56,14 @@ services:
     image: ministackorg/ministack:1.5.27
     environment:
       MINISTACK_REGION: ${AWS_REGION:-us-east-1}
+      # IAM enforced: signatures checked, identity and queue policies
+      # evaluated (ARCHITECTURE §28). The init script provisions every
+      # identity and writes its generated keys to the shared volume.
+      AUTH: "true"
     volumes:
       - ./deploy/ministack/init-queues.sh:/etc/localstack/init/ready.d/init-queues.sh:ro
+      - ./deploy/ministack/send-as.sh:/opt/wager/send-as.sh:ro
+      - sqs-credentials:/var/lib/wager-credentials
     ports:
       - "4566:4566"
     healthcheck:
@@ -93,20 +99,19 @@ services:
       OIDC_ISSUER: http://localhost:8080/realms/wagering
       OIDC_JWKS_URL: http://keycloak:8080/realms/wagering/protocol/openid-connect/certs
       OIDC_AUDIENCE: wallet-api
-      # Events queue and the publisher's own credentials (ARCHITECTURE §10).
+      # Events queue, inbound queue and its DLQ (ARCHITECTURE §10). The
+      # publisher's and the consumer's own keys, which MiniStack generated,
+      # come from the credentials file its init script wrote (§28).
       SQS_ENDPOINT: http://ministack:4566
       AWS_REGION: ${AWS_REGION:-us-east-1}
       SQS_EVENTS_QUEUE: wallet-events.fifo
-      SQS_PUBLISHER_ACCESS_KEY_ID: ${SQS_PUBLISHER_ACCESS_KEY_ID:-wallet-publisher}
-      SQS_PUBLISHER_SECRET_ACCESS_KEY: ${SQS_PUBLISHER_SECRET_ACCESS_KEY:-wallet-publisher-local-secret}
-      # Inbound queue, its DLQ and the consumer's own credentials (§10).
       SQS_INBOUND_QUEUE: wager-transactions.fifo
       SQS_INBOUND_DLQ: wager-transactions-dlq.fifo
-      SQS_CONSUMER_ACCESS_KEY_ID: ${SQS_CONSUMER_ACCESS_KEY_ID:-wallet-consumer}
-      SQS_CONSUMER_SECRET_ACCESS_KEY: ${SQS_CONSUMER_SECRET_ACCESS_KEY:-wallet-consumer-local-secret}
+      SQS_CREDENTIALS_FILE: /var/lib/wager-credentials/sqs-credentials.json
       # Producer identities the consumer trusts (§10/§11): the SenderId of
       # each provider's producer, and of the redrive operator. Locally each
-      # is a 12-digit MiniStack account, which MiniStack reports as SenderId.
+      # sends through a role in its own MiniStack account, and MiniStack
+      # reports that account as SenderId (§28).
       SQS_PROVIDER_SENDERS: ${SQS_PROVIDER_SENDERS:-111111111111=provider-a,222222222222=provider-b}
       SQS_OPERATOR_SENDER_ID: ${SQS_OPERATOR_SENDER_ID:-333333333333}
       LOG_LEVEL: ${LOG_LEVEL:-info}
@@ -114,6 +119,8 @@ services:
       RUN_CONSUMER: "true"
       RUN_OUTBOX: "true"
       RUN_REFERENCE_WORKER: "true"
+    volumes:
+      - sqs-credentials:/var/lib/wager-credentials:ro
     ports:
       - "8081:8081"
       - "9090:9090"
@@ -132,3 +139,4 @@ services:
 
 volumes:
   pgdata:
+  sqs-credentials:

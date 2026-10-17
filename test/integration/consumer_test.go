@@ -5,6 +5,7 @@ package integration
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -17,6 +18,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
+	"github.com/aws/smithy-go"
 	"github.com/google/uuid"
 
 	"github.com/medbottle/betting-wallet-go/internal/adapters/sqsconsumer"
@@ -40,9 +42,10 @@ type inboundQueues struct {
 func newInboundQueues(t *testing.T, visibility, maxReceive int) inboundQueues {
 	t.Helper()
 	endpoint := startMiniStack(t)
-	admin := sqsClient(endpoint, readerKey, readerSecret)
+	admin := sqsAs(t, asAdmin)
+	// Names inside the local identity policies' patterns (init-queues.sh).
 	suffix := strings.ReplaceAll(uuid.NewString(), "-", "")[:16]
-	q := inboundQueues{endpoint: endpoint, queue: "in-" + suffix + ".fifo", dlq: "in-" + suffix + "-dlq.fifo", admin: admin}
+	q := inboundQueues{endpoint: endpoint, queue: "wager-transactions-in-" + suffix + ".fifo", dlq: "wager-transactions-dlq-" + suffix + ".fifo", admin: admin}
 	fifo := map[string]string{"FifoQueue": "true", "ContentBasedDeduplication": "false", "VisibilityTimeout": strconv.Itoa(visibility)}
 	out, err := admin.CreateQueue(ctxT(t), &sqs.CreateQueueInput{QueueName: aws.String(q.dlq), Attributes: fifo})
 	if err != nil {
@@ -63,6 +66,7 @@ func newInboundQueues(t *testing.T, visibility, maxReceive int) inboundQueues {
 		t.Fatal(err)
 	}
 	q.queueURL = aws.ToString(out.QueueUrl)
+	applyQueuePolicies(t, q.queue, q.dlq)
 	return q
 }
 
@@ -70,12 +74,12 @@ func newInboundQueues(t *testing.T, visibility, maxReceive int) inboundQueues {
 // fresh id so tests can prove redeliveries that SQS itself would not drop.
 func (q inboundQueues) send(t *testing.T, body, group string) {
 	t.Helper()
-	q.sendAs(t, providerAKey, providerASecret, body, group, "")
+	q.sendAs(t, asProviderA, body, group, "")
 }
 
-// sendAs publishes body with the given broker credentials, naming
-// originalSender in originalSenderId when it is not empty.
-func (q inboundQueues) sendAs(t *testing.T, key, secret, body, group, originalSender string) {
+// sendAs publishes body as the broker identity id, naming originalSender
+// in originalSenderId when it is not empty.
+func (q inboundQueues) sendAs(t *testing.T, id brokerID, body, group, originalSender string) {
 	t.Helper()
 	in := &sqs.SendMessageInput{
 		QueueUrl: aws.String(q.queueURL), MessageBody: aws.String(body),
@@ -86,7 +90,7 @@ func (q inboundQueues) sendAs(t *testing.T, key, secret, body, group, originalSe
 			sqsconsumer.AttrOriginalSenderID: {DataType: aws.String("String"), StringValue: aws.String(originalSender)},
 		}
 	}
-	if _, err := sqsClient(q.endpoint, key, secret).SendMessage(ctxT(t), in); err != nil {
+	if _, err := sqsAs(t, id).SendMessage(ctxT(t), in); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -184,7 +188,7 @@ func startConsumer(t *testing.T, e apiEnv, q inboundQueues, opts consumerOpts) (
 		opts.readiness = readyGate()
 	}
 	if opts.api == nil {
-		opts.api = sqsClient(q.endpoint, consumerKey, consumerSecret)
+		opts.api = sqsAs(t, asConsumer)
 	}
 	if opts.backoffMax == 0 {
 		opts.backoffMax = time.Minute
@@ -195,7 +199,7 @@ func startConsumer(t *testing.T, e apiEnv, q inboundQueues, opts consumerOpts) (
 	c := sqsconsumer.New(opts.api, svc, opts.readiness, clock.System{}, sqsconsumer.Config{
 		Queue: q.queue, DLQ: q.dlq, WaitSeconds: 1, MaxMessages: 10,
 		HandlerTimeout: opts.handlerTimeout, Visibility: opts.visibility, BackoffMax: opts.backoffMax, PauseInterval: 50 * time.Millisecond,
-		Senders: providerSenders, OperatorSenderID: operatorKey,
+		Senders: providerSenders, OperatorSenderID: operatorSender,
 	}, e.logger, opts.metrics)
 	if err := c.Resolve(ctxT(t)); err != nil {
 		t.Fatal(err)
@@ -336,11 +340,12 @@ func TestConsumerDeadLetters(t *testing.T) {
 	amountAsNumber := strings.Replace(envelope(t, "msg-number", op(w, "provider-a", "BET", "5.00", "dl-number")), `"amount":"5.00"`, `"amount":5.00`, 1)
 	conflict := op(w, "provider-a", "BET", "7.00", "dl-ok") // same key as the processed one, another amount
 	type dlCase struct {
-		key, secret, body, code, envID string
-		sender                         string // the originalSenderId of the DLQ copy
+		as                brokerID
+		body, code, envID string
+		sender            string // the originalSenderId of the DLQ copy
 	}
 	fromA := func(body, code, envID string) dlCase {
-		return dlCase{providerAKey, providerASecret, body, code, envID, providerAKey}
+		return dlCase{asProviderA, body, code, envID, providerASender}
 	}
 	cases := map[string]dlCase{
 		"hash":     fromA(envelope(t, "msg-reused", op(w, "provider-a", "BET", "6.00", "dl-ok")), "INVALID_REQUEST", "msg-reused"),
@@ -349,14 +354,14 @@ func TestConsumerDeadLetters(t *testing.T) {
 		"provider": fromA(envelope(t, "msg-provider", op(w, "provider-z", "BET", "5.00", "dl-provider")), "PROVIDER_MISMATCH", "msg-provider"),
 		"number":   fromA(amountAsNumber, "INVALID_MONEY", "msg-number"),
 		"conflict": fromA(envelope(t, "msg-conflict", conflict), "IDEMPOTENCY_KEY_CONFLICT", "msg-conflict"),
-		// A key of the default account is no provider identity.
-		"unknown-sender": {readerKey, readerSecret, envelope(t, "msg-unknown", op(w, "provider-a", "BET", "5.00", "dl-unknown")),
+		// The queue owner's own identity is no provider identity.
+		"unknown-sender": {asAdmin, envelope(t, "msg-unknown", op(w, "provider-a", "BET", "5.00", "dl-unknown")),
 			"FORBIDDEN", "msg-unknown", queueOwner},
-		"inactive-provider": {providerBKey, providerBSecret, envelope(t, "msg-inactive", op(w, "provider-b", "BET", "5.00", "dl-inactive")),
-			"FORBIDDEN", "msg-inactive", providerBKey},
+		"inactive-provider": {asProviderB, envelope(t, "msg-inactive", op(w, "provider-b", "BET", "5.00", "dl-inactive")),
+			"FORBIDDEN", "msg-inactive", providerBSender},
 	}
 	for name, tc := range cases {
-		q.sendAs(t, tc.key, tc.secret, tc.body, "g-"+name, "")
+		q.sendAs(t, tc.as, tc.body, "g-"+name, "")
 	}
 	waitFor(t, 20*time.Second, "dead-lettered", func() bool { return c.Stats().DeadLetter == int64(len(cases)) })
 	waitFor(t, 10*time.Second, "source queue empty", func() bool { return q.depth(t, q.queueURL) == 0 })
@@ -387,7 +392,7 @@ func TestConsumerDeadLetters(t *testing.T) {
 	e.assertConsistent(t, w, "95.00")
 
 	// The redrive tool leaves the permanent messages in the DLQ.
-	res, err := sqsconsumer.Redrive(ctxT(t), sqsClient(q.endpoint, operatorKey, operatorSecret), q.dlqURL, q.queueURL, operatorKey, time.Now)
+	res, err := sqsconsumer.Redrive(ctxT(t), sqsAs(t, asOperator), q.dlqURL, q.queueURL, operatorSender, time.Now)
 	if err != nil || res.Redriven != 0 || res.Skipped != len(cases) {
 		t.Fatalf("redrive = %+v, %v", res, err)
 	}
@@ -408,7 +413,7 @@ func TestConsumerProviderIsTheSender(t *testing.T) {
 
 	// provider-b's own bet, sent with provider-b's credentials.
 	betB := op(w, "provider-b", "BET", "10.00", "b-bet")
-	q.sendAs(t, providerBKey, providerBSecret, envelope(t, "msg-b-bet", betB), w.ID, "")
+	q.sendAs(t, asProviderB, envelope(t, "msg-b-bet", betB), w.ID, "")
 	original := e.waitStatus(t, "provider-b", "provider-b", "b-bet", "PROCESSED", 15*time.Second)
 	waitFor(t, 10*time.Second, "provider-b's message handled", func() bool { return c.Stats().Handled == 1 })
 	rows := func() [4]int {
@@ -422,10 +427,11 @@ func TestConsumerProviderIsTheSender(t *testing.T) {
 	before := rows()
 
 	type attempt struct {
-		key, secret, body, forged, code, sender string
+		as                         brokerID
+		body, forged, code, sender string
 	}
 	fromA := func(body, forged string) attempt {
-		return attempt{providerAKey, providerASecret, body, forged, "PROVIDER_MISMATCH", providerAKey}
+		return attempt{asProviderA, body, forged, "PROVIDER_MISMATCH", providerASender}
 	}
 	attempts := map[string]attempt{
 		// A new operation in provider-b's name.
@@ -437,12 +443,12 @@ func TestConsumerProviderIsTheSender(t *testing.T) {
 		"reversal": fromA(envelope(t, "msg-a-reversal", op(w, "provider-b", "ROLLBACK", "10.00", "a-rollback", "b-bet")), ""),
 		// Naming provider-b's identity as the original sender: only the
 		// redrive operator is trusted with that attribute.
-		"forged": fromA(envelope(t, "msg-a-forged", op(w, "provider-b", "BET", "20.00", "a-forged")), providerBKey),
+		"forged": fromA(envelope(t, "msg-a-forged", op(w, "provider-b", "BET", "20.00", "a-forged")), providerBSender),
 		// The operator's own messages act for no provider.
-		"operator": {operatorKey, operatorSecret, envelope(t, "msg-operator", op(w, "provider-b", "BET", "20.00", "op-as-b")), "", "FORBIDDEN", ""},
+		"operator": {asOperator, envelope(t, "msg-operator", op(w, "provider-b", "BET", "20.00", "op-as-b")), "", "FORBIDDEN", ""},
 	}
 	for name, a := range attempts {
-		q.sendAs(t, a.key, a.secret, a.body, "g-"+name, a.forged)
+		q.sendAs(t, a.as, a.body, "g-"+name, a.forged)
 	}
 	waitFor(t, 20*time.Second, "attempts dead-lettered", func() bool { return c.Stats().DeadLetter == int64(len(attempts)) })
 	waitFor(t, 10*time.Second, "source queue empty", func() bool { return q.depth(t, q.queueURL) == 0 })
@@ -638,7 +644,7 @@ func TestConsumerCommitThenDieBeforeDelete(t *testing.T) {
 	t.Parallel()
 	e := newAPIEnv(t)
 	q := newInboundQueues(t, 2, 10)
-	api := &dropFirstDelete{Client: sqsClient(q.endpoint, consumerKey, consumerSecret)}
+	api := &dropFirstDelete{Client: sqsAs(t, asConsumer)}
 	c, _ := startConsumer(t, e, q, consumerOpts{api: api, handlerTimeout: 2 * time.Second, visibility: 7 * time.Second})
 	w := e.openWallet(t, "100.00")
 
@@ -705,7 +711,7 @@ func TestConsumerTransientRetriesThenRedrive(t *testing.T) {
 	}
 
 	down.Store(false)
-	operator := sqsClient(q.endpoint, operatorKey, operatorSecret)
+	operator := sqsAs(t, asOperator)
 	queueURL, err := sqspublisher.ResolveQueueURLInAccount(ctxT(t), operator, q.queue, queueOwner)
 	if err != nil || queueURL != q.queueURL {
 		t.Fatalf("operator resolves %q, %v; want %s", queueURL, err, q.queueURL)
@@ -714,7 +720,7 @@ func TestConsumerTransientRetriesThenRedrive(t *testing.T) {
 	if err != nil || dlqURL != q.dlqURL {
 		t.Fatalf("operator resolves %q, %v; want %s", dlqURL, err, q.dlqURL)
 	}
-	res, err := sqsconsumer.Redrive(ctxT(t), operator, dlqURL, queueURL, operatorKey, time.Now)
+	res, err := sqsconsumer.Redrive(ctxT(t), operator, dlqURL, queueURL, operatorSender, time.Now)
 	if err != nil || res.Redriven != 1 || res.Skipped != 0 {
 		t.Fatalf("redrive = %+v, %v", res, err)
 	}
@@ -816,36 +822,65 @@ func TestConsumerStopFinishesInFlight(t *testing.T) {
 	}
 }
 
-// TestConsumerCredentialSeparation is the consumer side of ARCHITECTURE
-// §10: the consumer's credentials must not publish to the events queue.
-// MiniStack enforces IAM only with AUTH=true, which the project does not
-// use, so in the default mode the test is skipped with that reason (A12).
+// TestConsumerCredentialSeparation: the broker enforces each identity's
+// credentials and policies (CHALLENGE §2, ARCHITECTURE §28). MiniStack runs
+// with AUTH=true: a wrong secret or an unknown key is refused, the consumer
+// can neither publish events nor send to its own inbound queue, a
+// provider's role can send to the inbound queue only, and the root key of
+// a provider's account, which MiniStack never authenticates, is refused by
+// the inbound queue's policy. That last one is the spoof the local setup
+// allowed before §28: a provider's 12-digit key with any secret.
 func TestConsumerCredentialSeparation(t *testing.T) {
 	t.Parallel()
 	endpoint := startMiniStack(t)
-	client := sqsClient(endpoint, consumerKey, consumerSecret)
-	queue := newEventsQueue(t, endpoint)
-	url, err := sqsconsumerResolve(t, client, queue)
-	if err == nil {
-		_, err = client.SendMessage(ctxT(t), &sqs.SendMessageInput{QueueUrl: aws.String(url), MessageBody: aws.String("{}"),
-			MessageGroupId: aws.String("g"), MessageDeduplicationId: aws.String(uuid.NewString())})
-	}
-	if err == nil {
-		t.Skip("MiniStack enforces IAM for SQS only with AUTH=true, which this project does not use: that mode generates the " +
-			"access keys, which would have to be provisioned for every role and read by the app and the tests. In the default mode the " +
-			"consumer's credentials could SendMessage to an events queue, so credential separation is configured but not verified " +
-			"locally (ARCHITECTURE §10, A12).")
-	}
-	t.Logf("send with consumer credentials refused: %v", err)
-}
-
-func sqsconsumerResolve(t *testing.T, client *sqs.Client, queue string) (string, error) {
-	t.Helper()
-	out, err := client.GetQueueUrl(ctxT(t), &sqs.GetQueueUrlInput{QueueName: aws.String(queue)})
+	q := newInboundQueues(t, 30, 10)
+	events, err := sqspublisher.ResolveQueueURL(ctxT(t), sqsAs(t, asAdmin), newEventsQueue(t, endpoint))
 	if err != nil {
-		return "", err
+		t.Fatal(err)
 	}
-	return aws.ToString(out.QueueUrl), nil
+	consumer := brokerKey(t, asConsumer)
+	send := func(c *sqs.Client, url string) error {
+		_, err := c.SendMessage(ctxT(t), &sqs.SendMessageInput{QueueUrl: aws.String(url), MessageBody: aws.String("{}"),
+			MessageGroupId: aws.String("g"), MessageDeduplicationId: aws.String(uuid.NewString())})
+		return err
+	}
+	receive := func(c *sqs.Client, url string) error {
+		_, err := c.ReceiveMessage(ctxT(t), &sqs.ReceiveMessageInput{QueueUrl: aws.String(url), WaitTimeSeconds: 0})
+		return err
+	}
+	for name, tc := range map[string]struct {
+		call func() error
+		code string
+	}{
+		"consumer publishes an event":         {func() error { return send(sqsAs(t, asConsumer), events) }, "AccessDeniedException"},
+		"consumer sends to the inbound queue": {func() error { return send(sqsAs(t, asConsumer), q.queueURL) }, "AccessDeniedException"},
+		"provider role receives":              {func() error { return receive(sqsAs(t, asProviderA), q.queueURL) }, "AccessDeniedException"},
+		"provider role sends to the DLQ":      {func() error { return send(sqsAs(t, asProviderA), q.dlqURL) }, "AccessDeniedException"},
+		"provider account root, any secret": {func() error {
+			return send(sqsClient(endpoint, providerASender, "any-secret"), q.queueURL)
+		}, "AccessDenied"},
+		"consumer key, wrong secret": {func() error {
+			return receive(sqsClient(endpoint, consumer.AccessKeyID, "wrong-secret"), q.queueURL)
+		}, "SignatureDoesNotMatch"},
+		"unknown key": {func() error {
+			return send(sqsClient(endpoint, "AKIA"+strings.ToUpper(strings.ReplaceAll(uuid.NewString(), "-", "")[:16]), "x"), q.queueURL)
+		}, "InvalidClientTokenId"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := tc.call()
+			var apiErr smithy.APIError
+			if !errors.As(err, &apiErr) || apiErr.ErrorCode() != tc.code {
+				t.Fatalf("got %v, want the broker to refuse with %s", err, tc.code)
+			}
+		})
+	}
+	// The allowed paths still work with the same queues.
+	if err := send(sqsAs(t, asProviderA), q.queueURL); err != nil {
+		t.Fatalf("provider-a's role cannot send: %v", err)
+	}
+	if err := receive(sqsAs(t, asConsumer), q.queueURL); err != nil {
+		t.Fatalf("the consumer cannot receive: %v", err)
+	}
 }
 
 // TestConsumerInboxIsPerProvider: two providers that pick the same
@@ -858,9 +893,9 @@ func TestConsumerInboxIsPerProvider(t *testing.T) {
 	c, _ := startConsumer(t, e, q, consumerOpts{})
 	w := e.openWallet(t, "100.00")
 
-	q.sendAs(t, providerBKey, providerBSecret, envelope(t, "msg-shared", op(w, "provider-b", "BET", "10.00", "shared-b")), w.ID, "")
+	q.sendAs(t, asProviderB, envelope(t, "msg-shared", op(w, "provider-b", "BET", "10.00", "shared-b")), w.ID, "")
 	e.waitStatus(t, "provider-b", "provider-b", "shared-b", "PROCESSED", 15*time.Second)
-	q.sendAs(t, providerAKey, providerASecret, envelope(t, "msg-shared", op(w, "provider-a", "BET", "15.00", "shared-a")), w.ID, "")
+	q.sendAs(t, asProviderA, envelope(t, "msg-shared", op(w, "provider-a", "BET", "15.00", "shared-a")), w.ID, "")
 	e.waitStatus(t, "provider-a", "provider-a", "shared-a", "PROCESSED", 15*time.Second)
 
 	if s := c.Stats(); s.Handled != 2 || s.DeadLetter != 0 {

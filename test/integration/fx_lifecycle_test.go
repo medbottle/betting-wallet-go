@@ -10,6 +10,8 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -35,15 +37,35 @@ type sqsEnv struct{ Endpoint, Queue string }
 // unreachableSQS is for tests that fail before the queue is resolved.
 var unreachableSQS = sqsEnv{Endpoint: "http://127.0.0.1:1", Queue: "wallet-events.fifo"}
 
+// setSQSEnv configures the broker. On the real MiniStack the app loads the
+// generated keys through SQS_CREDENTIALS_FILE, as in compose
+// (ARCHITECTURE §28); a test that never reaches a broker gets placeholders.
 func setSQSEnv(t *testing.T, s sqsEnv) {
 	t.Setenv("SQS_ENDPOINT", s.Endpoint)
 	t.Setenv("SQS_EVENTS_QUEUE", s.Queue)
-	t.Setenv("SQS_PUBLISHER_ACCESS_KEY_ID", publisherKey)
-	t.Setenv("SQS_PUBLISHER_SECRET_ACCESS_KEY", publisherSecret)
-	t.Setenv("SQS_CONSUMER_ACCESS_KEY_ID", consumerKey)
-	t.Setenv("SQS_CONSUMER_SECRET_ACCESS_KEY", consumerSecret)
-	t.Setenv("SQS_PROVIDER_SENDERS", providerAKey+"=provider-a,"+providerBKey+"=provider-b")
-	t.Setenv("SQS_OPERATOR_SENDER_ID", operatorKey)
+	if s == unreachableSQS {
+		t.Setenv("SQS_PUBLISHER_ACCESS_KEY_ID", "unused")
+		t.Setenv("SQS_PUBLISHER_SECRET_ACCESS_KEY", "unused")
+		t.Setenv("SQS_CONSUMER_ACCESS_KEY_ID", "unused")
+		t.Setenv("SQS_CONSUMER_SECRET_ACCESS_KEY", "unused")
+	} else {
+		startMiniStack(t)
+		b, err := json.Marshal(msCreds)
+		if err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(t.TempDir(), "sqs-credentials.json")
+		if err := os.WriteFile(path, b, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("SQS_CREDENTIALS_FILE", path)
+		// Environment keys win over the file; drop the placeholders.
+		for _, k := range []string{"SQS_PUBLISHER_ACCESS_KEY_ID", "SQS_PUBLISHER_SECRET_ACCESS_KEY", "SQS_CONSUMER_ACCESS_KEY_ID", "SQS_CONSUMER_SECRET_ACCESS_KEY"} {
+			t.Setenv(k, "")
+		}
+	}
+	t.Setenv("SQS_PROVIDER_SENDERS", providerASender+"=provider-a,"+providerBSender+"=provider-b")
+	t.Setenv("SQS_OPERATOR_SENDER_ID", operatorSender)
 }
 
 func setAppEnv(t *testing.T, databaseURL string, kc keycloakEnv) {

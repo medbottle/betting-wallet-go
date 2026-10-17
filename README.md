@@ -54,10 +54,9 @@ Stop and wipe the data: `docker compose down -v`.
 Compose reads `.env` only to fill the variables `docker-compose.yml`
 interpolates, each with a local default: `POSTGRES_PASSWORD`,
 `WALLET_OWNER_PASSWORD`, `WALLET_APP_PASSWORD`, `KEYCLOAK_ADMIN`,
-`KEYCLOAK_ADMIN_PASSWORD`, `AWS_REGION`, `SQS_PUBLISHER_ACCESS_KEY_ID` /
-`SQS_PUBLISHER_SECRET_ACCESS_KEY`, `SQS_CONSUMER_ACCESS_KEY_ID` /
-`SQS_CONSUMER_SECRET_ACCESS_KEY`, `SQS_PROVIDER_SENDERS`,
-`SQS_OPERATOR_SENDER_ID` and `LOG_LEVEL`. To override one, run
+`KEYCLOAK_ADMIN_PASSWORD`, `AWS_REGION`, `SQS_PROVIDER_SENDERS`,
+`SQS_OPERATOR_SENDER_ID` and `LOG_LEVEL`. The broker keys are not among
+them: MiniStack generates them at startup (see "Queues"). To override one, run
 `cp .env.example .env` and edit it. The other variables in `.env.example`
 (timeouts, `REFERENCE_*`, `OUTBOX_*`, `CONSUMER_*` and so on) do not reach
 the containers: set them in the `app` service's `environment` in
@@ -78,21 +77,40 @@ On startup, `deploy/ministack/init-queues.sh` (run by MiniStack from
 All queues are FIFO and have content-based deduplication turned off. Producers
 always send an explicit `MessageDeduplicationId`.
 
-Each role uses its own broker credentials: the consumer, the outbox
-publisher, the `dlqredrive` operator and each provider's producer. Their
-least-privilege IAM policies, and the queue policy that lets only the
-producers and the operator send to `wager-transactions.fifo`, are in
-[deploy/aws/iam-policies.json](deploy/aws/iam-policies.json) for a real AWS
-account. MiniStack
-enforces IAM for SQS only when started with `AUTH=true`, which this project
-does not use: in that mode the emulator generates the access keys, so they
-would have to be provisioned for every role and read by the app and the
-tests. In the default mode used here it accepts any credentials and
-evaluates no policy, so locally the separation is configured but not
-enforced, and the policies file stays the AWS definition (ARCHITECTURE.md
-§10, assumption A12).
+#### Broker identities and credentials
 
-To list them from the host (any AWS CLI, with dummy credentials):
+MiniStack runs with `AUTH=true`: it checks every request's signature and
+evaluates the identity and queue policies (ARCHITECTURE §28). After the
+queues, the init script creates each role's identity with its own
+least-privilege policy:
+
+| Identity | How it acts | May |
+| --- | --- | --- |
+| `wallet-consumer` (IAM user) | its own key | receive, delete and change visibility on `wager-transactions.fifo`; send to its DLQ |
+| `wallet-publisher` (IAM user) | its own key | send to `wallet-events.fifo` |
+| `provider-a-producer`, `provider-b-producer` (IAM users) | assume role `wager-producer` in account `111111111111` / `222222222222` | send to `wager-transactions.fifo` |
+| `wallet-operator` (IAM user) | assumes role `wager-operator` in account `333333333333` | read and delete the inbound DLQ; send to `wager-transactions.fifo` |
+
+The queue policy of `wager-transactions.fifo` lets only the two producer
+roles and the operator role send to it. MiniStack generates the access
+keys, so the script writes them to
+`/var/lib/wager-credentials/sqs-credentials.json` on the `sqs-credentials`
+volume, which the app reads through `SQS_CREDENTIALS_FILE`. The same
+policies for a real AWS account are in
+[deploy/aws/iam-policies.json](deploy/aws/iam-policies.json).
+
+The keys change whenever MiniStack starts, since it keeps its state in
+memory (as it does the queues): restart the app after restarting
+`ministack`. To run the binaries on the host, copy the file out and point
+`SQS_CREDENTIALS_FILE` at it:
+
+```sh
+docker compose cp ministack:/var/lib/wager-credentials/sqs-credentials.json ./sqs-credentials.json
+```
+
+`test` / `test` is the queue owner's root key, the emulator's
+administrator. Use it only to inspect queues, as below; it acts for no
+provider. To list the queues from the host (any AWS CLI):
 
 ```sh
 AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test aws --endpoint-url http://localhost:4566 --region us-east-1 sqs list-queues
@@ -168,18 +186,20 @@ never from `data.providerId` alone (ARCHITECTURE §10, "Identidade do
 produtor"). The consumer reads the `SenderId` SQS reports and maps it to a
 provider with `SQS_PROVIDER_SENDERS`; `data.providerId` must name that
 provider. In AWS the sender id is the producer's IAM user or role id.
-MiniStack reports the caller's account as `SenderId` and treats a 12-digit
-access key as that account, so locally each producer sends with its own
-12-digit key:
+MiniStack reports the sender's account as `SenderId`, so locally each
+producer sends through a role in its own account:
 
-| Producer | Access key / secret (local test values) | Acts for |
-| --- | --- | --- |
-| provider-a | `111111111111` / `provider-a-broker-local-secret` | `provider-a` |
-| provider-b | `222222222222` / `provider-b-broker-local-secret` | `provider-b` |
+| Producer | Sends as | `SenderId` | Acts for |
+| --- | --- | --- | --- |
+| provider-a | role `wager-producer` in `111111111111` | `111111111111` | `provider-a` |
+| provider-b | role `wager-producer` in `222222222222` | `222222222222` | `provider-b` |
 
-MiniStack does not authenticate keys in the mode used here, so this shows
-the consumer's sender-to-provider check, not broker authentication, which is
-IAM's job in AWS.
+A wrong secret, an unknown key, or an account's root key (`111111111111`
+with any secret) is refused by the broker before the consumer sees
+anything. One gap is the emulator's: MiniStack never checks the secret of
+an account's root key, so someone who knows that can still change that
+account's IAM and act through its role. In AWS root credentials are secret
+(ARCHITECTURE §28).
 
 | Item | Value |
 | --- | --- |
@@ -196,11 +216,17 @@ IAM's job in AWS.
 The message is deleted only after its transaction committed. Follow the
 outcome with `GET /providers/{providerId}/wagering/transactions/{externalId}`.
 
-Send one from the host as provider-a's producer:
+Send one as provider-a's producer with `deploy/ministack/send-as.sh`,
+mounted in the emulator container. It reads the producer's key from the
+credentials file, assumes provider-a's role and sends with it:
 
 ```sh
-AWS_ACCESS_KEY_ID=111111111111 AWS_SECRET_ACCESS_KEY=provider-a-broker-local-secret aws --endpoint-url http://localhost:4566 --region us-east-1 sqs send-message --queue-url http://localhost:4566/000000000000/wager-transactions.fifo --message-group-id <walletId> --message-deduplication-id msg-123 --message-body file://message.json
+docker compose exec ministack sh /opt/wager/send-as.sh provider-a <walletId> msg-123 '<message JSON>'
 ```
+
+The arguments are the provider, the `MessageGroupId`, the
+`MessageDeduplicationId` and the body (or `@/path/to/file` inside the
+container).
 
 #### DLQ redrive procedure
 
@@ -214,12 +240,13 @@ AWS_ACCESS_KEY_ID=111111111111 AWS_SECRET_ACCESS_KEY=provider-a-broker-local-sec
    original producer in the `originalSenderId` attribute (the consumer
    accepts it only from the operator's identity, `SQS_OPERATOR_SENDER_ID`),
    deletes each message from the DLQ after the send, and skips the permanent
-   ones. Locally the operator's 12-digit key is its own MiniStack account, so
-   it finds the queues in their owner's account with
-   `SQS_QUEUE_OWNER_ACCOUNT_ID`:
+   ones. It takes the operator's key and role from the credentials file
+   (`SQS_CREDENTIALS_FILE`, set on the `app` service) and acts through the
+   role, in account `333333333333`, so it finds the queues in their owner's
+   account with `SQS_QUEUE_OWNER_ACCOUNT_ID`:
 
    ```sh
-   docker compose run --rm --no-deps --entrypoint /app/dlqredrive -e SQS_OPERATOR_ACCESS_KEY_ID=333333333333 -e SQS_OPERATOR_SECRET_ACCESS_KEY=wallet-operator-local-secret -e SQS_QUEUE_OWNER_ACCOUNT_ID=000000000000 app
+   docker compose run --rm --no-deps --entrypoint /app/dlqredrive -e SQS_QUEUE_OWNER_ACCOUNT_ID=000000000000 app
    ```
 
    It prints `redriven=N skipped_permanent=M`. Skipped messages stay in
@@ -306,12 +333,14 @@ from the `provider_id` claim. `/health/*` needs no token.
 | `SQS_ENDPOINT` | — (AWS) | app | broker endpoint override (compose: `http://ministack:4566`) |
 | `AWS_REGION` | `us-east-1` | app | broker region |
 | `SQS_EVENTS_QUEUE` | `wallet-events.fifo` | app | outbound events queue |
-| `SQS_PUBLISHER_ACCESS_KEY_ID` / `SQS_PUBLISHER_SECRET_ACCESS_KEY` | — (required) | app | publisher-only credentials (ARCHITECTURE §10) |
+| `SQS_CREDENTIALS_FILE` | — | app, dlqredrive | broker credentials file (compose: the one MiniStack's init script writes); fills the keys below that are not set (ARCHITECTURE §28) |
+| `SQS_PUBLISHER_ACCESS_KEY_ID` / `SQS_PUBLISHER_SECRET_ACCESS_KEY` | — (required, or from the file) | app | publisher-only credentials (ARCHITECTURE §10) |
 | `SQS_INBOUND_QUEUE` / `SQS_INBOUND_DLQ` | `wager-transactions.fifo` / `wager-transactions-dlq.fifo` | app, dlqredrive | inbound queue and its DLQ |
-| `SQS_CONSUMER_ACCESS_KEY_ID` / `SQS_CONSUMER_SECRET_ACCESS_KEY` | — (required) | app | consumer-only credentials (ARCHITECTURE §10) |
+| `SQS_CONSUMER_ACCESS_KEY_ID` / `SQS_CONSUMER_SECRET_ACCESS_KEY` | — (required, or from the file) | app | consumer-only credentials (ARCHITECTURE §10) |
 | `SQS_PROVIDER_SENDERS` | — (required with `RUN_CONSUMER`) | app | `senderId=providerId` pairs, comma separated: the producer identities the consumer trusts (ARCHITECTURE §10) |
 | `SQS_OPERATOR_SENDER_ID` | — (required with `RUN_CONSUMER`; required by dlqredrive) | app, dlqredrive | the redrive operator's sender id, the only one whose `originalSenderId` is trusted |
-| `SQS_OPERATOR_ACCESS_KEY_ID` / `SQS_OPERATOR_SECRET_ACCESS_KEY` | — (required) | dlqredrive | operator credentials for the redrive tool (ARCHITECTURE §23) |
+| `SQS_OPERATOR_ACCESS_KEY_ID` / `SQS_OPERATOR_SECRET_ACCESS_KEY` | — (required, or from the file) | dlqredrive | operator credentials for the redrive tool (ARCHITECTURE §23) |
+| `SQS_OPERATOR_ROLE_ARN` | — (from the file; empty acts as the key itself) | dlqredrive | role the operator's key assumes (locally `arn:aws:iam::333333333333:role/wager-operator`, ARCHITECTURE §28) |
 | `SQS_QUEUE_OWNER_ACCOUNT_ID` | — (the operator's account) | dlqredrive | account that owns the queues, when the operator's is another one (locally `000000000000`) |
 | `CONSUMER_WAIT_SECONDS` | `20` | app | long-poll wait (0-20) |
 | `CONSUMER_MAX_MESSAGES` | `10` | app | messages per receive (1-10) |
@@ -473,7 +502,7 @@ integration tests.
 | `go test -race ./...` | the same with the race detector | Go + gcc (cgo) |
 | `go vet ./...` | vet (add `-tags=integration` to vet integration code too) | Go |
 | `gofmt -l .` | lists unformatted files (should print nothing) | Go |
-| `go test -tags=integration -count=1 ./test/integration/...` | real Postgres via testcontainers: migrations up/down, Fx start/stop with goroutine-leak check, every schema constraint, trigger and grant, the repositories, wallet locking and transaction atomicity, token verification against a real Keycloak (started once per run), the HTTP API end to end including the concurrency scenarios of CHALLENGE §13, the reference worker (late references, expiry, contention, abandoned claims, restart), the outbox relay against a real MiniStack (publishing, contention, crash recovery, backoff, parking), the SQS consumer against a real MiniStack (sender identity and provider binding, inbox, duplicates, DLQ, HTTP/SQS crossover, crash before delete, transient retries and redrive, readiness pause, graceful stop) | Docker |
+| `go test -tags=integration -count=1 ./test/integration/...` | real Postgres via testcontainers: migrations up/down, Fx start/stop with goroutine-leak check, every schema constraint, trigger and grant, the repositories, wallet locking and transaction atomicity, token verification against a real Keycloak (started once per run), the HTTP API end to end including the concurrency scenarios of CHALLENGE §13, the reference worker (late references, expiry, contention, abandoned claims, restart), the outbox relay against a real MiniStack (publishing, contention, crash recovery, backoff, parking), the SQS consumer against a real MiniStack with IAM enforced (`AUTH=true`: each identity's credentials and policies, the root-key spoof refused, sender identity and provider binding, inbox, duplicates, DLQ, HTTP/SQS crossover, crash before delete, transient retries and redrive, readiness pause, graceful stop) | Docker |
 | `go test -tags=integration -race -count=1 ./test/integration/...` | the same with the race detector | Docker + gcc |
 
 With no local C toolchain (for example, on Windows without gcc), run the race

@@ -34,6 +34,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/medbottle/betting-wallet-go/internal/adapters/sqspublisher"
+	"github.com/medbottle/betting-wallet-go/internal/platform/config"
 )
 
 const (
@@ -119,7 +120,12 @@ func run(m *testing.M) int {
 		return 1
 	}
 	defer db.Close()
+	// The queue owner's root key: the emulator's administrator (§28).
 	sqsc = sqspublisher.NewClient(sqspublisher.ClientConfig{Endpoint: sqsEndpoint, Region: "us-east-1", AccessKeyID: "test", SecretAccessKey: "test"})
+	if providerA, err = newProviderA(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
 	for _, q := range []string{inboundQueue, inboundDLQ, eventsQueue} {
 		if qURL[q], err = sqspublisher.ResolveQueueURL(ctx, sqsc, q); err != nil {
 			fmt.Fprintln(os.Stderr, err)
@@ -503,11 +509,26 @@ func envelope(t *testing.T, messageID string, body map[string]any) string {
 	return string(raw)
 }
 
-// providerA sends as provider-a's producer: a 12-digit key is its own
-// MiniStack account, whose id is the SenderId the consumers map to
-// provider-a (SQS_PROVIDER_SENDERS in docker-compose.yml, ARCHITECTURE §10).
-var providerA = sqspublisher.NewClient(sqspublisher.ClientConfig{Endpoint: sqsEndpoint, Region: "us-east-1",
-	AccessKeyID: "111111111111", SecretAccessKey: "provider-a-broker-local-secret"})
+// providerA sends as provider-a's producer: its IAM user, with the key
+// MiniStack generated, assumes provider-a's role in account 111111111111,
+// the SenderId the consumers map to provider-a (SQS_PROVIDER_SENDERS in
+// docker-compose.yml, ARCHITECTURE §10, §28). Set by TestMain.
+var providerA *sqs.Client
+
+// newProviderA reads the generated keys from the MiniStack container.
+func newProviderA() (*sqs.Client, error) {
+	out, err := compose("exec", "-T", "ministack", "cat", "/var/lib/wager-credentials/sqs-credentials.json")
+	if err != nil {
+		return nil, fmt.Errorf("read the broker credentials: %w: %s", err, out)
+	}
+	var creds config.BrokerCredentials
+	if err := json.Unmarshal([]byte(out), &creds); err != nil {
+		return nil, fmt.Errorf("parse the broker credentials: %w", err)
+	}
+	k := creds.Providers["provider-a"]
+	return sqspublisher.NewClient(sqspublisher.ClientConfig{Endpoint: sqsEndpoint, Region: "us-east-1",
+		AccessKeyID: k.AccessKeyID, SecretAccessKey: k.SecretAccessKey, RoleARN: k.RoleARN, RoleSessionName: "provider-a"}), nil
+}
 
 // sendSQS publishes to the inbound queue as provider-a with a fresh
 // deduplication id, so a repeated envelope is a delivery the broker cannot

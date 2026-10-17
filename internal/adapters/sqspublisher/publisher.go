@@ -14,8 +14,10 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
 
 	"github.com/medbottle/betting-wallet-go/internal/app"
 )
@@ -27,16 +29,42 @@ type ClientConfig struct {
 	Region          string
 	AccessKeyID     string
 	SecretAccessKey string
+	// RoleARN, when set, is assumed with the static key through STS (same
+	// endpoint and region) and the client acts as that role: the redrive
+	// operator and, in tests, the providers' producers (ARCHITECTURE §28).
+	RoleARN string
+	// RoleSessionName names the assumed-role session (default
+	// "wager-wallet").
+	RoleSessionName string
 	HTTPClient      *http.Client
 }
 
-// NewClient returns an SQS client with static credentials. Shared AWS
-// config files and environment are deliberately not read, so each role
-// uses exactly the credentials it was given (ARCHITECTURE §10).
+// NewClient returns an SQS client with static credentials, or with the
+// temporary credentials of RoleARN assumed with them. Shared AWS config
+// files and environment are deliberately not read, so each role uses
+// exactly the credentials it was given (ARCHITECTURE §10). Assumed-role
+// credentials are fetched on first use and refreshed before they expire.
 func NewClient(cfg ClientConfig) *sqs.Client {
+	var provider aws.CredentialsProvider = credentials.NewStaticCredentialsProvider(cfg.AccessKeyID, cfg.SecretAccessKey, "")
+	if cfg.RoleARN != "" {
+		stsOpts := sts.Options{Region: cfg.Region, Credentials: provider}
+		if cfg.HTTPClient != nil {
+			stsOpts.HTTPClient = cfg.HTTPClient
+		}
+		if cfg.Endpoint != "" {
+			stsOpts.BaseEndpoint = aws.String(cfg.Endpoint)
+		}
+		session := cfg.RoleSessionName
+		if session == "" {
+			session = "wager-wallet"
+		}
+		provider = stscreds.NewAssumeRoleProvider(sts.New(stsOpts), cfg.RoleARN, func(o *stscreds.AssumeRoleOptions) {
+			o.RoleSessionName = session
+		})
+	}
 	opts := sqs.Options{
 		Region:      cfg.Region,
-		Credentials: aws.NewCredentialsCache(credentials.NewStaticCredentialsProvider(cfg.AccessKeyID, cfg.SecretAccessKey, "")),
+		Credentials: aws.NewCredentialsCache(provider),
 	}
 	if cfg.HTTPClient != nil {
 		opts.HTTPClient = cfg.HTTPClient

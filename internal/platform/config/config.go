@@ -63,19 +63,25 @@ type Config struct {
 	SQSEndpoint    string `env:"SQS_ENDPOINT"`
 	AWSRegion      string `env:"AWS_REGION" envDefault:"us-east-1"`
 	SQSEventsQueue string `env:"SQS_EVENTS_QUEUE" envDefault:"wallet-events.fifo"`
+	// SQSCredentialsFile is the broker credentials file (ARCHITECTURE §28):
+	// it supplies the publisher and consumer keys the variables below
+	// leave empty. Locally, MiniStack's init script writes it.
+	SQSCredentialsFile string `env:"SQS_CREDENTIALS_FILE"`
 	// Publisher credentials, separate from the consumer's (ARCHITECTURE §10).
-	SQSPublisherAccessKeyID     string `env:"SQS_PUBLISHER_ACCESS_KEY_ID,required,notEmpty"`
-	SQSPublisherSecretAccessKey string `env:"SQS_PUBLISHER_SECRET_ACCESS_KEY,required,notEmpty"`
+	// Required, from the environment or SQS_CREDENTIALS_FILE.
+	SQSPublisherAccessKeyID     string `env:"SQS_PUBLISHER_ACCESS_KEY_ID"`
+	SQSPublisherSecretAccessKey string `env:"SQS_PUBLISHER_SECRET_ACCESS_KEY"`
 
 	// MetricsAddr is the separate Prometheus listener (ARCHITECTURE §25,
 	// G2); empty disables it.
 	MetricsAddr string `env:"METRICS_ADDR" envDefault:":9090"`
 
 	// Inbound queue and the consumer's own credentials (ARCHITECTURE §10).
-	SQSInboundQueue            string `env:"SQS_INBOUND_QUEUE" envDefault:"wager-transactions.fifo"`
-	SQSInboundDLQ              string `env:"SQS_INBOUND_DLQ" envDefault:"wager-transactions-dlq.fifo"`
-	SQSConsumerAccessKeyID     string `env:"SQS_CONSUMER_ACCESS_KEY_ID,required,notEmpty"`
-	SQSConsumerSecretAccessKey string `env:"SQS_CONSUMER_SECRET_ACCESS_KEY,required,notEmpty"`
+	SQSInboundQueue string `env:"SQS_INBOUND_QUEUE" envDefault:"wager-transactions.fifo"`
+	SQSInboundDLQ   string `env:"SQS_INBOUND_DLQ" envDefault:"wager-transactions-dlq.fifo"`
+	// Consumer credentials, required like the publisher's.
+	SQSConsumerAccessKeyID     string `env:"SQS_CONSUMER_ACCESS_KEY_ID"`
+	SQSConsumerSecretAccessKey string `env:"SQS_CONSUMER_SECRET_ACCESS_KEY"`
 	// SQSProviderSenders maps each producer's broker identity to the
 	// provider its messages act for, as senderId=providerId pairs separated
 	// by commas (ARCHITECTURE §10/§11). The sender id is the SenderId SQS
@@ -142,6 +148,9 @@ func LoadFrom(vars map[string]string) (Config, error) {
 	var c Config
 	if err := env.ParseWithOptions(&c, env.Options{Environment: vars}); err != nil {
 		return Config{}, fmt.Errorf("config: %w", withEnvNames(err))
+	}
+	if err := c.applyCredentialsFile(); err != nil {
+		return Config{}, fmt.Errorf("config: %w", err)
 	}
 	if err := c.Validate(); err != nil {
 		return Config{}, err
@@ -213,6 +222,14 @@ func (c Config) Validate() error {
 	for _, q := range []struct{ name, value string }{{"SQS_INBOUND_QUEUE", c.SQSInboundQueue}, {"SQS_INBOUND_DLQ", c.SQSInboundDLQ}} {
 		if !strings.HasSuffix(q.value, ".fifo") || len(q.value) <= len(".fifo") {
 			errs = append(errs, fmt.Errorf("%s must be a FIFO queue (.fifo)", q.name))
+		}
+	}
+	for _, k := range []struct{ name, id, secret string }{
+		{"SQS_PUBLISHER", c.SQSPublisherAccessKeyID, c.SQSPublisherSecretAccessKey},
+		{"SQS_CONSUMER", c.SQSConsumerAccessKeyID, c.SQSConsumerSecretAccessKey},
+	} {
+		if k.id == "" || k.secret == "" {
+			errs = append(errs, fmt.Errorf("%s_ACCESS_KEY_ID and %s_SECRET_ACCESS_KEY must be set, in the environment or in SQS_CREDENTIALS_FILE", k.name, k.name))
 		}
 	}
 	if c.RunConsumer {

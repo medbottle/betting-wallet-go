@@ -369,7 +369,7 @@ stateDiagram-v2
 - **Reenvio pelo operador**: o `dlqredrive` publica com a identidade do operador, então o `SenderId` do reenvio é o dele. O remetente original vai no atributo de mensagem `originalSenderId`, que o consumidor só aceita quando o `SenderId` é o do operador (`SQS_OPERATOR_SENDER_ID`); de qualquer outro remetente o atributo é ignorado.
   - O `dlqredrive` preenche o atributo com o `SenderId` da mensagem na DLQ (o redrive da fila preserva o `SenderId` e os atributos). Só mantém o atributo que a mensagem já trazia quando ela mesma veio do operador (um segundo redrive); de outro remetente, sobrescreve.
   - A cópia que o consumidor manda à DLQ traz `originalSenderId` com o remetente atribuído, porque o `SenderId` da cópia é o do consumidor.
-- **No MiniStack**: o `SenderId` é a conta de quem envia, e uma chave de acesso de 12 dígitos é a própria conta (verificado em 2026-10-17 com a imagem 1.5.27). Localmente, cada identidade conferida é portanto uma conta: `provider-a` = `111111111111`, `provider-b` = `222222222222`, operador = `333333333333`. As demais chaves (consumidor, publisher) ficam na conta padrão `000000000000`, dona das filas, e não são identidade de provedor nem de operador. O `dlqredrive` acha as filas na conta delas com `SQS_QUEUE_OWNER_ACCOUNT_ID` (`QueueOwnerAWSAccountId`). Como o modo padrão do MiniStack não autentica chaves (premissa A12), qualquer um pode apresentar `111111111111`: os testes locais provam o vínculo do remetente ao provedor no consumidor, e autenticar a identidade no broker é papel do IAM na AWS (premissa A22).
+- **No MiniStack**: o `SenderId` é a conta de quem envia (verificado em 2026-10-17 com a imagem 1.5.27). Localmente, cada identidade conferida age por uma role na própria conta: `provider-a` = `111111111111`, `provider-b` = `222222222222`, operador = `333333333333`; o consumidor e o publisher são usuários IAM da conta `000000000000`, dona das filas, e não são identidade de provedor nem de operador. O `dlqredrive` acha as filas na conta delas com `SQS_QUEUE_OWNER_ACCOUNT_ID` (`QueueOwnerAWSAccountId`). O MiniStack roda com `AUTH=true`: assinaturas e políticas são conferidas, e só as roles dos produtores e do operador podem enviar à fila de entrada (seção 28).
 
 **Ordem no lote após falha transitória**: se a mensagem k do grupo G falhar de forma transitória, as mensagens seguintes de G no mesmo lote **não são processadas**. Elas são liberadas com `ChangeMessageVisibility(0)`. O FIFO não as entrega antes de k enquanto k estiver em voo, então a ordem do grupo é preservada.
 
@@ -420,9 +420,9 @@ stateDiagram-v2
 - Credenciais separadas para consumidor, publisher, operador do `dlqredrive` e cada provedor (produtor).
 - Políticas de fila: o consumidor recebe `ReceiveMessage`, `DeleteMessage` e `ChangeMessageVisibility` na entrada, e `SendMessage` na DLQ de entrada. O publisher recebe somente `SendMessage` em `wallet-events.fifo`. Cada produtor recebe somente `SendMessage` na entrada, e a política de recurso da entrada nega `SendMessage` a qualquer identidade que não seja um produtor ou o operador.
 - As políticas de menor privilégio de cada identidade (consumidor, publisher, operador e produtores) e a política da fila de entrada estão em `deploy/aws/iam-policies.json`, para uma conta AWS real.
-- **IAM no emulador**: o MiniStack (seção 15) só aplica IAM ao SQS quando iniciado com `AUTH=true`, modo que este projeto não usa. Nesse modo as chaves de acesso são geradas pelo próprio emulador, então teriam de ser provisionadas para cada papel e lidas pela aplicação e pelos testes. No modo padrão, o adotado, ele aceita qualquer credencial e não avalia políticas.
-  - Os testes negativos (as credenciais do publisher não conseguem `ReceiveMessage` na entrada; as do consumidor não publicam numa fila de eventos) são pulados com essa razão explícita (seções 22 e 23, premissa A12).
-  - As políticas de `deploy/aws/iam-policies.json` continuam sendo a definição para a AWS.
+- **IAM no emulador**: o MiniStack (seção 15) roda com `AUTH=true`, que aplica IAM ao SQS: confere a assinatura de cada chave de usuário IAM ou sessão STS e avalia as políticas de identidade e de fila. O script de init cria as identidades, as roles e as políticas e grava as chaves geradas num arquivo de credenciais que a aplicação, o `dlqredrive` e os testes leem (seção 28).
+  - Os testes negativos (o publisher não lê a fila de entrada; o consumidor não publica eventos nem envia à própria entrada; a role de um provedor não lê nem envia à DLQ; segredo errado, chave desconhecida e a chave raiz da conta de um provedor são recusados) rodam e passam (seções 22, 23 e 28).
+  - As políticas de `deploy/aws/iam-policies.json` continuam sendo a definição exata para a AWS; as locais usam o curinga de conta e o nome das filas de teste (seção 28).
 
 ---
 
@@ -931,7 +931,7 @@ Tudo abaixo segue as seções 3, 4, 6, 8 e 9; os pontos que os documentos não d
 - O corpo publicado é o `payload` lido do banco. Como a coluna é `JSONB` (seção 9), o conteúdo é idêntico ao snapshot do evento, mas a ordem das chaves e os espaços são os do Postgres (premissa A11).
 - Um evento estacionado gera log de erro com `eventId`, tipo, tentativas, `senderFault` e erro; `outbox_parked_total` veio no slice 10 (seção 25).
 
-**Credenciais do broker** (seção 10): o publisher usa só `SQS_PUBLISHER_ACCESS_KEY_ID`/`SECRET`, sem ler arquivos de configuração da AWS nem o ambiente; o consumidor ganhou as suas no slice 9 (seção 23). O teste negativo existe e foi executado: no modo padrão o MiniStack não aplica IAM (as credenciais do publisher conseguem `ReceiveMessage` na fila de entrada, e até credenciais desconhecidas são aceitas), então o teste é pulado com essa razão explícita. O emulador só aplica IAM com `AUTH=true`, modo que o projeto não usa (seção 10). A separação está configurada, mas não é verificada localmente (limitação, premissa A12).
+**Credenciais do broker** (seção 10): o publisher usa só as suas, sem ler arquivos de configuração da AWS nem o ambiente; o consumidor ganhou as suas no slice 9 (seção 23). Desde a seção 28 elas vêm do arquivo de credenciais (`SQS_CREDENTIALS_FILE`) quando as variáveis não estão definidas, e o MiniStack roda com `AUTH=true`: o teste negativo (`TestBrokerCredentialSeparation`) roda e passa.
 
 **Readiness e startup**: a readiness agora checa PostgreSQL e SQS (`GetQueueAttributes` na fila de eventos, timeout de 1s por checagem, a cada 2s). A URL da fila é resolvida no `OnStart` (passo 4 da seção 14); fila ausente faz o start falhar. Nesse caminho de erro as conexões ociosas do cliente HTTP do SQS são fechadas no próprio `OnStart` (o Fx não chama o `OnStop` de um hook que falhou; o `goleak` pegou isso).
 
@@ -957,7 +957,7 @@ Regras para consumidores: a entrega é at-least-once, então deduplicar por `eve
 - Queda entre publicação e confirmação: um relay "morto" reivindica com lease curto, publica e não marca; dentro do lease ninguém pega as linhas; depois dele outro relay republica com o mesmo `eventId` (o SQS colapsou as cópias: 2 mensagens para 2 eventos) e o morto não consegue mais marcar.
 - Backoff e estacionamento: com o broker inacessível, as tentativas crescem com `last_error` e, no limite, a linha é estacionada e não é mais reivindicada.
 - Falha parcial do lote: um publisher roteirizado (o único lugar com broker simulado; Postgres é real) rejeita entradas alternadas; as aceitas são marcadas e as rejeitadas reagendadas, sem novo claim antes do backoff.
-- Readiness do SQS, fila ausente falhando o start sem vazar goroutines, e o teste negativo de credenciais (pulado com a razão acima).
+- Readiness do SQS, fila ausente falhando o start sem vazar goroutines, e o teste negativo de credenciais (aplicado pelo MiniStack com `AUTH=true` desde a seção 28).
 
 ---
 
@@ -994,11 +994,11 @@ Regras para consumidores: a entrega é at-least-once, então deduplicar por `eve
 
 **Lifecycle**: o consumidor inicia no hook "runners" depois do relay e antes do HTTP, e para em paralelo com os outros no orçamento de 20s. O draining da readiness já pausa o polling no instante 0.
 
-**Credenciais do broker**: o consumidor usa só as suas. O teste negativo do lado do consumidor (as credenciais dele não publicam numa fila de eventos) existe e é pulado no MiniStack, que só aplica IAM com `AUTH=true`, modo que o projeto não usa (premissa A12).
+**Credenciais do broker**: o consumidor usa só as suas. O teste negativo do lado do consumidor (`TestConsumerCredentialSeparation`) roda contra o MiniStack com `AUTH=true` (seção 28).
 
 **Testes**:
 - Unitários (`internal/adapters/sqsconsumer`, com `-race` e `goleak`, SQS falso só aqui): regras do envelope; classificação dos erros e atributos da DLQ; fallback de grupo; falha no envio à DLQ; backoff com teto; ordem dentro do grupo e paralelismo entre grupos; liberação após falha transitória; pausa sem readiness; `Stop` esperando o handler em voo e liberando o resto; lógica do redrive.
-- Integração (Postgres, MiniStack e Keycloak reais, uma fila de entrada e uma DLQ próprias por teste): mensagem do exemplo processada com inbox concluída e eventos com `causationId`; item 4 da seção 13 do desafio (três entregas com dedup diferentes do SQS, um efeito); DLQ explícita para hash divergente, JSON inválido, `OPENING`, provedor desconhecido, valor numérico e conflito de chave, sem linhas de domínio, e o redrive deixando essas mensagens na DLQ; rejeição de negócio; `PENDING_REFERENCE` concluindo a inbox e o worker resolvendo depois; cruzamento HTTP e SQS nas duas ordens e concorrente; item 5 da seção 13 (commit e queda antes do delete, reentrega como duplicata); falhas transitórias até o redrive da fila mandar para a DLQ sem `failureClass`, seguidas do redrive pela ferramenta e do processamento; pausa sem readiness; `Stop` com handler em voo; teste negativo de credenciais (pulado). O teste de lifecycle do Fx roda com o consumidor ligado e verifica `goleak`.
+- Integração (Postgres, MiniStack e Keycloak reais, uma fila de entrada e uma DLQ próprias por teste): mensagem do exemplo processada com inbox concluída e eventos com `causationId`; item 4 da seção 13 do desafio (três entregas com dedup diferentes do SQS, um efeito); DLQ explícita para hash divergente, JSON inválido, `OPENING`, provedor desconhecido, valor numérico e conflito de chave, sem linhas de domínio, e o redrive deixando essas mensagens na DLQ; rejeição de negócio; `PENDING_REFERENCE` concluindo a inbox e o worker resolvendo depois; cruzamento HTTP e SQS nas duas ordens e concorrente; item 5 da seção 13 (commit e queda antes do delete, reentrega como duplicata); falhas transitórias até o redrive da fila mandar para a DLQ sem `failureClass`, seguidas do redrive pela ferramenta e do processamento; pausa sem readiness; `Stop` com handler em voo; teste negativo de credenciais (pulado até a seção 28; desde então aplicado pelo MiniStack com `AUTH=true`). O teste de lifecycle do Fx roda com o consumidor ligado e verifica `goleak`.
 
 ---
 
@@ -1090,7 +1090,7 @@ Uma revisão independente contra o desafio apontou um risco eliminatório (H1, "
 **Testes de H1**:
 - Unitários: mapa de remetentes, atributo aceito só do operador, sessão de role, ordem autenticar → envelope → `providerId`, atributos da cópia na DLQ, redrive mantendo ou sobrescrevendo o atributo, validação da configuração.
 - Integração (MiniStack, Postgres e Keycloak reais): as credenciais de `provider-a` não conseguem criar, reproduzir nem reverter operações de `provider-b` (DLQ com `PROVIDER_MISMATCH`, nenhuma linha nova de transação, inbox, ledger ou outbox, a operação de `provider-b` intacta); a chave da conta padrão e o operador sem `originalSenderId` recebem `FORBIDDEN`; um provedor inativo também; o redrive com a identidade do operador, que resolve as filas na conta dona, é processado como `provider-a`.
-- Múltiplas instâncias: as mensagens da suíte são enviadas com a chave de `provider-a`.
+- Múltiplas instâncias: as mensagens da suíte são enviadas por `provider-a` (desde a seção 28, pela role dele).
 
 **L1, erros de invariante do domínio no submit** (seção 5): `ErrInvalidTransaction` ou `ErrInvalidTransition` vindos de `Apply` caíam no caso não classificado: `503` retryable no HTTP e retry no SQS até o redrive da fila, sem `failureClass`, de modo que o `dlqredrive` os reenviaria. Agora o submit faz o que o worker já fazia (premissa A9): rollback e `FAILED/INTERNAL_INVARIANT_VIOLATION` numa transação separada; no SQS a inbox é concluída com `FAILED` e a mensagem removida (seção 23, G6). O mesmo erro antes da transação (só um erro de programação chega lá) e uma gravação de `FAILED` que falhou de forma não transitória ficam como `app.ErrInvariantViolation`: `500` não retryable no HTTP e DLQ permanente com `INTERNAL_INVARIANT_VIOLATION` no SQS. Erros não classificados continuam transitórios (premissa A6). Testes: os dois erros do domínio injetados (carteira errada no lock, transição inválida) viram `FAILED` com replay, sem movimento nem eventos, pelo HTTP e pelo SQS; unitário do consumidor para a gravação que falha de forma permanente ou transitória.
 
@@ -1149,7 +1149,44 @@ Uma revisão independente, feita como um avaliador estrito a partir de um clone 
 
 **Documentação**: a ordem do `OnStart` da seção 14 ganhou o listener de métricas, que o código abre entre o pool e o JWKS (`internal/bootstrap/bootstrap.go`), e a lista de módulos ganhou o `RunnersModule`.
 
-**Fora destas correções**: autenticar no MiniStack a identidade do produtor (modo `AUTH=true`, com chaves provisionadas para cada papel) continua como limitação (premissas A12 e A22, "Trabalho não concluído"): a revisão confirmou que, localmente, qualquer segredo com a chave de 12 dígitos de um provedor age por ele; na AWS isso é papel do IAM.
+**H-2, identidade do produtor autenticada no broker**: tratada na seção 28.
+
+---
+
+## 28. Identidade no broker aplicada localmente (H-2)
+
+A revisão do avaliador (seção 27) mostrou que, com o MiniStack no modo padrão, qualquer um enviava à fila de entrada como `provider-a` usando a chave `111111111111` e qualquer segredo: a seção 2 do desafio pede que o acesso à mensageria seja controlado por credenciais e políticas do broker, e os dois testes negativos eram pulados. Agora o MiniStack roda com `AUTH=true` no compose, nos testes de integração e na suíte de múltiplas instâncias.
+
+**O que o emulador faz com `AUTH=true`** (verificado no código e na prática, imagem 1.5.27):
+- confere a assinatura SigV4 de chaves de usuários IAM e de sessões STS; segredo errado é `SignatureDoesNotMatch`, chave desconhecida é `InvalidClientTokenId`;
+- avalia as políticas de identidade e, entre contas, as políticas de fila;
+- informa como `SenderId` a conta de quem envia, também para uma sessão de role;
+- nunca autentica a chave raiz de uma conta (`test`, ou um id de 12 dígitos): ela é administradora da própria conta;
+- confere uma role de outra conta contra o ARN da fila montado na conta de quem chama, então as políticas locais usam curinga de conta (`arn:aws:sqs:*:*:<fila>`);
+- trata `SendMessageBatch` como ação própria (na AWS é `sqs:SendMessage`), então a política local do publisher nomeia as duas.
+
+**Identidades locais** (`deploy/ministack/init-queues.sh`, depois das filas):
+
+| Identidade | Conta | Age como | Pode |
+| --- | --- | --- | --- |
+| `wallet-consumer` | `000000000000` | usuário IAM | receber, remover e mudar visibilidade na entrada; enviar à DLQ dela |
+| `wallet-publisher` | `000000000000` | usuário IAM | enviar a `wallet-events.fifo` |
+| `provider-a-producer` / `provider-b-producer` | `000000000000` | assume `wager-producer` em `111111111111` / `222222222222` | enviar à entrada |
+| `wallet-operator` | `000000000000` | assume `wager-operator` em `333333333333` | ler e remover na DLQ de entrada; enviar à entrada |
+
+- A política de recurso de `wager-transactions.fifo` permite `SendMessage` só às três roles; a da DLQ permite ao operador ler e remover. Cada role só confia no usuário do seu produtor (ou do operador).
+- O mapeamento `SenderId` → provedor (`SQS_PROVIDER_SENDERS`) e `SQS_OPERATOR_SENDER_ID` não mudam: as contas das roles são os mesmos `111111111111`, `222222222222` e `333333333333`. O código do consumidor não muda.
+- A raiz da conta dona (`test`) é a administradora do emulador: só o script de init e o harness de testes a usam (criar filas de teste, ler filas); ela não age por nenhum provedor (`FORBIDDEN`).
+
+**Chaves geradas e o arquivo de credenciais**: com `AUTH=true` o MiniStack gera as chaves, então o script as grava em `/var/lib/wager-credentials/sqs-credentials.json` (volume `sqs-credentials`), com o formato `{consumer, publisher, operator: {accessKeyId, secretAccessKey, roleArn?}, providers: {<id>: {...}}}`.
+- A aplicação lê o arquivo por `SQS_CREDENTIALS_FILE` (`config.ReadBrokerCredentials`) e preenche as chaves do publisher e do consumidor que as variáveis `SQS_*_ACCESS_KEY_ID` deixam vazias; as variáveis continuam valendo na AWS. A leitura acontece uma vez no start, como a do ambiente, por isso não recebe contexto.
+- O `dlqredrive` lê a chave e a role do operador do mesmo arquivo (ou de `SQS_OPERATOR_ACCESS_KEY_ID`/`SECRET` e `SQS_OPERATOR_ROLE_ARN`) e assume a role por STS (`aws-sdk-go-v2/service/sts`, `credentials/stscreds`), com a sessão renovada antes de expirar. `sqspublisher.NewClient` ganhou `RoleARN` para isso; o consumidor e o publisher continuam com chave estática.
+- `deploy/ministack/send-as.sh` faz o mesmo para um produtor (usuário → role → envio), para os exemplos do README.
+- Os testes leem o arquivo de dentro do container (integração: `CopyFileFromContainer`; múltiplas instâncias: `docker compose exec`). As filas de cada teste de integração usam nomes dentro dos padrões das políticas locais (`wager-transactions-in-*`, `wager-transactions-dlq-*`, `wallet-events-t-*`) e recebem as mesmas políticas de fila pelo modo `queue-policies` do script.
+
+**Testes**: `TestConsumerCredentialSeparation` (o consumidor não publica eventos nem envia à entrada; a role de um provedor não lê a entrada nem envia à DLQ; a raiz `111111111111` com qualquer segredo é recusada pela política da fila; segredo errado e chave desconhecida são recusados; os caminhos permitidos funcionam) e `TestBrokerCredentialSeparation` (o publisher não lê a entrada nem a fila de eventos; segredo errado é recusado) deixaram de ser pulados. Todos os testes de consumidor, outbox e Fx rodam com as chaves geradas; o teste de lifecycle do Fx carrega as chaves pelo `SQS_CREDENTIALS_FILE`, como no compose.
+
+**Limitação que fica**: quem conhece o comportamento do emulador pode usar a raiz da conta de um provedor, que o MiniStack não autentica, para mudar o IAM dessa conta (por exemplo a política de confiança da role) e então agir pela role: verificado com a imagem 1.5.27. O envio direto com a chave de 12 dígitos, que antes bastava, é recusado. Na AWS a raiz é secreta e o `SenderId` de uma role é o id dela, então o vínculo é autenticado pelo IAM ("Premissas e limitações").
 
 ---
 
@@ -1234,7 +1271,7 @@ Uma revisão independente, feita como um avaliador estrito a partir de um clone 
 - **Erros de carteira, jogador e moeda**: erros de entrada não persistidos.
 - **TTL e backoff**: padrões mantidos, configuráveis por env. Os testes usam TTL de 2s.
 - **Destino dos eventos**: SQS FIFO `wallet-events.fifo`.
-- **IAM no emulador**: o MiniStack só aplica IAM com `AUTH=true`, modo que não usamos (seção 10). Os testes negativos são pulados com essa razão.
+- **IAM no emulador**: o MiniStack roda com `AUTH=true` e aplica IAM ao SQS (seção 28).
 - **Idioma**: documento em português, identificadores em inglês.
 
 ---
@@ -1254,7 +1291,7 @@ Pontos que os documentos deixam abertos e como foram lidos. As seções citadas 
 - **A9. Só violações de invariante gravam `FAILED` no worker** (do banco ou do domínio, `ErrInvalidTransaction`/`ErrInvalidTransition`), para uma linha quebrada não ser tentada para sempre. Erros transitórios e não classificados fazem rollback e a linha é tentada de novo (seção 27, H-1); antes da revisão do avaliador, qualquer erro não transitório gravava `FAILED`. No submit, as violações de invariante (do banco ou do domínio, `ErrInvalidTransaction`/`ErrInvalidTransition`) também gravam `FAILED` (seção 26, L1); os erros não classificados seguem a A6.
 - **A10. O jitter da outbox é aditivo, até uma base**: sorteado em `[0, OUTBOX_BACKOFF_BASE)` (seção 22).
 - **A11. O corpo publicado é o JSONB armazenado**: mesmo conteúdo do snapshot, com ordem de chaves e espaços do Postgres; consumidores devem fazer parse, não comparar bytes.
-- **A12. Separação de credenciais do broker configurada, mas não verificada localmente**: o MiniStack só aplica IAM ao SQS com `AUTH=true`, modo que o projeto não usa, porque nele as chaves são geradas pelo emulador e teriam de ser provisionadas para cada papel e lidas pela aplicação e pelos testes. No modo padrão ele aceita qualquer credencial e não aplica políticas; os testes negativos são pulados com essa razão. As políticas de `deploy/aws/iam-policies.json` continuam sendo a definição para a AWS, sem aplicação local.
+- **A12. Separação de credenciais do broker aplicada localmente** (seção 28): o MiniStack roda com `AUTH=true`, então assinaturas, políticas de identidade e políticas de fila são avaliadas; as chaves, geradas pelo emulador, chegam à aplicação, ao `dlqredrive` e aos testes pelo arquivo de credenciais. Antes da seção 28 o projeto usava o modo padrão, que aceita qualquer credencial, e os testes negativos eram pulados.
 - **A13. O `messageId` do envelope é o `correlationId` no SQS**: o envelope do desafio não tem campo de correlação; o `messageId` vai como `correlationId` e `causationId` da transação e dos eventos.
 - **A14. Os códigos da DLQ reutilizam os existentes**: remetente desconhecido e provedor desconhecido ou inativo são `FORBIDDEN` (o mesmo do HTTP); `providerId` de outro provedor que não o do remetente é `PROVIDER_MISMATCH` (o mesmo do HTTP); hash divergente na inbox é `INVALID_REQUEST`.
 - **A15. Replay sobre uma linha `PENDING` antiga é transitório no SQS**: a inbox só aceita resultados terminais ou `PENDING_REFERENCE`, então a mensagem volta até o worker mover a linha.
@@ -1264,7 +1301,7 @@ Pontos que os documentos deixam abertos e como foram lidos. As seções citadas 
 - **A19. O atraso da outbox é global**: igual em todas as instâncias; agregue com `max`.
 - **A20. No SQS, a identidade autenticada é o remetente no broker**: a seção 2 do desafio pede que a identidade autenticada determine o `providerId` e que a mensageria seja controlada por credenciais e políticas do broker. O consumidor mapeia o `SenderId` (até o `:` de uma sessão de role) para o provedor por configuração, `SQS_PROVIDER_SENDERS`, como o mapper fixo `provider_id` faz no Keycloak, e exige `data.providerId` igual (seção 10).
 - **A21. O redrive preserva o remetente original**: no atributo `originalSenderId`, que o consumidor aceita só de mensagens cujo `SenderId` é o do operador (`SQS_OPERATOR_SENDER_ID`); de outro remetente ele é ignorado (seção 10).
-- **A22. Localmente, cada identidade do broker é uma conta do MiniStack**: ele informa como `SenderId` a conta de quem envia e trata uma chave de 12 dígitos como a própria conta, então provedores e operador usam chaves de 12 dígitos. O modo padrão não autentica chaves (A12): os testes provam o vínculo do remetente ao provedor no consumidor; autenticar o remetente é papel do IAM na AWS.
+- **A22. Localmente, cada produtor e o operador agem por uma role na própria conta do MiniStack**: ele informa como `SenderId` a conta de quem envia, então o usuário IAM de cada produtor assume a role `wager-producer` da conta do provedor (`111111111111`, `222222222222`) e o operador a role `wager-operator` de `333333333333`. A chave raiz dessas contas, que o MiniStack nunca autentica, é recusada pela política da fila de entrada (seção 28).
 - **A23. Depois da primeira de cada grupo, uma mensagem só começa se ainda cabe no visibility do lote**: o deadline do handler mais 5s para liquidá-la; senão ela e as seguintes do grupo são liberadas com visibility 0. A primeira sempre começa, porque a configuração garante que ela cabe (seção 10, seção 26 L5).
 
 **Notas de teste**:
@@ -1280,8 +1317,8 @@ Pontos que os documentos deixam abertos e como foram lidos. As seções citadas 
 - **Resposta perdida de `POST /wallets`**: se o `201` se perde, um novo envio recebe `409 WALLET_ALREADY_EXISTS` sem o id da carteira existente, e não há busca por `(playerId, currency)`. A seção 9 do desafio só exige o conflito; recuperar a resposta perdida fica fora do escopo.
 - **Precedência de erros**: erro de entrada prevalece sobre conflito de idempotência (seção 6).
 - **Ordem dos eventos de saída**: não é garantida entre publishers. Os consumidores usam `walletVersion`.
-- **IAM no emulador**: o MiniStack só aplica IAM ao SQS com `AUTH=true` (verificado em 2026-10-17 com a imagem 1.5.27: um usuário IAM sem política recebe `AccessDenied` e uma chave desconhecida é recusada). O projeto usa o modo padrão, em que qualquer credencial é aceita e nenhuma política é avaliada, porque com `AUTH=true` as chaves seriam geradas pelo emulador e teriam de ser provisionadas para cada papel e lidas pela aplicação e pelos testes. As credenciais separadas estão configuradas e os testes negativos (publisher e consumidor) são pulados com essa razão. As políticas de menor privilégio de cada identidade para uma conta AWS real estão em `deploy/aws/iam-policies.json` (seção 10), sem aplicação local.
-- **Identidade do remetente no emulador**: no modo padrão o MiniStack aceita qualquer chave, então qualquer um pode apresentar a chave `111111111111` de `provider-a`. Os testes locais provam que o consumidor vincula o `SenderId` ao provedor e recusa o resto; que só o produtor de cada provedor consiga aquele `SenderId` é garantido pelo IAM na AWS (A12, A22).
+- **Chave raiz no emulador**: mesmo com `AUTH=true`, o MiniStack nunca confere o segredo da chave raiz de uma conta (`test` ou um id de 12 dígitos; verificado no código e na prática com a imagem 1.5.27). A política da fila de entrada recusa a raiz das contas dos provedores, o que barra o envio direto com `111111111111` e qualquer segredo; mas quem conhece essa raiz pode mudar o IAM da conta (por exemplo a política de confiança da role) e então agir pela role. Na AWS as credenciais raiz são secretas. É uma limitação do emulador que nenhum modo dele fecha (seção 28).
+- **Chaves do broker mudam a cada start do MiniStack**: ele guarda o estado em memória, como as filas; depois de reiniciar o `ministack`, reinicie a aplicação para ela ler as chaves novas (README, "Queues").
 - **`messageId` por provedor na inbox**: a seção 6.5 do desafio fixa a unicidade em `(consumerName, messageId)`; o `consumer_name` leva o provedor autenticado (seção 27, L-2), então provedores diferentes podem usar o mesmo `messageId`. Dentro de um provedor, reutilizar um `messageId` para outra operação continua indo para a DLQ como `INVALID_REQUEST`.
 - **`StartMessageMoveTask`**: o suporte a FIFO no emulador não é garantido. Usamos `cmd/dlqredrive`.
 - **Retenção**: sem limpeza de `inbox_messages` e `outbox_events` publicados neste escopo, já que a aplicação não tem `DELETE`. Uma rotina de retenção ficaria para trabalho futuro, executada com outro papel.
@@ -1295,7 +1332,7 @@ Pontos que os documentos deixam abertos e como foram lidos. As seções citadas 
 - **Teste de carga** (diferencial da seção 14 do desafio): sem comando, throughput nem p50/p95/p99. A pilha de três instâncias e as métricas da seção 25 são a base para ele.
 - **Tracing com OpenTelemetry e dashboards** (diferenciais da seção 12): não implementados. Os logs JSON carregam `correlationId`, `messageId`, `transactionId`, `walletId` e `providerId`.
 - **Regras de alerta**: as séries a alertar estão na seção 25; as regras dependem de uma stack de monitoramento fora do escopo.
-- **Políticas do broker aplicadas**: definidas em `deploy/aws/iam-policies.json`, mas não provisionadas nem verificadas localmente: o MiniStack só as aplicaria com `AUTH=true` (premissa A12).
+- **Raiz das contas no emulador**: o MiniStack não autentica a chave raiz de uma conta; ver "Premissas e limitações" e a seção 28.
 - **Retenção de `inbox_messages` e `outbox_events`**: sem rotina de limpeza (ver acima).
 - **Ledger de partidas dobradas** (opcional na seção 6.4 do desafio): não adotado; o ledger é de lançamentos simples por carteira.
 - **Integração contínua**: o repositório não tem pipeline. gofmt, vet, testes unitários, integração e múltiplas instâncias, com e sem `-race`, rodam pelos comandos do README.
