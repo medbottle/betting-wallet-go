@@ -329,7 +329,8 @@ stateDiagram-v2
   4. **Esgotamento**: com `attempts >= OUTBOX_MAX_ATTEMPTS` (padrão 20), ou com `SenderFault=true` repetido até esse limite, a entrada recebe `parked_at = now()`.
      - A entrada nunca é removida.
      - A métrica `outbox_parked_total` é incrementada e há alerta.
-     - O reprocessamento é manual, zerando `parked_at`.
+     - O reprocessamento é manual, zerando `parked_at` e `attempts` (comando no README, "Outbound events").
+  5. **Broker indisponível**: enquanto a checagem de readiness do SQS falha, o relay não reivindica nada, então uma queda não consome tentativas nem estaciona eventos (seção 27, M-1).
 - **Trabalho abandonado**:
   - Lease expirado volta a ser elegível para claim.
   - Uma queda entre a publicação e a marcação causa republicação com o mesmo `eventId`. A entrega é at-least-once, e os consumidores deduplicam por `eventId`.
@@ -1063,7 +1064,7 @@ Séries para alertar: `wager_transactions_total{status="FAILED"}`, `outbox_parke
 7. `REFUND` e `ROLLBACK` aceitos em `PENDING_REFERENCE` por uma instância que é morta: outra instância resolve o `REFUND` e expira o `ROLLBACK` como `REFERENCE_NOT_FOUND`.
 8. Reinício das três instâncias (G9).
 9. Postgres parado: readiness 503 nas três, HTTP 503 retryable, consumidores pausados, nada na DLQ; depois da volta, tudo processado uma vez e o retry HTTP aplica a operação.
-10. SQS pausado: readiness 503, operações HTTP commitam com os eventos na outbox; depois da volta, todo evento publicado.
+10. SQS pausado: readiness 503, operações HTTP commitam com os eventos na outbox, os relays não reivindicam nada (nenhuma tentativa consumida, seção 27, M-1); depois da volta, todo evento publicado.
 
 Todo teste termina com os invariantes: nenhuma operação pendente, reconciliação consistente com o saldo esperado, um lançamento por operação processada que move dinheiro, outbox esvaziada sem estacionados e cada `eventId` commitado recebido em `wallet-events.fifo` (repetições são permitidas e logadas).
 
@@ -1126,6 +1127,11 @@ Uma revisão independente, feita como um avaliador estrito a partir de um clone 
 - `classify` trata `57P01`, `57P02`, `57P03` e a classe `53` como transitórios. Eles não entram em `db_concurrency_conflicts_total`, que continua contando só conflitos de concorrência.
 - Um erro não classificado que se repete deixa a linha em retry a cada iteração do worker, com log `worker step failed`; isso é preferível a perder a operação, e o alerta vem do log e da linha ainda pendente.
 - Testes: `TestClassify` com os novos códigos; integração `TestWorkerRetriesTerminatedConnection` (encerra a sessão do worker com `pg_terminate_backend` enquanto ele espera o lock; a operação continua pendente e é aplicada quando a referência chega) e `TestWorkerRetriesUnclassifiedError` (um `XX000` injetado no lock). Os dois falham com o código anterior.
+
+**M-1, a outbox consumia tentativas durante uma queda do SQS** (seção 3 do desafio, indisponibilidade temporária do SQS): o relay reivindicava e tentava publicar mesmo com o broker fora, e cada claim somava uma tentativa; uma queda de mais de cerca de 64 minutos estacionava todo evento commitado, que só voltava com SQL manual.
+- O relay agora só reivindica quando a checagem `sqs` da readiness está `ok`, como o consumidor pausa o polling (seção 10). Vale só a checagem do SQS: o draining não interrompe a publicação, e uma queda do Postgres já faz o claim falhar sem consumir tentativas. A transição é logada (`outbox relay paused`/`resumed`).
+- O estacionamento continua como proteção para falhas por entrada (por exemplo `SenderFault`) e o README traz o comando que devolve os eventos estacionados à fila, zerando `parked_at` e `attempts`; o `eventId` não muda.
+- Testes: unitário `TestRelayPausesWhileBrokerNotReady`; na suíte de múltiplas instâncias, `TestSQSOutage` agora exige que nenhum evento da carteira tenha tentativa consumida durante a queda.
 
 ---
 

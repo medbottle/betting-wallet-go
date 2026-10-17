@@ -259,8 +259,8 @@ func TestPostgresOutage(t *testing.T) {
 // TestSQSOutage: CHALLENGE §3, SQS temporarily unavailable. MiniStack is
 // frozen (docker pause; a restart would wipe its in-memory queues, which
 // real SQS never does). Readiness fails, HTTP operations still commit with
-// their events in the outbox, and once SQS is back every event is
-// published with its original eventId.
+// their events in the outbox, the relays claim nothing (no attempts used),
+// and once SQS is back every event is published with its original eventId.
 func TestSQSOutage(t *testing.T) {
 	w := openWallet(t, instances[0], "50.00")
 	mustCompose(t, "pause", "ministack")
@@ -283,10 +283,16 @@ func TestSQSOutage(t *testing.T) {
 			t.Fatalf("bet %d during the SQS outage: %d %s", i, r.Status, r.Raw)
 		}
 	}
-	waitFor(t, 30*time.Second, "publish attempts to fail", func() bool {
-		return count(t, `SELECT count(*) FROM outbox_events WHERE aggregate_id = $1 AND published_at IS NULL AND attempts > 0`, w.ID) > 0
-	})
+	// The relays pause while the broker is not ready: the events wait in the
+	// outbox without using attempts, so a long outage parks nothing
+	// (ARCHITECTURE §27, M-1).
 	time.Sleep(10 * time.Second)
+	if n := count(t, `SELECT count(*) FROM outbox_events WHERE aggregate_id = $1 AND published_at IS NULL`, w.ID); n == 0 {
+		t.Fatal("no event waiting in the outbox during the outage")
+	}
+	if n := count(t, `SELECT count(*) FROM outbox_events WHERE aggregate_id = $1 AND published_at IS NULL AND attempts > 0`, w.ID); n != 0 {
+		t.Fatalf("%d events used publish attempts while the broker was not ready", n)
+	}
 	mustCompose(t, "unpause", "ministack")
 	paused = false
 	ctx := ctxT(t)

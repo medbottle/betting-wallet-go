@@ -114,6 +114,17 @@ relay: `MessageGroupId` is the wallet id, `MessageDeduplicationId` the
 message attributes. Delivery is at-least-once; deduplicate by `eventId` and
 order per wallet by `walletVersion`. Full contract: ARCHITECTURE.md §22.
 
+While the SQS readiness check fails, the relay claims nothing, so an outage
+uses no attempts. An event that still fails 20 times (`OUTBOX_MAX_ATTEMPTS`)
+is parked and counted in `outbox_parked_total`; once the cause is fixed,
+put parked events back in the queue as the schema owner:
+
+```sh
+docker compose exec postgres psql -U wallet_owner -d wallet -c "UPDATE outbox_events SET parked_at = NULL, attempts = 0, next_attempt_at = now() WHERE parked_at IS NOT NULL"
+```
+
+They keep their `eventId`, so consumers deduplicate any earlier delivery.
+
 Read them from the host:
 
 ```sh
@@ -500,7 +511,7 @@ Postgres, Keycloak and MiniStack, and simulates the failures of CHALLENGE §3:
 | `TestReferenceResolvedAfterInstanceKill` | pending references held by a killed instance are resolved or expired by another |
 | `TestRestartAllInstances` | all three killed and restarted: replays, pending references and queued messages survive |
 | `TestPostgresOutage` | Postgres stopped: readiness 503, HTTP 503 retryable, consumers paused, no DLQ; recovery |
-| `TestSQSOutage` | MiniStack paused: HTTP keeps committing, events wait in the outbox and are all published after recovery |
+| `TestSQSOutage` | MiniStack paused: HTTP keeps committing, the relays pause, events wait in the outbox without using attempts and are all published after recovery |
 
 Each test ends with the invariant checks: nothing left pending, reconciliation
 consistent with the expected balance, one ledger entry per money-moving

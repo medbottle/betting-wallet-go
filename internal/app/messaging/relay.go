@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
+	"sync/atomic"
 	"time"
 
 	"github.com/medbottle/betting-wallet-go/internal/app"
@@ -25,6 +26,11 @@ type RelayConfig struct {
 	MaxAttempts    int
 	// Jitter returns a value in [0, n); nil uses math/rand/v2.
 	Jitter func(n int64) int64
+	// BrokerReady reports whether the broker passed its last readiness
+	// check. While it is false the relay claims nothing, so an outage does
+	// not use up attempts and park events (ARCHITECTURE §27, M-1). nil
+	// means always ready.
+	BrokerReady func() bool
 }
 
 // Relay publishes outbox rows.
@@ -35,6 +41,7 @@ type Relay struct {
 	cfg       RelayConfig
 	logger    *slog.Logger
 	metrics   app.Metrics
+	paused    atomic.Bool
 }
 
 // NewRelay wires the relay to its ports. A nil metrics discards the
@@ -54,8 +61,18 @@ func NewRelay(tx app.TxRunner, publisher app.EventPublisher, clock app.Clock, cf
 //     exhausted. A failure of the whole call reschedules the whole batch.
 //
 // If the process dies between 2 and 3, the lease expires and another relay
-// republishes with the same eventId. didWork is false when nothing was due.
+// republishes with the same eventId. didWork is false when nothing was due
+// or the broker is not ready (nothing is claimed then).
 func (r *Relay) RelayOnce(ctx context.Context) (didWork bool, err error) {
+	if r.cfg.BrokerReady != nil && !r.cfg.BrokerReady() {
+		if r.paused.CompareAndSwap(false, true) {
+			r.logger.Warn("broker not ready, outbox relay paused")
+		}
+		return false, nil
+	}
+	if r.paused.CompareAndSwap(true, false) {
+		r.logger.Info("broker ready, outbox relay resumed")
+	}
 	var batch []app.OutboxRecord
 	err = r.tx.InTx(ctx, app.TxOptions{}, func(ctx context.Context, repos app.Repos) error {
 		var err error

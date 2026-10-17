@@ -49,8 +49,11 @@ func newPublisher(cfg config.Config) (*sqspublisher.Publisher, publisherTranspor
 	return sqspublisher.New(client, cfg.SQSEventsQueue), publisherTransport{transport}
 }
 
+// sqsCheckName is the readiness check of the events queue.
+const sqsCheckName = "sqs"
+
 func newSQSCheck(p *sqspublisher.Publisher) health.Check {
-	return health.Check{Name: "sqs", Fn: p.HealthCheck}
+	return health.Check{Name: sqsCheckName, Fn: p.HealthCheck}
 }
 
 func registerQueueResolution(lc fx.Lifecycle, p *sqspublisher.Publisher, t publisherTransport, cfg config.Config, logger *slog.Logger) {
@@ -78,7 +81,7 @@ var OutboxRelayModule = fx.Module("outbox_relay",
 )
 
 func newRelay(cfg config.Config, tx app.TxRunner, publisher app.EventPublisher, clock app.Clock, ids app.IDGenerator, logger *slog.Logger,
-	metrics app.Metrics) *messaging.Relay {
+	metrics app.Metrics, readiness *health.Readiness) *messaging.Relay {
 	host, err := os.Hostname()
 	if err != nil || host == "" {
 		host = "unknown-host"
@@ -92,6 +95,9 @@ func newRelay(cfg config.Config, tx app.TxRunner, publisher app.EventPublisher, 
 		BackoffBase:    cfg.OutboxBackoffBase,
 		BackoffMax:     cfg.OutboxBackoffMax,
 		MaxAttempts:    cfg.OutboxMaxAttempts,
+		// Only the SQS check: draining does not stop publishing, and a
+		// Postgres outage already fails the claim without using attempts.
+		BrokerReady: func() bool { return readiness.Report().Checks[sqsCheckName] == health.StateOK },
 	}, logger.With(slog.String("component", "outbox_relay")), metrics)
 }
 

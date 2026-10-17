@@ -1,8 +1,14 @@
 package messaging
 
 import (
+	"context"
+	"io"
+	"log/slog"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/medbottle/betting-wallet-go/internal/app"
 )
 
 func TestRelayBackoff(t *testing.T) {
@@ -27,5 +33,37 @@ func TestRelayBackoff(t *testing.T) {
 		if d := r.next(t0, 1).Sub(t0); d < 2*time.Second || d >= 3*time.Second {
 			t.Fatalf("delay %v outside [2s, 3s)", d)
 		}
+	}
+}
+
+// countingRunner records transactions and runs none.
+type countingRunner struct{ calls *atomic.Int64 }
+
+func (c countingRunner) InTx(context.Context, app.TxOptions, func(context.Context, app.Repos) error) error {
+	c.calls.Add(1)
+	return nil
+}
+
+// TestRelayPausesWhileBrokerNotReady: no claim (and so no attempt) while
+// the broker's readiness check fails (ARCHITECTURE §27, M-1).
+func TestRelayPausesWhileBrokerNotReady(t *testing.T) {
+	var calls atomic.Int64
+	var ready atomic.Bool
+	r := NewRelay(countingRunner{&calls}, nil, nil, RelayConfig{BrokerReady: ready.Load},
+		slog.New(slog.NewJSONHandler(io.Discard, nil)), nil)
+	for range 3 {
+		if did, err := r.RelayOnce(context.Background()); did || err != nil {
+			t.Fatalf("not ready: did=%v err=%v", did, err)
+		}
+	}
+	if n := calls.Load(); n != 0 {
+		t.Fatalf("%d claims while the broker was not ready", n)
+	}
+	ready.Store(true)
+	if _, err := r.RelayOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("%d claims once ready, want 1", n)
 	}
 }
