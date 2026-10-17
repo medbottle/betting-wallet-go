@@ -731,7 +731,7 @@ Versão do Go: a última estável no momento da implementação, fixada em `go.m
 
 **IDs vêm de quem chama** (aprovado): construtores e regras recebem os IDs (carteira, transação, lançamento) e uma função `newID func() uuid.UUID` para lançamentos e eventos. Em produção ela é o `IDGenerator` (UUIDv7) da aplicação; nos testes, uma sequência determinística. O domínio não gera IDs nem lê o relógio: o instante `now` também é parâmetro.
 
-**Regras verificadas mecanicamente**: o teste de arquitetura analisa o AST de `internal/domain` (fora de testes) e falha com `float32`/`float64`, `strconv.ParseFloat`/`FormatFloat`/`AppendFloat` ou chamadas a `panic`. Um teste de integração compara os códigos das categorias B e D com o CHECK `wager_transactions_failure_code`.
+**Regras verificadas mecanicamente**: o teste de arquitetura analisa o AST de todo o código fora de testes em `internal/`, `cmd/` e `migrations/` (desde a revisão de conformidade, seção 26; antes, só `internal/domain`) e falha com `float32`/`float64`, `strconv.ParseFloat`/`FormatFloat`/`AppendFloat` ou chamadas a `panic`. As únicas exceções estão numa allow-list explícita, cada uma com o motivo: segundos e contagens do Prometheus em `internal/platform/metrics` e o re-panic do `TxRunner` depois do rollback em `internal/adapters/postgres`; o domínio não tem exceção, e uma entrada que nada usa mais faz o teste falhar. Um teste de integração compara os códigos das categorias B e D com o CHECK `wager_transactions_failure_code`.
 
 **Money**:
 - `Parse` aplica a regra estrita da seção 2 com multiplicação-soma checada (overflow é verificado mesmo sendo impossível com 12 dígitos).
@@ -1084,6 +1084,9 @@ Uma revisão independente contra o desafio apontou um risco eliminatório (H1, "
 **L6, saldo amarrado ao ledger no banco** (seções 5.3 e 6.2 do desafio): nada no banco ligava uma mudança de saldo ao seu lançamento; o próprio teste de reconciliação mudava saldo e versão como owner sem lançamento, e o banco aceitava. A migration `0008` acrescenta o trigger de restrição adiado `wallets_ledger_link` (seção 16). Testes: schema (abertura com e sem crédito, abertura zero, mudança com o lançamento antes ou depois, sem lançamento, lançamento de outro saldo de partida ou de outra versão, também como owner, e a recusa no `COMMIT` real sem alterar o saldo); repositório (`UpdateBalance` sem lançamento falha no commit como `ErrInvariantViolation`); a reconciliação mostra que a adulteração simples é recusada e só gera divergência com o trigger desligado na transação.
 
 **I1, autorização antes da busca** (seção 13 do desafio, nenhuma exposição de dados em acesso não autorizado): `GET /wagering/transactions/{id}` carregava a transação antes de autorizar, então um token sem papel reconhecido recebia 404 ou 403 conforme ela existisse (e 400 para um id malformado). Agora `CanLookUpTransactions()` recusa com `403 FORBIDDEN` quem não tem o papel `provider` nem `wallet-internal`, antes de ler o id e de buscar; a checagem de dono depois da busca continua igual (outro provedor: 404). A outra rota de leitura já recusava antes da busca. Teste do roteador com o middleware real e um serviço que conta as buscas: sem papel, 403 para id existente, inexistente e malformado, sem nenhuma busca; os provedores continuam com 200 e 404.
+
+**Testes que faltavam** (seção 13 do desafio e CLAUDE.md):
+- **L3, guarda de float e panic**: passou de `internal/domain` para todo o código fora de testes em `internal/`, `cmd/` e `migrations/` (adapters que decodificam e gravam dinheiro inclusive), com a allow-list explícita da seção 17 (segundos e contagens do Prometheus; re-panic do `TxRunner`). Uma entrada sem uso falha, e o domínio não pode ter entrada.
 
 ---
 

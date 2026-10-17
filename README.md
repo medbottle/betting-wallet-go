@@ -497,8 +497,10 @@ It fails if:
 
 - `internal/domain` depends on fx, net/http, the AWS SDK, pgx or database/sql,
   or on anything outside the standard library, google/uuid and itself;
-- domain code (outside tests) uses `float32`/`float64`, `strconv` float
-  functions or `panic`;
+- any code outside tests under `internal/`, `cmd/` or `migrations/` uses
+  `float32`/`float64`, `strconv` float functions or `panic`, except the
+  allow-listed Prometheus seconds and counts in `internal/platform/metrics`
+  and the TxRunner's re-panic after rollback (an unused entry fails too);
 - `internal/app` depends on `internal/adapters`;
 - any package other than `internal/bootstrap` and `cmd/*` imports fx.
 
