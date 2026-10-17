@@ -4,7 +4,7 @@ Distributed processing of bets and wallet movements in Go (Uber Fx, PostgreSQL,
 SQS, Keycloak). Spec: [docs/CHALLENGE.md](docs/CHALLENGE.md). Design decisions:
 [ARCHITECTURE.md](ARCHITECTURE.md).
 
-> **Status: slice 10 (metrics, multi-instance tests, failure simulations).**
+> **Status: complete: all ten slices and the compliance-review fixes.**
 > The authenticated HTTP API, the SQS consumer (with inbox, DLQ and the
 > `dlqredrive` tool), the reference worker and the outbox relay run on the
 > full schema, domain and persistence adapter; committed events are
@@ -25,6 +25,8 @@ SQS, Keycloak). Spec: [docs/CHALLENGE.md](docs/CHALLENGE.md). Design decisions:
 | Docker + Docker Compose v2 | recent | local stack, integration tests |
 | C toolchain (gcc) | any | only for `go test -race` (cgo) |
 | make | optional | shortcuts below; every target is a plain command |
+| curl and jq | any | the authenticated API examples (`jq` extracts the token) |
+| AWS CLI v2 | optional | the SQS examples from the host; without it, run them inside the MiniStack container (see "Queues") |
 
 ## Local stack
 
@@ -94,6 +96,14 @@ To list them from the host (any AWS CLI, with dummy credentials):
 
 ```sh
 AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test aws --endpoint-url http://localhost:4566 --region us-east-1 sqs list-queues
+```
+
+Without a local AWS CLI, run any of the `aws` commands in this README inside
+the emulator container, which ships one. Pass the credentials with `-e`, and
+pass a message body inline instead of with `file://`:
+
+```sh
+docker compose exec -e AWS_ACCESS_KEY_ID=test -e AWS_SECRET_ACCESS_KEY=test ministack aws --endpoint-url http://localhost:4566 --region us-east-1 sqs list-queues
 ```
 
 ### Outbound events
@@ -345,10 +355,26 @@ returns the stored outcome with `"idempotentReplay": true`:
 curl -s -X POST http://localhost:8081/wagering/transactions -H "Authorization: Bearer $PROVIDER" -H 'Content-Type: application/json' -H 'Idempotency-Key: provider-a:transaction-123' -d '{"providerId":"provider-a","externalTransactionId":"transaction-123","playerId":"0192f28f-5dc0-7d58-bdb2-814ad6a0f4a1","walletId":"<walletId>","roundId":"round-987","gameId":"fortune-chimp","kind":"BET","money":{"amount":"25.00","currency":"BRL"}}'
 ```
 
-Reads and reconciliation:
+Refund that bet. A reversal names the original operation in
+`referenceExternalTransactionId`, and its amount must equal the original's:
+
+```sh
+curl -s -X POST http://localhost:8081/wagering/transactions -H "Authorization: Bearer $PROVIDER" -H 'Content-Type: application/json' -H 'Idempotency-Key: provider-a:transaction-124' -d '{"providerId":"provider-a","externalTransactionId":"transaction-124","playerId":"0192f28f-5dc0-7d58-bdb2-814ad6a0f4a1","walletId":"<walletId>","roundId":"round-987","gameId":"fortune-chimp","kind":"REFUND","money":{"amount":"25.00","currency":"BRL"},"referenceExternalTransactionId":"transaction-123"}'
+```
+
+Reads and reconciliation. A transaction can be read by its internal id or
+by the provider's external id; wallet reads are for the internal service:
 
 ```sh
 curl -s http://localhost:8081/providers/provider-a/wagering/transactions/transaction-123 -H "Authorization: Bearer $PROVIDER"
+```
+
+```sh
+curl -s http://localhost:8081/wagering/transactions/<transactionId> -H "Authorization: Bearer $PROVIDER"
+```
+
+```sh
+curl -s http://localhost:8081/wallets/<walletId> -H "Authorization: Bearer $INTERNAL"
 ```
 
 ```sh

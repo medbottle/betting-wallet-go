@@ -467,6 +467,17 @@ stateDiagram-v2
 
 **Registro de provedores**: a tabela `providers` (seed `provider-a`, `provider-b`) é consultada por HTTP e SQS. Provedor desconhecido ou inativo é rejeitado. Não há vínculo entre provedor e jogador/carteira: qualquer provedor registrado pode operar qualquer carteira.
 
+**Por quê** (seção 2 do desafio: justificar o IdP, a validação de credenciais e o modelo de permissões):
+- **Keycloak** é o IdP que o desafio recomenda. Implementa OAuth 2.0/OIDC padrão, roda no Docker Compose sem conta externa e se provisiona sozinho pelo import do realm: clients, papéis e mappers ficam versionados em `deploy/keycloak/realm-wagering.json`, então todo checkout limpo tem as mesmas identidades de teste. Cadastro de senhas e emissão própria de tokens ficam fora do escopo, como o desafio pede.
+- **`client_credentials`**: quem chama a API são serviços (os provedores de jogos e o serviço interno de carteiras), não pessoas. O fluxo não envolve usuários nem senhas de usuário, e cada client tem um segredo próprio, revogável no IdP sem mudar a aplicação.
+- **Validação local do JWT**: assinatura conferida com o JWKS em cache, `iss` exato, `aud` e expiração dispensam uma chamada ao IdP por requisição. A latência e a disponibilidade da API não dependem do Keycloak a cada chamada, e a rotação de chaves é atendida pelo refetch em `kid` desconhecido. Aceitar só RS256 impede a troca de algoritmo (`none`, ou HS256 assinado com a chave pública).
+- **Client roles do recurso `wallet-api`**: as permissões são atribuídas no IdP, por client, e a aplicação lê só os papéis do recurso que ela é, ignorando os de outros clients. Dois papéis bastam para as regras do desafio: `provider` opera e lê apenas o que é seu, e `wallet-internal` concentra as operações de carteira, que o desafio restringe ao serviço interno. Provedores não leem carteiras porque o desafio não pede e isso reduz a exposição de dados.
+- **Claim fixa `provider_id`**: o `providerId` autorizado vem do token emitido pelo IdP, nunca do corpo, como exige a seção 2 do desafio; o corpo só é conferido contra ele.
+
+**Alternativas**:
+- Introspecção do token a cada requisição (RFC 7662): revogação imediata, mas cada chamada passaria a depender da disponibilidade do IdP.
+- Chaves de API próprias por provedor: mais simples, mas seriam emissão própria de credenciais, fora do escopo do desafio.
+
 ---
 
 ## 12. Códigos de falha (estáveis)
@@ -537,7 +548,7 @@ Há dois corpos de resposta:
 
 **Outros endpoints**:
 - `POST /wallets`: `201`; conflito `409 WALLET_ALREADY_EXISTS`; entrada inválida `400`.
-- `GET` de transação: `200` com o recurso, qualquer que seja o status (o `422` vale só para o `POST`); `404` se a transação não existe ou pertence a outro provedor.
+- `GET` de transação: `200` com o recurso, qualquer que seja o status (o `422` vale só para o `POST`); `404` se a transação não existe ou pertence a outro provedor; `403 FORBIDDEN` antes de qualquer leitura para um token sem o papel `provider` nem `wallet-internal`, exista a transação ou não (seção 26, I1).
 - `GET` de carteira e de ledger: `200` ou `404`.
 - `POST /wallets/{id}/reconciliation`: `200` mesmo com divergência (`consistent: false`).
 
