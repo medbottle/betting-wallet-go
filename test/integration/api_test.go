@@ -332,7 +332,8 @@ func TestAPIReadsAndIsolation(t *testing.T) {
 
 func TestAPILedgerAndReconciliation(t *testing.T) {
 	t.Parallel()
-	e := newAPIEnv(t)
+	logs := &logBuffer{}
+	e := newAPIEnv(t, withLogs(logs))
 	w := e.openWallet(t, "100.00")
 	for i, amount := range []string{"1.00", "2.00", "3.00", "4.00"} {
 		e.submit(t, "provider-a", op(w, "provider-a", "BET", amount, "page-"+string(rune('a'+i))))
@@ -418,6 +419,17 @@ func TestAPILedgerAndReconciliation(t *testing.T) {
 	}
 	if got := e.call(t, http.MethodGet, "/wallets/"+w.ID, "wallet-internal", nil).amount("balance"); got != "91.00" {
 		t.Errorf("reconciliation changed the balance to %s", got)
+	}
+
+	// CHALLENGE §9: the divergence is also reported in the logs and a metric.
+	logged := logs.find(t, "reconciliation divergence", map[string]string{
+		"level": "ERROR", "walletId": w.ID, "storedBalance": "91.00", "calculatedBalance": "90.00", "difference": "1.00",
+	})
+	if len(logged) != 1 {
+		t.Errorf("divergence log records = %d, want 1", len(logged))
+	}
+	if got := scrape(t, e.metrics)["reconciliation_divergences_total"]; got != 1 {
+		t.Errorf("reconciliation_divergences_total = %v, want 1 (consistent reconciliations do not count)", got)
 	}
 }
 

@@ -1088,6 +1088,8 @@ Uma revisão independente contra o desafio apontou um risco eliminatório (H1, "
 **Testes que faltavam** (seção 13 do desafio e CLAUDE.md):
 - **L3, guarda de float e panic**: passou de `internal/domain` para todo o código fora de testes em `internal/`, `cmd/` e `migrations/` (adapters que decodificam e gravam dinheiro inclusive), com a allow-list explícita da seção 17 (segundos e contagens do Prometheus; re-panic do `TxRunner`). Uma entrada sem uso falha, e o domínio não pode ter entrada.
 - **L4, `t.Fatal` fora da goroutine do teste**: helpers chamados de goroutines (`submit`, `call`, `token`, `sendSQS`, `envelope`, `relayUntilIdle`) podiam chamar `t.Fatal`, que só pode rodar na goroutine do teste. As goroutines usam agora variantes que devolvem o erro ou o reportam com `t.Error` (`goSubmit`, `goSendSQS`, `relayUntilIdleErr`), e os envelopes são montados antes do `go`.
+- **Divergência na reconciliação** (seção 9 do desafio: resposta, logs e métrica): o teste de reconciliação, que só olhava a resposta, agora exige o registro de erro `reconciliation divergence` com `walletId` e os três valores, e `reconciliation_divergences_total = 1` (as reconciliações consistentes não contam).
+- **Campos dos logs** (seção 12 do desafio): com o logger de produção (`logging.New`) capturado, uma operação pelo HTTP e outra pelo SQS geram o registro `wager transaction submitted` com `correlationId`, `transactionId`, `walletId` e `providerId` (e `messageId` no SQS); nenhuma linha traz um token (nem o forjado, recusado com o motivo logado), o esquema `Bearer`, o corpo HTTP, o envelope SQS ou o `playerId`. Os dois testes falham se o `walletId` sai do log ou a métrica deixa de ser incrementada.
 
 ---
 

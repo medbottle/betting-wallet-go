@@ -6,8 +6,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -198,7 +196,7 @@ func startConsumer(t *testing.T, e apiEnv, q inboundQueues, opts consumerOpts) (
 		Queue: q.queue, DLQ: q.dlq, WaitSeconds: 1, MaxMessages: 10,
 		HandlerTimeout: opts.handlerTimeout, Visibility: opts.visibility, BackoffMax: opts.backoffMax, PauseInterval: 50 * time.Millisecond,
 		Senders: providerSenders, OperatorSenderID: operatorKey,
-	}, slog.New(slog.NewJSONHandler(io.Discard, nil)), opts.metrics)
+	}, e.logger, opts.metrics)
 	if err := c.Resolve(ctxT(t)); err != nil {
 		t.Fatal(err)
 	}

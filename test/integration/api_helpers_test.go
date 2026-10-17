@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -26,6 +27,7 @@ import (
 	"github.com/medbottle/betting-wallet-go/internal/domain/wallet"
 	"github.com/medbottle/betting-wallet-go/internal/platform/clock"
 	"github.com/medbottle/betting-wallet-go/internal/platform/idgen"
+	"github.com/medbottle/betting-wallet-go/internal/platform/logging"
 	"github.com/medbottle/betting-wallet-go/internal/platform/metrics"
 )
 
@@ -45,6 +47,69 @@ type apiOption func(*apiConfig)
 type apiConfig struct {
 	runnerFrom func(repo repoEnv) app.TxRunner
 	reference  wagering.Config
+	logs       *logBuffer
+}
+
+// withLogs captures the JSON logs of the whole stack (router, use cases and
+// any consumer started on the env) in b, through the production logger.
+func withLogs(b *logBuffer) apiOption {
+	return func(c *apiConfig) { c.logs = b }
+}
+
+// logBuffer collects JSON log lines written concurrently.
+type logBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *logBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+// lines returns every line written so far; each must be one JSON record.
+func (b *logBuffer) lines(t *testing.T) ([]string, []map[string]any) {
+	t.Helper()
+	b.mu.Lock()
+	text := b.buf.String()
+	b.mu.Unlock()
+	var lines []string
+	var records []map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(text), "\n") {
+		if line == "" {
+			continue
+		}
+		var rec map[string]any
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("log line is not a JSON record: %v: %s", err, line)
+		}
+		lines, records = append(lines, line), append(records, rec)
+	}
+	return lines, records
+}
+
+// find returns the records whose msg is msg and whose fields include want.
+func (b *logBuffer) find(t *testing.T, msg string, want map[string]string) []map[string]any {
+	t.Helper()
+	_, records := b.lines(t)
+	var out []map[string]any
+	for _, rec := range records {
+		if rec["msg"] != msg {
+			continue
+		}
+		match := true
+		for k, v := range want {
+			if rec[k] != v {
+				match = false
+				break
+			}
+		}
+		if match {
+			out = append(out, rec)
+		}
+	}
+	return out
 }
 
 // withRunner replaces the transaction runner (a short lock timeout, a
@@ -74,6 +139,9 @@ func newAPIEnv(t *testing.T, opts ...apiOption) apiEnv {
 		runner = cfg.runnerFrom(repo)
 	}
 	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	if cfg.logs != nil {
+		logger = logging.New(cfg.logs, slog.LevelInfo)
+	}
 	reader := postgres.NewReader(repo.db.app)
 	ids := idgen.UUIDv7{}
 	reg := metrics.New()
