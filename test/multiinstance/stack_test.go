@@ -37,18 +37,32 @@ import (
 )
 
 const (
-	project     = "wager-wallet-multi"
-	keycloakURL = "http://localhost:8080/realms/wagering/protocol/openid-connect/token"
-	sqsEndpoint = "http://localhost:4566"
-	// Owner role (local default, docker-compose.yml): reads every table
-	// for the invariant checks; the app itself uses wallet_app.
-	ownerURL      = "postgres://wallet_owner:wallet_owner_local@localhost:5432/wallet?sslmode=disable"
+	project       = "wager-wallet-multi"
 	inboundQueue  = "wager-transactions.fifo"
 	inboundDLQ    = "wager-transactions-dlq.fifo"
 	eventsQueue   = "wallet-events.fifo"
 	referenceTTL  = 8 * time.Second // docker-compose.multi.yml
 	readyTimeout  = 5 * time.Minute
 	settleTimeout = 3 * time.Minute
+)
+
+// stackHost is where the stack's published ports are reached: localhost
+// from the host, or MULTIINSTANCE_HOST (host.docker.internal) when the
+// suite runs in a container, as for -race (README). Tokens carry the fixed
+// issuer whatever host they are fetched from (ARCHITECTURE §11).
+var stackHost = func() string {
+	if h := os.Getenv("MULTIINSTANCE_HOST"); h != "" {
+		return h
+	}
+	return "localhost"
+}()
+
+var (
+	keycloakURL = "http://" + stackHost + ":8080/realms/wagering/protocol/openid-connect/token"
+	sqsEndpoint = "http://" + stackHost + ":4566"
+	// Owner role (local default, docker-compose.yml): reads every table
+	// for the invariant checks; the app itself uses wallet_app.
+	ownerURL = "postgres://wallet_owner:wallet_owner_local@" + stackHost + ":5432/wallet?sslmode=disable"
 )
 
 // instance is one app process.
@@ -58,9 +72,9 @@ type instance struct {
 }
 
 var instances = []instance{
-	{"app", "http://localhost:8081"},
-	{"app-2", "http://localhost:8082"},
-	{"app-3", "http://localhost:8083"},
+	{"app", "http://" + stackHost + ":8081"},
+	{"app-2", "http://" + stackHost + ":8082"},
+	{"app-3", "http://" + stackHost + ":8083"},
 }
 
 var (

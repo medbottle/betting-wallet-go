@@ -1,4 +1,4 @@
-.PHONY: build test test-race vet fmt fmt-check integration integration-race multiinstance migrate-up migrate-down migrate-version up down
+.PHONY: build test test-race vet fmt fmt-check integration integration-race multiinstance multiinstance-race migrate-up migrate-down migrate-version up down
 
 GO ?= go
 
@@ -50,3 +50,11 @@ up:
 
 down:
 	docker compose down -v
+
+# The multiinstance suite under -race, from a Linux container with gcc and
+# the Docker CLI; the checkout is mounted at its own path (README).
+multiinstance-race:
+	docker build -t wager-wallet-race-harness - < test/multiinstance/race.Dockerfile
+	docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$(CURDIR):$(CURDIR)" -w "$(CURDIR)" \
+		-e MULTIINSTANCE_HOST=host.docker.internal --add-host=host.docker.internal:host-gateway \
+		wager-wallet-race-harness go test -race -tags=multiinstance -count=1 -v -timeout 40m ./test/multiinstance/

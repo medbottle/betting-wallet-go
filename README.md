@@ -498,11 +498,27 @@ same stack can be started by hand to explore:
 docker compose -p wager-wallet-multi -f docker-compose.yml -f docker-compose.multi.yml up -d --build
 ```
 
-The suite drives the stack from the host with `docker compose`, so it runs
-without `-race` here (no local C toolchain, and the Go container used for
-`-race` has no Docker CLI). The processes under test are the image's
-binaries, which are not race-instrumented in any case; `-race` covers the
-unit and integration suites.
+To run the suite under the race detector, run it in a Linux container that
+has gcc and the Docker CLI ([test/multiinstance/race.Dockerfile](test/multiinstance/race.Dockerfile)).
+It drives the same stack through the Docker socket and reaches the published
+ports through `host.docker.internal`. The repository is mounted at its own
+path, so compose's relative bind mounts (init scripts, realm) resolve on the
+Docker host:
+
+```sh
+docker build -t wager-wallet-race-harness - < test/multiinstance/race.Dockerfile
+```
+
+```sh
+docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$PWD:$PWD" -w "$PWD" -e MULTIINSTANCE_HOST=host.docker.internal --add-host=host.docker.internal:host-gateway wager-wallet-race-harness go test -race -tags=multiinstance -count=1 -v -timeout 40m ./test/multiinstance/
+```
+
+`make multiinstance-race` runs both. On Docker Desktop for Windows, replace
+`$PWD` on both sides of the mount and in `-w` with the path the Docker VM
+knows the checkout by: `/run/desktop/mnt/host/c/...` for `C:\...`. The race
+detector instruments the test process: its HTTP, SQS and Postgres clients
+and the goroutines of the concurrent scenarios. The three app processes are
+the image's binaries, built without `-race` (ARCHITECTURE §25, N7).
 
 The architecture test (`test/architecture`) runs with the plain `go test ./...`.
 It fails if:
@@ -526,4 +542,4 @@ go test -run=^$ -fuzz=FuzzParseRoundTrip -fuzztime=1m ./internal/domain/money/
 ### Make shortcuts
 
 `make build test test-race vet fmt fmt-check integration integration-race
-multiinstance migrate-up migrate-down migrate-version up down`
+multiinstance multiinstance-race migrate-up migrate-down migrate-version up down`
