@@ -1,30 +1,34 @@
 # betting-wallet-go
 
-Distributed processing of bets and wallet movements in Go (Uber Fx, PostgreSQL,
-SQS, Keycloak). Spec: [docs/CHALLENGE.md](docs/CHALLENGE.md). Design decisions:
-[ARCHITECTURE.md](ARCHITECTURE.md).
+A wallet service for game providers, written in Go: it processes bets,
+wins, losses, refunds and rollbacks over an HTTP API and an SQS queue, with
+the same guarantees on both paths. It is built with Uber Fx, PostgreSQL,
+AWS SQS (MiniStack locally) and Keycloak.
 
-> **Status: complete: all ten slices and the fixes from two independent
-> reviews.** The authenticated HTTP API, the SQS consumer (with inbox, DLQ
-> and the `dlqredrive` tool), the reference worker and the outbox relay run
-> on the full schema, domain and persistence adapter; committed events are
-> published to `wallet-events.fifo`; Prometheus metrics are served on
-> `:9090`; the CHALLENGE §13 scenarios run against three instances. Where
-> the review fixes are recorded in ARCHITECTURE.md:
->
-> - §26, compliance review: SQS provider bound to the sender's broker
->   identity, balance tied to the ledger in the database, and the rest;
-> - §27, strict grader review: the reference worker retries transient
->   database errors instead of recording `FAILED`, the outbox relay pauses
->   while SQS is down, a WIN on a reversed BET is rejected, the inbox is
->   keyed per provider, the timeout 503 keeps the contract;
-> - §28: broker credentials and policies enforced in MiniStack
->   (`AUTH=true`).
->
-> Known limitations are listed below ("Known limitations"); all
-> interpretations, limitations and unfinished work are in ARCHITECTURE.md,
-> "Interpretações adotadas", "Premissas e limitações" and "Trabalho não
-> concluído".
+What it guarantees:
+
+- **Exact money**: amounts are integer minor units with a currency, never
+  floating point.
+- **A trustworthy ledger**: every balance change has an append-only ledger
+  entry, enforced by the database, and a reconciliation endpoint rebuilds
+  the balance from it.
+- **Safe concurrency**: one lock per wallet, so the same wallet is never
+  double-spent while different wallets proceed in parallel, across any
+  number of instances.
+- **Idempotency that survives restarts**: retries and duplicate deliveries
+  return the original result instead of moving money twice.
+- **Reliable messaging**: an SQS inbox, a transactional outbox (events are
+  published only after commit), retries, a dead-letter queue and a redrive
+  tool.
+- **Authentication everywhere**: OAuth 2.0 client credentials for the API,
+  broker credentials and policies for SQS; a provider only ever sees its
+  own transactions.
+
+The specification is [docs/CHALLENGE.md](docs/CHALLENGE.md). Design
+decisions, with a one-page summary at the top, are in
+[ARCHITECTURE.md](ARCHITECTURE.md). Known limitations are listed below.
+
+Quick start: `docker compose up --build`, then see "API examples".
 
 ## Prerequisites
 
