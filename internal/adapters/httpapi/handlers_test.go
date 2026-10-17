@@ -123,3 +123,46 @@ func (tt tokenTable) Verify(_ context.Context, raw string) (authz.Principal, err
 	}
 	return p, nil
 }
+
+// blockingLookup never returns before its context is done.
+type blockingLookup struct{ lookupCounter }
+
+func (s *blockingLookup) Get(ctx context.Context, _ uuid.UUID) (*wager.WagerTransaction, error) {
+	<-ctx.Done()
+	time.Sleep(50 * time.Millisecond) // answer after the timeout handler did
+	return nil, ctx.Err()
+}
+
+// TestHandlerTimeoutKeepsThe503Contract: the handler-timeout answer is
+// JSON with Retry-After and retryable, like every 503 (ARCHITECTURE §13,
+// §27 L-3); ordinary responses get no Retry-After.
+func TestHandlerTimeoutKeepsThe503Contract(t *testing.T) {
+	p, err := authz.NewPrincipal("provider-a", "provider-a", []string{"provider"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := NewRouter(Deps{Verifier: tokenTable{"provider-a": p}, Wagering: &blockingLookup{}, HandlerTimeout: 50 * time.Millisecond})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/wagering/transactions/"+uuid.NewString(), nil)
+	req.Header.Set("Authorization", "Bearer provider-a")
+	router.ServeHTTP(rec, req)
+	var body struct {
+		Error struct {
+			Code      string
+			Retryable bool
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("body %q: %v", rec.Body.String(), err)
+	}
+	if rec.Code != http.StatusServiceUnavailable || rec.Header().Get("Content-Type") != "application/json" ||
+		rec.Header().Get("Retry-After") != retryAfterSeconds || body.Error.Code != codeTemporarilyUnavailable || !body.Error.Retryable {
+		t.Fatalf("timeout answer: %d %v %s", rec.Code, rec.Header(), rec.Body.String())
+	}
+
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health/live", nil))
+	if rec.Code != http.StatusOK || rec.Header().Get("Retry-After") != "" {
+		t.Fatalf("ordinary answer: %d %v", rec.Code, rec.Header())
+	}
+}

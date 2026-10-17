@@ -86,7 +86,28 @@ func NewRouter(d Deps) http.Handler {
 	if d.Observer != nil {
 		h = observe(d.Observer, mux)
 	}
-	return withCorrelation(d.NewID, http.TimeoutHandler(h, d.HandlerTimeout, timeoutBody))
+	return withCorrelation(d.NewID, timeoutContract(http.TimeoutHandler(h, d.HandlerTimeout, timeoutBody)))
+}
+
+// timeoutContract gives the handler-timeout answer of http.TimeoutHandler
+// the same contract as every other 503 (ARCHITECTURE §13, §27 L-3): JSON
+// and Retry-After. That answer is the only 503 written without a
+// Content-Type; the handlers' own responses always set one, so they pass
+// through unchanged.
+func timeoutContract(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		next.ServeHTTP(timeoutWriter{w}, r)
+	})
+}
+
+type timeoutWriter struct{ http.ResponseWriter }
+
+func (w timeoutWriter) WriteHeader(code int) {
+	if code == http.StatusServiceUnavailable && w.Header().Get("Content-Type") == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", retryAfterSeconds)
+	}
+	w.ResponseWriter.WriteHeader(code)
 }
 
 type handlers struct {

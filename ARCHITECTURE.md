@@ -687,7 +687,7 @@ Versão do Go: a última estável no momento da implementação, fixada em `go.m
 - O corpo expõe só `ok`/`fail`/`pending` por check; o detalhe do erro vai para o log, porque o endpoint é público.
 - O check de SQS entra no slice de SQS.
 
-**Roteador**: `net/http.ServeMux` com padrões de método (`GET /health/live`), envolvido por `http.TimeoutHandler` com o handler timeout.
+**Roteador**: `net/http.ServeMux` com padrões de método (`GET /health/live`), envolvido por `http.TimeoutHandler` com o handler timeout; a resposta de timeout sai em JSON com `Retry-After`, como todo 503 (seção 27, L-3).
 
 **Hook "runners"**: no slice 1 ele só contém o servidor HTTP. O listen é síncrono no `OnStart`, então porta ocupada falha o start. Os papéis `RUN_CONSUMER`, `RUN_OUTBOX` e `RUN_REFERENCE_WORKER` existiam na config e só logavam "not implemented yet" (implementados nos slices 7, 8 e 9).
 
@@ -1139,6 +1139,8 @@ Uma revisão independente, feita como um avaliador estrito a partir de um clone 
 **L-1, `WIN` pago sobre `BET` revertida** (seção 7 do desafio, coerência financeira): `BET` 25.00, `ROLLBACK` dela e depois um `WIN` referenciando a mesma `BET` creditava o prêmio de uma aposta desfeita; a seção 7 tratava `ROLLBACK` depois de `WIN`, não o contrário. Agora o `WIN` é rejeitado com `REFERENCE_NOT_PROCESSED` (código existente; o CHECK do schema já o aceita, nenhuma migration). `WIN` sobre `BET` que continua valendo não muda. Testes: dois casos em `TestApplyReferenceRejections` (inclusive a precedência da concordância de rodada) e `TestAPIWinOfReversedBet` (depois de `REFUND` e de `ROLLBACK`, saldo inalterado, e um `WIN` válido ainda pago).
 
 **L-2, `messageId` compartilhado entre provedores na inbox** (seção 6.5 do desafio): com um `consumer_name` fixo, a mensagem `msg-123` de um provedor bloqueava a `msg-123` de outro, que ia para a DLQ como hash divergente e nunca era aplicada. Agora o `consumer_name` é `wager-transactions:<providerId>`, com o provedor que o consumidor já autenticou pelo `SenderId` antes de qualquer acesso ao banco. A chave continua `(consumerName, messageId)`, sem migration. Linhas antigas com `consumer_name = wager-transactions` só importariam para mensagens reentregues durante a troca de versão; numa implantação nova não existem. Teste: `TestConsumerInboxIsPerProvider` (provider-b e provider-a com o mesmo `messageId`, as duas operações aplicadas, nada na DLQ); falha com o `consumer_name` fixo.
+
+**L-3, 503 do handler timeout fora do contrato** (seção 13): o `http.TimeoutHandler` escrevia o próprio 503 sem `Retry-After` e com `Content-Type` detectado como texto, enquanto a seção 13 promete `Retry-After` em todo 503. Dá para chegar lá: as leituras do pool (registro de provedores, pré-leitura, GETs) não têm `statement_timeout`, e o `statement_timeout` da transação (10s) é igual ao `HTTP_HANDLER_TIMEOUT`. Um writer em volta do `TimeoutHandler` acrescenta `Content-Type: application/json` e `Retry-After: 2` ao único 503 escrito sem `Content-Type`, o do timeout; as respostas dos handlers sempre definem `Content-Type` e passam inalteradas. Teste: `TestHandlerTimeoutKeepsThe503Contract`.
 
 ---
 
