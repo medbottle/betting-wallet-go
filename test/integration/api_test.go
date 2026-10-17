@@ -13,6 +13,7 @@ import (
 
 	"github.com/medbottle/betting-wallet-go/internal/adapters/postgres"
 	"github.com/medbottle/betting-wallet-go/internal/app"
+	"github.com/medbottle/betting-wallet-go/internal/domain/wager"
 )
 
 func TestAPIAuthentication(t *testing.T) {
@@ -443,6 +444,48 @@ func TestAPITransientAndFailed(t *testing.T) {
 			t.Errorf("outbox events = %d, want only the opening's 2", n)
 		}
 		e.assertConsistent(t, w, "100.00")
+	})
+
+	// A domain invariant error is category D like a database one: FAILED
+	// is recorded and replayed, never answered as a retryable 503
+	// (ARCHITECTURE §5, §26).
+	assertRecordedFailed := func(t *testing.T, e apiEnv, w apiWallet, ext string) {
+		t.Helper()
+		body := op(w, "provider-a", "BET", "10.00", ext)
+		r := e.submit(t, "provider-a", body)
+		if r.Status != http.StatusInternalServerError || r.str("status") != "FAILED" || r.str("failureCode") != "INTERNAL_INVARIANT_VIOLATION" {
+			t.Fatalf("failed: %d %s", r.Status, r.Raw)
+		}
+		replay := e.submit(t, "provider-a", body)
+		if replay.Status != http.StatusInternalServerError || replay.Body["idempotentReplay"] != true || replay.str("transactionId") != r.str("transactionId") {
+			t.Errorf("FAILED replay: %d %s", replay.Status, replay.Raw)
+		}
+		if n := e.count(t, `SELECT count(*) FROM outbox_events WHERE aggregate_id = $1`, w.ID); n != 2 {
+			t.Errorf("outbox events = %d, want only the opening's 2", n)
+		}
+		e.assertConsistent(t, w, "100.00")
+	}
+
+	t.Run("invalid transaction from the domain is recorded as FAILED", func(t *testing.T) {
+		armed, other := &atomic.Bool{}, &uuid.UUID{}
+		e := newAPIEnv(t, withRunner(func(repo repoEnv) app.TxRunner {
+			return wrongWalletRunner{inner: repo.runner, armed: armed, other: other}
+		}))
+		w, decoy := e.openWallet(t, "100.00"), e.openWallet(t, "50.00")
+		*other = uuid.MustParse(decoy.ID)
+		armed.Store(true)
+		assertRecordedFailed(t, e, w, "wrong-wallet")
+		e.assertConsistent(t, decoy, "50.00")
+	})
+
+	t.Run("invalid transition from the domain is recorded as FAILED", func(t *testing.T) {
+		armed := &atomic.Bool{}
+		e := newAPIEnv(t, withRunner(func(repo repoEnv) app.TxRunner {
+			return faultyRunner{inner: repo.runner, armed: armed, fault: wager.ErrInvalidTransition}
+		}))
+		w := e.openWallet(t, "100.00")
+		armed.Store(true)
+		assertRecordedFailed(t, e, w, "bad-transition")
 	})
 }
 

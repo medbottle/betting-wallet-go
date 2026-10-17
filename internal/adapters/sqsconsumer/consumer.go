@@ -383,8 +383,9 @@ func (c *Consumer) authenticate(sender string) (authz.Principal, error) {
 }
 
 // permanentCode classifies a use case error (ARCHITECTURE §10/§23):
-// category A and C errors, an unknown provider and a reused messageId are
-// permanent. Everything else, including unclassified errors, is
+// category A and C errors, an unknown provider, a reused messageId and an
+// invariant violation that could not be recorded as FAILED (category D,
+// §5) are permanent. Everything else, including unclassified errors, is
 // transient (G8).
 func permanentCode(err error) (wager.FailureCode, bool) {
 	var ve *wager.ValidationError
@@ -400,6 +401,8 @@ func permanentCode(err error) (wager.FailureCode, bool) {
 		return codeForbidden, true
 	case errors.Is(err, app.ErrInboxHashMismatch):
 		return wager.CodeInvalidRequest, true
+	case errors.Is(err, app.ErrInvariantViolation):
+		return wager.CodeInternalInvariantViolation, true
 	}
 	return "", false
 }

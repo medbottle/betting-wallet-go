@@ -462,6 +462,36 @@ func TestConsumerProviderIsTheSender(t *testing.T) {
 	e.assertConsistent(t, w, "90.00")
 }
 
+// TestConsumerRecordsInvariantViolationAsFailed: a domain invariant error
+// over SQS is recorded as FAILED like over HTTP. The inbox is completed with
+// FAILED and the message deleted; it is neither retried nor dead-lettered
+// (ARCHITECTURE §5, §23 G6, §26).
+func TestConsumerRecordsInvariantViolationAsFailed(t *testing.T) {
+	t.Parallel()
+	e := newAPIEnv(t)
+	q := newInboundQueues(t, 60, 10)
+	armed, other := &atomic.Bool{}, &uuid.UUID{}
+	c, _ := startConsumer(t, e, q, consumerOpts{runner: wrongWalletRunner{inner: e.repo.runner, armed: armed, other: other}})
+	w, decoy := e.openWallet(t, "100.00"), e.openWallet(t, "50.00")
+	*other = uuid.MustParse(decoy.ID)
+	armed.Store(true)
+
+	q.send(t, envelope(t, "msg-broken", op(w, "provider-a", "BET", "10.00", "sqs-broken")), w.ID)
+	r := e.waitStatus(t, "provider-a", "provider-a", "sqs-broken", "FAILED", 15*time.Second)
+	if r.str("failureCode") != "INTERNAL_INVARIANT_VIOLATION" {
+		t.Fatalf("failed transaction: %s", r.Raw)
+	}
+	waitFor(t, 10*time.Second, "message deleted", func() bool { return q.depth(t, q.queueURL) == 0 })
+	if row, ok := e.inbox(t, "msg-broken"); !ok || row.Outcome == nil || *row.Outcome != "FAILED" {
+		t.Fatalf("inbox %+v (found %v)", row, ok)
+	}
+	if s := c.Stats(); s.Handled != 1 || s.Retried != 0 || s.DeadLetter != 0 {
+		t.Fatalf("stats %+v: want one handled message, no retry, no DLQ", s)
+	}
+	e.assertConsistent(t, w, "100.00")
+	e.assertConsistent(t, decoy, "50.00")
+}
+
 // TestConsumerBusinessRejection: a confirmed rejection is terminal; it is
 // committed and the message removed (CHALLENGE §10).
 func TestConsumerBusinessRejection(t *testing.T) {

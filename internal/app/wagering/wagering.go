@@ -84,9 +84,14 @@ type SubmitResult struct {
 //
 // Errors: *wager.ValidationError (category A, nothing persisted),
 // *wager.ConflictError (category C), app.ErrProviderNotAllowed,
-// app.ErrInboxHashMismatch, app.ErrTransient (rolled back, retry). An invariant violation rolls back
-// and is recorded as FAILED in a separate transaction (§5); the FAILED
-// transaction is then the result.
+// app.ErrInboxHashMismatch, app.ErrTransient (rolled back, retry). An
+// invariant violation in the business transaction (category D: the
+// database refusing a change the domain allowed, or the domain reporting
+// wager.ErrInvalidTransaction or wager.ErrInvalidTransition) rolls back and
+// is recorded as FAILED in a separate transaction (§5), as the worker does;
+// the FAILED transaction is then the result. If FAILED cannot be recorded,
+// or the violation happens before the transaction, the error wraps
+// app.ErrInvariantViolation and nothing is persisted.
 func (s *Service) Submit(ctx context.Context, cmd SubmitCommand) (res SubmitResult, err error) {
 	start := time.Now()
 	defer func() { s.observe(cmd, res, err, time.Since(start)) }()
@@ -137,7 +142,8 @@ func (s *Service) submit(ctx context.Context, cmd SubmitCommand) (SubmitResult, 
 	now := s.clock.Now()
 	t, err := wager.NewExternal(req, s.ids.NewID(), cmd.CorrelationID, now)
 	if err != nil {
-		return SubmitResult{}, err
+		// Only a programming error gets here; there is nothing to record.
+		return SubmitResult{}, invariant(err)
 	}
 	var res SubmitResult
 	err = s.tx.InTx(ctx, app.TxOptions{}, func(ctx context.Context, r app.Repos) error {
@@ -163,14 +169,33 @@ func (s *Service) submit(ctx context.Context, cmd SubmitCommand) (SubmitResult, 
 		res = SubmitResult{Transaction: t}
 		return completeInbox(ctx, r, cmd, t, now)
 	})
-	if errors.Is(err, app.ErrInvariantViolation) {
-		return s.recordFailure(ctx, req, cmd, err)
+	if isInvariantViolation(err) {
+		return s.recordFailure(ctx, req, cmd, invariant(err))
 	}
 	if err != nil {
 		return SubmitResult{}, err
 	}
 	s.logOutcome(res, cmd)
 	return res, nil
+}
+
+// isInvariantViolation reports a category D error (ARCHITECTURE §5): the
+// database refused a change the domain allowed, or the domain reported a
+// broken invariant or an impossible transition. None can happen for a
+// valid request, so retrying would never succeed.
+func isInvariantViolation(err error) bool {
+	return errors.Is(err, app.ErrInvariantViolation) || errors.Is(err, wager.ErrInvalidTransaction) ||
+		errors.Is(err, wager.ErrInvalidTransition)
+}
+
+// invariant marks err as app.ErrInvariantViolation, so the transports
+// answer it as category D (HTTP 500, SQS permanent) even when FAILED could
+// not be recorded.
+func invariant(err error) error {
+	if errors.Is(err, app.ErrInvariantViolation) {
+		return err
+	}
+	return fmt.Errorf("%w: %w", app.ErrInvariantViolation, err)
 }
 
 // preRead is ARCHITECTURE §4 step 0: input errors before anything is
@@ -350,7 +375,7 @@ func (s *Service) recordFailure(ctx context.Context, req wager.Request, cmd Subm
 	now := s.clock.Now()
 	t, err := wager.NewExternal(req, s.ids.NewID(), cmd.CorrelationID, now)
 	if err != nil {
-		return SubmitResult{}, err
+		return SubmitResult{}, fmt.Errorf("recording FAILED: %w (original: %w)", err, cause)
 	}
 	var res SubmitResult
 	err = s.tx.InTx(ctx, app.TxOptions{}, func(ctx context.Context, r app.Repos) error {

@@ -430,6 +430,27 @@ func TestSenderDecidesTheProvider(t *testing.T) {
 	}
 }
 
+// TestUnrecordedInvariantViolationIsPermanent: the use case records an
+// invariant violation as FAILED; if that fails too, the error is category D
+// and the message goes to the DLQ instead of being retried (ARCHITECTURE
+// §5, §26). A recording that failed transiently is retried.
+func TestUnrecordedInvariantViolationIsPermanent(t *testing.T) {
+	api := newFakeSQS([]types.Message{msg("broken", "w1", 1), msg("retry", "w2", 1)})
+	sub := &fakeSubmitter{results: map[string]error{
+		"broken": fmt.Errorf("recording FAILED: no row (original: %w)", app.ErrInvariantViolation),
+		"retry":  fmt.Errorf("recording FAILED: %w (original: %w)", app.ErrTransient, app.ErrInvariantViolation),
+	}}
+	c := newTestConsumer(t, api, sub, &fakeReadiness{ready: true})
+	runUntil(t, c, func() bool { d, v, _ := api.snapshot(); return len(d) == 1 && len(v) == 1 })
+	d, v, sent := api.snapshot()
+	if d[0] != "broken" || len(sent) != 1 || v["retry"][0] != 2 {
+		t.Fatalf("deleted %v, visibility %v, DLQ sends %d", d, v, len(sent))
+	}
+	if got := aws.ToString(sent[0].MessageAttributes[AttrFailureCode].StringValue); got != string(wager.CodeInternalInvariantViolation) {
+		t.Fatalf("DLQ failureCode %s", got)
+	}
+}
+
 func TestStartRequiresSenders(t *testing.T) {
 	api := newFakeSQS()
 	c := New(api, &fakeSubmitter{}, &fakeReadiness{}, fixedClock{}, Config{

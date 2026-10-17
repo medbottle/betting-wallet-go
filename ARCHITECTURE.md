@@ -159,9 +159,10 @@ stateDiagram-v2
   - `40001`, `40P01` e `55P03`;
   - deadline de contexto;
   - erro 5xx ou throttling do SQS.
-- **Falha permanente** (`FAILED`, `INTERNAL_INVARIANT_VIOLATION`): violação de invariante que deveria ser impossível, como o CHECK de saldo ou de versão disparando apesar da verificação do domínio, ou um ledger inconsistente.
+- **Falha permanente** (`FAILED`, `INTERNAL_INVARIANT_VIOLATION`): violação de invariante que deveria ser impossível, como o CHECK de saldo ou de versão disparando apesar da verificação do domínio, um ledger inconsistente, ou o próprio domínio recusando a operação com `ErrInvalidTransaction` ou `ErrInvalidTransition` (por exemplo, uma carteira travada que não é a da transação). O submit e o worker tratam todos do mesmo jeito.
   - É registrada em uma transação separada após o rollback, adquirindo o lock da carteira para respeitar a invariante da seção 4.
   - Serve para auditoria e gera alerta via métrica.
+  - Se nem o `FAILED` puder ser gravado, nada é persistido e a falha continua sendo de categoria D: o HTTP responde `500 INTERNAL_INVARIANT_VIOLATION` (não retryable) e o SQS manda a mensagem para a DLQ com `failureClass=PERMANENT` e esse código. Uma gravação que falhou de forma transitória continua sendo retry no SQS.
 - **Limitação**: `FAILED` é um beco sem saída para o provedor. Como `(provider_id, external_transaction_id)` é único, a operação não pode ser reenviada com o mesmo ID externo nem com outra chave (retorna `409 EXTERNAL_ID_CONFLICT`). A correção exige intervenção operacional. Isso é aceitável porque `FAILED` só ocorre em violação de invariante interna.
 
 ---
@@ -1071,6 +1072,8 @@ Uma revisão independente contra o desafio apontou um risco eliminatório (H1, "
 - Integração (MiniStack, Postgres e Keycloak reais): as credenciais de `provider-a` não conseguem criar, reproduzir nem reverter operações de `provider-b` (DLQ com `PROVIDER_MISMATCH`, nenhuma linha nova de transação, inbox, ledger ou outbox, a operação de `provider-b` intacta); a chave da conta padrão e o operador sem `originalSenderId` recebem `FORBIDDEN`; um provedor inativo também; o redrive com a identidade do operador, que resolve as filas na conta dona, é processado como `provider-a`.
 - Múltiplas instâncias: as mensagens da suíte são enviadas com a chave de `provider-a`.
 
+**L1, erros de invariante do domínio no submit** (seção 5): `ErrInvalidTransaction` ou `ErrInvalidTransition` vindos de `Apply` caíam no caso não classificado: `503` retryable no HTTP e retry no SQS até o redrive da fila, sem `failureClass`, de modo que o `dlqredrive` os reenviaria. Agora o submit faz o que o worker já fazia (premissa A9): rollback e `FAILED/INTERNAL_INVARIANT_VIOLATION` numa transação separada; no SQS a inbox é concluída com `FAILED` e a mensagem removida (seção 23, G6). O mesmo erro antes da transação (só um erro de programação chega lá) e uma gravação de `FAILED` que falhou de forma não transitória ficam como `app.ErrInvariantViolation`: `500` não retryable no HTTP e DLQ permanente com `INTERNAL_INVARIANT_VIOLATION` no SQS. Erros não classificados continuam transitórios (premissa A6). Testes: os dois erros do domínio injetados (carteira errada no lock, transição inválida) viram `FAILED` com replay, sem movimento nem eventos, pelo HTTP e pelo SQS; unitário do consumidor para a gravação que falha de forma permanente ou transitória.
+
 ---
 
 ## Esboço do schema
@@ -1170,7 +1173,7 @@ Pontos que os documentos deixam abertos e como foram lidos. As seções citadas 
 - **A6. Erros não classificados respondem 503, retryable**: não persistiram nada e toda escrita é idempotente, então repetir é seguro; são logados em nível de erro. No SQS, o equivalente é o erro transitório (seção 23, G8).
 - **A7. `TRANSACTION_NOT_FOUND` é um código estável novo** (seção 12, "Leitura"), porque o corpo de erro exige um código.
 - **A8. O reagendamento do worker conta a tentativa em curso**: usa `attempts + 1` na fórmula da seção 8, então as esperas crescem 1s, 2s, 4s... até 60s (antes do jitter).
-- **A9. Qualquer falha não transitória no worker grava `FAILED`** (violação de invariante, ou erro de domínio que não deveria acontecer para uma linha persistida), para uma linha quebrada não ser tentada para sempre.
+- **A9. Qualquer falha não transitória no worker grava `FAILED`** (violação de invariante, ou erro de domínio que não deveria acontecer para uma linha persistida), para uma linha quebrada não ser tentada para sempre. No submit, as violações de invariante (do banco ou do domínio, `ErrInvalidTransaction`/`ErrInvalidTransition`) também gravam `FAILED` (seção 26, L1); os erros não classificados seguem a A6.
 - **A10. O jitter da outbox é aditivo, até uma base**: sorteado em `[0, OUTBOX_BACKOFF_BASE)` (seção 22).
 - **A11. O corpo publicado é o JSONB armazenado**: mesmo conteúdo do snapshot, com ordem de chaves e espaços do Postgres; consumidores devem fazer parse, não comparar bytes.
 - **A12. Separação de credenciais do broker configurada, mas não verificada localmente**: o MiniStack só aplica IAM ao SQS com `AUTH=true`, modo que o projeto não usa, porque nele as chaves são geradas pelo emulador e teriam de ser provisionadas para cada papel e lidas pela aplicação e pelos testes. No modo padrão ele aceita qualquer credencial e não aplica políticas; os testes negativos são pulados com essa razão. As políticas de `deploy/aws/iam-policies.json` continuam sendo a definição para a AWS, sem aplicação local.

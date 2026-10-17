@@ -217,37 +217,83 @@ func (e apiEnv) count(t *testing.T, sql string, args ...any) int {
 	return n
 }
 
-// faultyRunner injects one invariant violation at the next ledger insert,
-// the only way to reach the FAILED path: the database correctly prevents
-// it otherwise (ARCHITECTURE §5).
+// faultyRunner injects one fault at the next ledger insert: an invariant
+// violation by default, the only way to reach the FAILED path, since the
+// database correctly prevents it otherwise (ARCHITECTURE §5). fault
+// replaces it, for example with a domain invariant error.
 type faultyRunner struct {
 	inner app.TxRunner
 	armed *atomic.Bool
+	fault error
 }
 
 func (f faultyRunner) InTx(ctx context.Context, opts app.TxOptions, fn func(ctx context.Context, r app.Repos) error) error {
 	return f.inner.InTx(ctx, opts, func(ctx context.Context, r app.Repos) error {
-		return fn(ctx, faultyRepos{Repos: r, armed: f.armed})
+		return fn(ctx, faultyRepos{Repos: r, armed: f.armed, fault: f.fault})
 	})
 }
 
 type faultyRepos struct {
 	app.Repos
 	armed *atomic.Bool
+	fault error
 }
 
 func (r faultyRepos) Ledger() app.LedgerRepository {
-	return faultyLedger{LedgerRepository: r.Repos.Ledger(), armed: r.armed}
+	return faultyLedger{LedgerRepository: r.Repos.Ledger(), armed: r.armed, fault: r.fault}
 }
 
 type faultyLedger struct {
 	app.LedgerRepository
 	armed *atomic.Bool
+	fault error
 }
 
 func (l faultyLedger) Insert(ctx context.Context, e wallet.LedgerEntry) error {
 	if l.armed.CompareAndSwap(true, false) {
+		if l.fault != nil {
+			return fmt.Errorf("injected ledger fault: %w", l.fault)
+		}
 		return fmt.Errorf("%w: injected ledger fault", app.ErrInvariantViolation)
 	}
 	return l.LedgerRepository.Insert(ctx, e)
+}
+
+// wrongWalletRunner makes the next wallet lock load another wallet, so the
+// domain's Apply refuses it with wager.ErrInvalidTransaction: a broken
+// invariant that a valid request never reaches (ARCHITECTURE §5, §26).
+type wrongWalletRunner struct {
+	inner app.TxRunner
+	armed *atomic.Bool
+	// other is set before armed.
+	other *uuid.UUID
+}
+
+func (f wrongWalletRunner) InTx(ctx context.Context, opts app.TxOptions, fn func(ctx context.Context, r app.Repos) error) error {
+	return f.inner.InTx(ctx, opts, func(ctx context.Context, r app.Repos) error {
+		return fn(ctx, wrongWalletRepos{Repos: r, armed: f.armed, other: f.other})
+	})
+}
+
+type wrongWalletRepos struct {
+	app.Repos
+	armed *atomic.Bool
+	other *uuid.UUID
+}
+
+func (r wrongWalletRepos) Wallets() app.WalletRepository {
+	return wrongWallets{WalletRepository: r.Repos.Wallets(), armed: r.armed, other: r.other}
+}
+
+type wrongWallets struct {
+	app.WalletRepository
+	armed *atomic.Bool
+	other *uuid.UUID
+}
+
+func (w wrongWallets) GetForUpdate(ctx context.Context, walletID uuid.UUID) (*wallet.Wallet, error) {
+	if w.armed.CompareAndSwap(true, false) {
+		return w.WalletRepository.GetForUpdate(ctx, *w.other)
+	}
+	return w.WalletRepository.GetForUpdate(ctx, walletID)
 }
