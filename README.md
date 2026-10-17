@@ -350,7 +350,7 @@ curl -s -X POST http://localhost:8081/wallets/<walletId>/reconciliation -H "Auth
 ## Database migrations
 
 Migrations live in `migrations/` as `NNNN_name.up.sql` / `NNNN_name.down.sql`,
-one per table:
+one per table, then 0008 adding a trigger to `wallets`:
 
 | Version | Creates |
 | --- | --- |
@@ -361,9 +361,10 @@ one per table:
 | 0005 | `wallet_ledger_entries` (append-only) |
 | 0006 | `inbox_messages` |
 | 0007 | `outbox_events` |
+| 0008 | `wallets_ledger_link`: a deferred constraint trigger that commits a balance change only with its ledger entry |
 
-Each migration carries its table's constraints, trigger guards and grants for
-`wallet_app` (see ARCHITECTURE.md §16).
+Each table's migration carries its constraints, trigger guards and grants for
+`wallet_app`; 0008 adds a trigger to `wallets` (see ARCHITECTURE.md §16).
 
 They are embedded in the binaries and applied with
 [golang-migrate](https://github.com/golang-migrate/migrate) through

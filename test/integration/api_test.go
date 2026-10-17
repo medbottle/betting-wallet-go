@@ -384,9 +384,32 @@ func TestAPILedgerAndReconciliation(t *testing.T) {
 		t.Fatalf("reconciliation: %d %s", rec.Status, rec.Raw)
 	}
 
-	// Tamper with the stored balance as the owner (the trigger demands a
-	// version bump): reconciliation reports it and changes nothing.
-	if _, err := e.repo.db.owner.Exec(ctxT(t), `UPDATE wallets SET balance_minor = balance_minor + 100, version = version + 1 WHERE id = $1`, w.ID); err != nil {
+	// The database refuses a balance change without its ledger entry, even
+	// from the owner (migration 0008).
+	tamper := `UPDATE wallets SET balance_minor = balance_minor + 100, version = version + 1 WHERE id = $1`
+	if _, err := e.repo.db.owner.Exec(ctxT(t), tamper, w.ID); pgCode(err) != "23000" {
+		t.Fatalf("tampering with the balance: %v, want SQLSTATE 23000", err)
+	}
+	// Corrupt it anyway, as only the owner could, by turning the check off
+	// for one transaction: reconciliation reports it and changes nothing.
+	tx, err := e.repo.db.owner.Begin(ctxT(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, step := range []struct {
+		sql  string
+		args []any
+	}{
+		{`ALTER TABLE wallets DISABLE TRIGGER wallets_ledger_link`, nil},
+		{tamper, []any{w.ID}},
+		{`ALTER TABLE wallets ENABLE TRIGGER wallets_ledger_link`, nil},
+	} {
+		if _, err := tx.Exec(ctxT(t), step.sql, step.args...); err != nil {
+			_ = tx.Rollback(ctxT(t))
+			t.Fatalf("%s: %v", step.sql, err)
+		}
+	}
+	if err := tx.Commit(ctxT(t)); err != nil {
 		t.Fatal(err)
 	}
 	rec = e.call(t, http.MethodPost, "/wallets/"+w.ID+"/reconciliation", "wallet-internal", nil)

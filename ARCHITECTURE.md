@@ -84,7 +84,8 @@ flowchart LR
 **Decisão**: lock pessimista com `SELECT ... FROM wallets WHERE id=$1 FOR NO KEY UPDATE` dentro da transação de negócio, com salvaguardas no banco:
 - `CHECK (balance_minor >= 0)`;
 - `UPDATE wallets ... WHERE id=$1 AND version=$2`, em que 0 linhas afetadas significa violação de invariante;
-- `UNIQUE (wallet_id, wallet_version)` no ledger.
+- `UNIQUE (wallet_id, wallet_version)` no ledger;
+- trigger de restrição adiado `wallets_ledger_link`: toda mudança de saldo só commita com o seu lançamento no ledger (seção 16).
 
 **Invariante de travamento**: toda transição de estado de uma `wager_transaction` acontece com o lock da carteira dessa transação adquirido. Isso vale para o submit, para o worker, para a expiração por TTL e para o registro de `FAILED`. Por isso a leitura da referência **não** usa `FOR UPDATE`: o lock da carteira já serializa qualquer mudança no estado da referência, e o índice único de reversões funciona como salvaguarda.
 
@@ -697,6 +698,7 @@ Versão do Go: a última estável no momento da implementação, fixada em `go.m
   - `reference_transaction_id`, uma vez preenchido, não muda.
 - **`failure_code` restrito por CHECK**: `REJECTED` aceita só os códigos da categoria B; `FAILED` só `INTERNAL_INVARIANT_VIOLATION`; os demais estados exigem `NULL`. Um código novo exige migration, além da atualização da seção 12.
 - **Regra de versão da carteira**: o trigger de `wallets` exige `version = OLD.version + 1` quando o saldo muda e versão inalterada quando não muda (CHALLENGE §6.2).
+- **Saldo amarrado ao ledger** (migration `0008_wallets_ledger_link`, acrescentada na revisão de conformidade, seção 26): um trigger de restrição `DEFERRABLE INITIALLY DEFERRED` em `wallets` confere no commit que cada mudança de saldo de `OLD` para `NEW` tem o lançamento `(wallet_id, wallet_version) = (NEW.id, NEW.version)` com `balance_before_minor = OLD.balance_minor` e `balance_after_minor = NEW.balance_minor`, e que uma carteira inserida com saldo positivo tem o crédito de abertura nessa versão, a partir de 0. Com a regra de versão e o CHECK aritmético do ledger, o ledger reconstrói todo saldo armazenado. Por ser adiado, carteira e lançamento podem ser gravados em qualquer ordem na transação. Levanta `23000` com `ConstraintName = wallets_ledger_link`, que o adapter classifica como `ErrInvariantViolation` (o commit falha e o submit grava `FAILED`, seção 5). Vale também para o owner; só desligar o trigger (DDL, que o `wallet_app` não pode fazer) permite divergir, e é o que o teste de reconciliação faz para simular corrupção.
 - **`TRUNCATE` bloqueado em todas as tabelas**, não só no ledger. Como `TRUNCATE` de tabela referenciada exige `CASCADE`, os testes usam `TRUNCATE ... CASCADE` como owner para exercitar o trigger.
 
 **Outras interpretações do esboço**:
@@ -1079,6 +1081,8 @@ Uma revisão independente contra o desafio apontou um risco eliminatório (H1, "
 
 **L2, contexto nas chamadas de liquidação**: `delete`, `setVisibility`, `release`, `deadLetterCode` e `retry` faziam I/O sem receber `context.Context` (CLAUDE.md e seção 6 do desafio). Agora recebem um contexto derivado do contexto do polling com `context.WithoutCancel` e aplicam o próprio timeout de 5s, o que mantém o comportamento de shutdown da seção 23 (a liquidação acontece mesmo depois do `Stop`). O contexto do handler deriva do mesmo contexto. Teste unitário: depois do `Stop`, as chamadas de liquidação recebem um contexto vivo com prazo de no máximo 5s; com o contexto do polling, o teste falha.
 
+**L6, saldo amarrado ao ledger no banco** (seções 5.3 e 6.2 do desafio): nada no banco ligava uma mudança de saldo ao seu lançamento; o próprio teste de reconciliação mudava saldo e versão como owner sem lançamento, e o banco aceitava. A migration `0008` acrescenta o trigger de restrição adiado `wallets_ledger_link` (seção 16). Testes: schema (abertura com e sem crédito, abertura zero, mudança com o lançamento antes ou depois, sem lançamento, lançamento de outro saldo de partida ou de outra versão, também como owner, e a recusa no `COMMIT` real sem alterar o saldo); repositório (`UpdateBalance` sem lançamento falha no commit como `ErrInvariantViolation`); a reconciliação mostra que a adulteração simples é recusada e só gera divergência com o trigger desligado na transação.
+
 ---
 
 ## Esboço do schema
@@ -1091,6 +1095,7 @@ Uma revisão independente contra o desafio apontou um risco eliminatório (H1, "
 - Colunas: `id UUID PK`, `player_id UUID NOT NULL`, `currency CHAR(3) NOT NULL CHECK (currency ~ '^[A-Z]{3}$')`, `balance_minor BIGINT NOT NULL CHECK (balance_minor >= 0)`, `version BIGINT NOT NULL CHECK (version >= 1)`, `created_at`, `updated_at`.
 - Unicidade: `UNIQUE (player_id, currency)`, e `UNIQUE (id, currency)` como alvo de FK composta.
 - Trigger: impede alterar `id`, `player_id`, `currency` e `created_at`, e impede `DELETE`. É o que garante a pré-leitura da seção 4.
+- Trigger de restrição adiado `wallets_ledger_link`: no commit, cada mudança de saldo (e uma abertura com saldo positivo) exige o lançamento do ledger na nova versão, do saldo anterior ao novo (seção 16).
 
 **`wager_transactions`**:
 - **Colunas**:

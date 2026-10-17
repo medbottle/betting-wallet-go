@@ -213,6 +213,7 @@ func TestWalletRepository(t *testing.T) {
 
 	t.Run("update conditioned on version", func(t *testing.T) {
 		w := env.openWallet(t, "100.00")
+		checked := errors.New("checked, roll back")
 		err := env.runner.InTx(ctxT(t), app.TxOptions{}, func(ctx context.Context, r app.Repos) error {
 			locked, err := r.Wallets().GetForUpdate(ctx, w.ID())
 			if err != nil {
@@ -225,10 +226,32 @@ func TestWalletRepository(t *testing.T) {
 			if err := r.Wallets().UpdateBalance(ctx, locked, 7); !errors.Is(err, app.ErrInvariantViolation) {
 				t.Errorf("stale version: %v", err)
 			}
+			if err := r.Wallets().UpdateBalance(ctx, locked, 1); err != nil {
+				return err
+			}
+			// Committing would also need this debit's ledger entry
+			// (migration 0008, TestSchemaWalletLedgerLink).
+			return checked
+		})
+		if !errors.Is(err, checked) {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("balance change without its ledger entry fails at commit", func(t *testing.T) {
+		w := env.openWallet(t, "100.00")
+		err := env.runner.InTx(ctxT(t), app.TxOptions{}, func(ctx context.Context, r app.Repos) error {
+			locked, err := r.Wallets().GetForUpdate(ctx, w.ID())
+			if err != nil {
+				return err
+			}
+			if _, err := locked.Debit(env.ids(), env.ids(), brlAmount(t, "10.00"), now()); err != nil {
+				return err
+			}
 			return r.Wallets().UpdateBalance(ctx, locked, 1)
 		})
-		if err != nil {
-			t.Fatal(err)
+		if !errors.Is(err, app.ErrInvariantViolation) || pgCode(err) != "23000" {
+			t.Fatalf("err = %v, want ErrInvariantViolation from the commit (23000)", err)
 		}
 	})
 }
