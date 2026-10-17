@@ -230,19 +230,29 @@ type cachedToken struct {
 // before it expires.
 func token(t *testing.T, client string) string {
 	t.Helper()
+	tok, err := tryToken(client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tok
+}
+
+// tryToken is token without the test, for goroutines other than the
+// test's, where t.Fatal must not run.
+func tryToken(client string) (string, error) {
 	tokens.mu.Lock()
 	defer tokens.mu.Unlock()
 	if tokens.cache == nil {
 		tokens.cache = map[string]cachedToken{}
 	}
 	if c, ok := tokens.cache[client]; ok && time.Until(c.exp) > 30*time.Second {
-		return c.value
+		return c.value, nil
 	}
 	resp, err := http.PostForm(keycloakURL, url.Values{
 		"grant_type": {"client_credentials"}, "client_id": {client}, "client_secret": {client + "-local-secret"},
 	})
 	if err != nil {
-		t.Fatalf("token for %s: %v", client, err)
+		return "", fmt.Errorf("token for %s: %w", client, err)
 	}
 	defer resp.Body.Close()
 	var body struct {
@@ -250,10 +260,10 @@ func token(t *testing.T, client string) string {
 		ExpiresIn   int    `json:"expires_in"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil || body.AccessToken == "" {
-		t.Fatalf("token for %s: status %d, %v", client, resp.StatusCode, err)
+		return "", fmt.Errorf("token for %s: status %d, %v", client, resp.StatusCode, err)
 	}
 	tokens.cache[client] = cachedToken{body.AccessToken, time.Now().Add(time.Duration(body.ExpiresIn) * time.Second)}
-	return body.AccessToken
+	return body.AccessToken, nil
 }
 
 // ---------------------------------------------------------------- HTTP
@@ -287,32 +297,46 @@ var httpClient = &http.Client{Timeout: 30 * time.Second}
 // error is returned as status 0 (an instance may be down on purpose).
 func call(t *testing.T, in instance, method, path, client string, body any, headers ...string) response {
 	t.Helper()
+	r, err := tryCall(in, method, path, client, body, headers...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r
+}
+
+// tryCall is call without the test, for goroutines other than the test's,
+// where t.Fatal must not run. A transport error is still status 0.
+func tryCall(in instance, method, path, client string, body any, headers ...string) (response, error) {
 	var rd io.Reader
 	if body != nil {
 		raw, err := json.Marshal(body)
 		if err != nil {
-			t.Fatal(err)
+			return response{}, err
 		}
 		rd = bytes.NewReader(raw)
 	}
 	req, err := http.NewRequest(method, in.BaseURL+path, rd)
 	if err != nil {
-		t.Fatal(err)
+		return response{}, err
+	}
+	tok, err := tryToken(client)
+	if err != nil {
+		return response{}, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+token(t, client))
+	req.Header.Set("Authorization", "Bearer "+tok)
 	for i := 0; i+1 < len(headers); i += 2 {
 		req.Header.Set(headers[i], headers[i+1])
 	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return response{Status: 0, Raw: []byte(err.Error())}
+		return response{Status: 0, Raw: []byte(err.Error())}, nil
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 	out := response{Status: resp.StatusCode, Raw: raw}
 	_ = json.Unmarshal(raw, &out.Body)
-	return out
+	return out, nil
 }
 
 type wallet struct{ ID, PlayerID string }
@@ -346,6 +370,18 @@ func submit(t *testing.T, in instance, body map[string]any) response {
 	t.Helper()
 	return call(t, in, http.MethodPost, "/wagering/transactions", "provider-a", body,
 		"Idempotency-Key", fmt.Sprintf("provider-a:%s", body["externalTransactionId"]))
+}
+
+// goSubmit is submit for goroutines other than the test's, where t.Fatal
+// must not run: a failure is reported with t.Error and the zero response
+// returned, which the caller's checks then reject.
+func goSubmit(t *testing.T, in instance, body map[string]any) response {
+	r, err := tryCall(in, http.MethodPost, "/wagering/transactions", "provider-a", body,
+		"Idempotency-Key", fmt.Sprintf("provider-a:%s", body["externalTransactionId"]))
+	if err != nil {
+		t.Errorf("submit %s on %s: %v", body["externalTransactionId"], in.Service, err)
+	}
+	return r
 }
 
 func getOp(t *testing.T, in instance, externalID string) response {
@@ -400,12 +436,27 @@ var providerA = sqspublisher.NewClient(sqspublisher.ClientConfig{Endpoint: sqsEn
 // drop.
 func sendSQS(t *testing.T, body, group string) {
 	t.Helper()
-	if _, err := providerA.SendMessage(ctxT(t), &sqs.SendMessageInput{
-		QueueUrl: aws.String(qURL[inboundQueue]), MessageBody: aws.String(body),
-		MessageGroupId: aws.String(group), MessageDeduplicationId: aws.String(uuid.NewString()),
-	}); err != nil {
+	if err := trySendSQS(body, group); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// goSendSQS is sendSQS for goroutines other than the test's, where t.Fatal
+// must not run: a failure is reported with t.Error.
+func goSendSQS(t *testing.T, body, group string) {
+	if err := trySendSQS(body, group); err != nil {
+		t.Errorf("send to %s: %v", inboundQueue, err)
+	}
+}
+
+func trySendSQS(body, group string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_, err := providerA.SendMessage(ctx, &sqs.SendMessageInput{
+		QueueUrl: aws.String(qURL[inboundQueue]), MessageBody: aws.String(body),
+		MessageGroupId: aws.String(group), MessageDeduplicationId: aws.String(uuid.NewString()),
+	})
+	return err
 }
 
 // depth is visible + in-flight messages.

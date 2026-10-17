@@ -51,16 +51,24 @@ func relayWith(runner app.TxRunner, pub app.EventPublisher, owner string, mutate
 // relayUntilIdle runs RelayOnce until a cycle finds nothing due.
 func relayUntilIdle(t *testing.T, r *messaging.Relay) {
 	t.Helper()
+	if err := relayUntilIdleErr(ctxT(t), r); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// relayUntilIdleErr is relayUntilIdle for goroutines other than the test's,
+// where t.Fatal must not run.
+func relayUntilIdleErr(ctx context.Context, r *messaging.Relay) error {
 	for i := 0; i < 1000; i++ {
-		did, err := r.RelayOnce(ctxT(t))
+		did, err := r.RelayOnce(ctx)
 		if err != nil {
-			t.Fatalf("relay: %v", err)
+			return fmt.Errorf("relay: %w", err)
 		}
 		if !did {
-			return
+			return nil
 		}
 	}
-	t.Fatal("relay never became idle")
+	return errors.New("relay never became idle")
 }
 
 type relayRow struct {
@@ -201,12 +209,15 @@ func TestOutboxTwoRelaysContend(t *testing.T) {
 		relayFor(t, env.runner, endpoint, queue, "relay-a"),
 		relayFor(t, postgres.NewTxRunner(pool, 5*time.Second, testStatementTimeout, nil), endpoint, queue, "relay-b"),
 	}
+	ctx := ctxT(t)
 	var wg sync.WaitGroup
 	for _, r := range relays {
 		wg.Add(1)
 		go func(r *messaging.Relay) {
 			defer wg.Done()
-			relayUntilIdle(t, r)
+			if err := relayUntilIdleErr(ctx, r); err != nil {
+				t.Error(err)
+			}
 		}(r)
 	}
 	wg.Wait()

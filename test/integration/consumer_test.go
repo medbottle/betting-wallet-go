@@ -576,7 +576,7 @@ func TestHTTPAndSQSCrossover(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			r := e.submit(t, "provider-a", concurrent)
+			r := e.goSubmit(t, "provider-a", concurrent)
 			if r.Status != http.StatusOK {
 				t.Errorf("concurrent http: %d %s", r.Status, r.Raw)
 				return

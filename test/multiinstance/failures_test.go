@@ -77,7 +77,7 @@ func TestOutboxRelaysKilledUnderLoad(t *testing.T) {
 				// a load balancer would do. The same key makes it safe.
 				body := op(w, "BET", "1.00", ext("killrelay"))
 				for k := 0; ; k++ {
-					r := submit(t, instances[(i+j+k)%3], body)
+					r := goSubmit(t, instances[(i+j+k)%3], body)
 					if r.Status == http.StatusOK {
 						break
 					}

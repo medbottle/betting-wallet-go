@@ -32,17 +32,19 @@ func TestSameBet50TimesAcrossInstances(t *testing.T) {
 	txIDs := map[string]int{}
 	fresh := 0
 	for i := range 50 {
+		// Built here: envelope may t.Fatal, which only the test goroutine may.
+		newEnvelope := envelope(t, fmt.Sprintf("msg-%s-%d", id, i), bet)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			<-start
 			switch {
 			case i%5 == 3:
-				sendSQS(t, sameEnvelope, w.ID)
+				goSendSQS(t, sameEnvelope, w.ID)
 			case i%5 == 4:
-				sendSQS(t, envelope(t, fmt.Sprintf("msg-%s-%d", id, i), bet), w.ID)
+				goSendSQS(t, newEnvelope, w.ID)
 			default:
-				r := submit(t, instances[i%3], bet)
+				r := goSubmit(t, instances[i%3], bet)
 				mu.Lock()
 				defer mu.Unlock()
 				if r.Status != http.StatusOK || r.str("status") != "PROCESSED" || r.amount("balance") != "90.00" {
@@ -92,8 +94,8 @@ func TestTwoBetsOf80AcrossInstances(t *testing.T) {
 		var wg sync.WaitGroup
 		start := make(chan struct{})
 		wg.Add(2)
-		go func() { defer wg.Done(); <-start; ra = submit(t, instances[0], a) }()
-		go func() { defer wg.Done(); <-start; rb = submit(t, instances[1], b) }()
+		go func() { defer wg.Done(); <-start; ra = goSubmit(t, instances[0], a) }()
+		go func() { defer wg.Done(); <-start; rb = goSubmit(t, instances[1], b) }()
 		close(start)
 		wg.Wait()
 
@@ -136,7 +138,7 @@ func TestDistinctWalletsInParallel(t *testing.T) {
 		t.Fatal(err)
 	}
 	blockedDone := make(chan response, 1)
-	go func() { blockedDone <- submit(t, instances[0], op(blocked, "BET", "1.00", ext("blocked"))) }()
+	go func() { blockedDone <- goSubmit(t, instances[0], op(blocked, "BET", "1.00", ext("blocked"))) }()
 
 	var wallets []wallet
 	want := map[string]string{}
@@ -152,7 +154,7 @@ func TestDistinctWalletsInParallel(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := range 3 {
-				r := submit(t, instances[(i+j)%3], op(w, "BET", "1.00", ext("par")))
+				r := goSubmit(t, instances[(i+j)%3], op(w, "BET", "1.00", ext("par")))
 				if r.Status != http.StatusOK {
 					t.Errorf("wallet %d bet %d: %d %s", i, j, r.Status, r.Raw)
 				}
@@ -194,11 +196,12 @@ func TestHTTPAndSQSCrossoverAcrossInstances(t *testing.T) {
 		var wg sync.WaitGroup
 		results := make([]response, len(instances))
 		start := make(chan struct{})
+		msg := envelope(t, "msg-"+id, body)
 		wg.Add(1)
-		go func() { defer wg.Done(); <-start; sendSQS(t, envelope(t, "msg-"+id, body), w.ID) }()
+		go func() { defer wg.Done(); <-start; goSendSQS(t, msg, w.ID) }()
 		for i, in := range instances {
 			wg.Add(1)
-			go func() { defer wg.Done(); <-start; results[i] = submit(t, in, body) }()
+			go func() { defer wg.Done(); <-start; results[i] = goSubmit(t, in, body) }()
 		}
 		close(start)
 		wg.Wait()

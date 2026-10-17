@@ -1087,6 +1087,7 @@ Uma revisão independente contra o desafio apontou um risco eliminatório (H1, "
 
 **Testes que faltavam** (seção 13 do desafio e CLAUDE.md):
 - **L3, guarda de float e panic**: passou de `internal/domain` para todo o código fora de testes em `internal/`, `cmd/` e `migrations/` (adapters que decodificam e gravam dinheiro inclusive), com a allow-list explícita da seção 17 (segundos e contagens do Prometheus; re-panic do `TxRunner`). Uma entrada sem uso falha, e o domínio não pode ter entrada.
+- **L4, `t.Fatal` fora da goroutine do teste**: helpers chamados de goroutines (`submit`, `call`, `token`, `sendSQS`, `envelope`, `relayUntilIdle`) podiam chamar `t.Fatal`, que só pode rodar na goroutine do teste. As goroutines usam agora variantes que devolvem o erro ou o reportam com `t.Error` (`goSubmit`, `goSendSQS`, `relayUntilIdleErr`), e os envelopes são montados antes do `go`.
 
 ---
 

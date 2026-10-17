@@ -126,6 +126,16 @@ func (r response) amount(key string) string {
 // value encoded as JSON. headers are pairs.
 func (e apiEnv) call(t *testing.T, method, path, client string, body any, headers ...string) response {
 	t.Helper()
+	r, err := e.tryCall(method, path, client, body, headers...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r
+}
+
+// tryCall is call without the test: it returns the error, for goroutines
+// other than the test's, where t.Fatal must not run.
+func (e apiEnv) tryCall(method, path, client string, body any, headers ...string) (response, error) {
 	var rd io.Reader
 	switch b := body.(type) {
 	case nil:
@@ -134,13 +144,13 @@ func (e apiEnv) call(t *testing.T, method, path, client string, body any, header
 	default:
 		raw, err := json.Marshal(b)
 		if err != nil {
-			t.Fatal(err)
+			return response{}, err
 		}
 		rd = bytes.NewReader(raw)
 	}
 	req, err := http.NewRequestWithContext(context.Background(), method, e.srv.URL+path, rd)
 	if err != nil {
-		t.Fatal(err)
+		return response{}, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if client != "" {
@@ -151,13 +161,13 @@ func (e apiEnv) call(t *testing.T, method, path, client string, body any, header
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		t.Fatal(err)
+		return response{}, err
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 	out := response{Status: resp.StatusCode, Header: resp.Header, Raw: raw}
 	_ = json.Unmarshal(raw, &out.Body)
-	return out
+	return out, nil
 }
 
 // apiWallet is a wallet opened through the API.
@@ -195,6 +205,18 @@ func (e apiEnv) submit(t *testing.T, client string, body map[string]any) respons
 	t.Helper()
 	key := fmt.Sprintf("%s:%s", body["providerId"], body["externalTransactionId"])
 	return e.call(t, http.MethodPost, "/wagering/transactions", client, body, "Idempotency-Key", key)
+}
+
+// goSubmit is submit for goroutines other than the test's, where t.Fatal
+// must not run: a failure is reported with t.Error and the zero response
+// returned, which the caller's checks then reject.
+func (e apiEnv) goSubmit(t *testing.T, client string, body map[string]any) response {
+	key := fmt.Sprintf("%s:%s", body["providerId"], body["externalTransactionId"])
+	r, err := e.tryCall(http.MethodPost, "/wagering/transactions", client, body, "Idempotency-Key", key)
+	if err != nil {
+		t.Errorf("submit %s: %v", body["externalTransactionId"], err)
+	}
+	return r
 }
 
 // assertConsistent checks stored balance against the ledger through the

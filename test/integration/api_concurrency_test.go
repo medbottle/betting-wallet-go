@@ -29,7 +29,7 @@ func TestAPIConcurrency(t *testing.T) {
 			wg.Add(1)
 			go func(i int) {
 				defer wg.Done()
-				results[i] = e.submit(t, "provider-a", body)
+				results[i] = e.goSubmit(t, "provider-a", body)
 			}(i)
 		}
 		wg.Wait()
@@ -63,7 +63,7 @@ func TestAPIConcurrency(t *testing.T) {
 			go func(i int) {
 				defer wg.Done()
 				<-start
-				results[i] = e.submit(t, "provider-a", bodies[i])
+				results[i] = e.goSubmit(t, "provider-a", bodies[i])
 			}(i)
 		}
 		close(start)
@@ -97,7 +97,7 @@ func TestAPIConcurrency(t *testing.T) {
 		release := holdTx(t, e.repo.db.owner, `SELECT 1 FROM wallets WHERE id = $1 FOR UPDATE`, busy.ID)
 
 		blocked := make(chan response, 1)
-		go func() { blocked <- e.submit(t, "provider-a", op(busy, "provider-a", "BET", "5.00", "busy-1")) }()
+		go func() { blocked <- e.goSubmit(t, "provider-a", op(busy, "provider-a", "BET", "5.00", "busy-1")) }()
 
 		start := time.Now()
 		r := e.submit(t, "provider-a", op(free, "provider-a", "BET", "5.00", "free-1"))
