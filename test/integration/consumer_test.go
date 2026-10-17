@@ -168,6 +168,9 @@ type consumerOpts struct {
 	api        sqsconsumer.API
 	backoffMax time.Duration
 	metrics    app.Metrics
+	// handlerTimeout and visibility default to 15s and 60s (ARCHITECTURE
+	// §10); the visibility is set on every receive.
+	handlerTimeout, visibility time.Duration
 }
 
 // startConsumer runs a consumer on q until the test ends (or until the
@@ -188,9 +191,12 @@ func startConsumer(t *testing.T, e apiEnv, q inboundQueues, opts consumerOpts) (
 	if opts.backoffMax == 0 {
 		opts.backoffMax = time.Minute
 	}
+	if opts.handlerTimeout == 0 {
+		opts.handlerTimeout, opts.visibility = 15*time.Second, time.Minute
+	}
 	c := sqsconsumer.New(opts.api, svc, opts.readiness, clock.System{}, sqsconsumer.Config{
 		Queue: q.queue, DLQ: q.dlq, WaitSeconds: 1, MaxMessages: 10,
-		HandlerTimeout: 15 * time.Second, BackoffMax: opts.backoffMax, PauseInterval: 50 * time.Millisecond,
+		HandlerTimeout: opts.handlerTimeout, Visibility: opts.visibility, BackoffMax: opts.backoffMax, PauseInterval: 50 * time.Millisecond,
 		Senders: providerSenders, OperatorSenderID: operatorKey,
 	}, slog.New(slog.NewJSONHandler(io.Discard, nil)), opts.metrics)
 	if err := c.Resolve(ctxT(t)); err != nil {
@@ -621,20 +627,27 @@ func (d *dropFirstDelete) DeleteMessage(ctx context.Context, in *sqs.DeleteMessa
 
 // TestConsumerCommitThenDieBeforeDelete: CHALLENGE §13 item 5. The message
 // comes back after its visibility timeout and is recognised as a
-// duplicate: the operation is applied once.
+// duplicate: the operation is applied once. The consumer sets the
+// visibility on receive, so a short one (deadline 2s + 5s to settle)
+// keeps the redelivery quick.
 func TestConsumerCommitThenDieBeforeDelete(t *testing.T) {
 	t.Parallel()
 	e := newAPIEnv(t)
 	q := newInboundQueues(t, 2, 10)
 	api := &dropFirstDelete{Client: sqsClient(q.endpoint, consumerKey, consumerSecret)}
-	c, _ := startConsumer(t, e, q, consumerOpts{api: api})
+	c, _ := startConsumer(t, e, q, consumerOpts{api: api, handlerTimeout: 2 * time.Second, visibility: 7 * time.Second})
 	w := e.openWallet(t, "100.00")
 
+	sent := time.Now()
 	q.send(t, envelope(t, "msg-crash", op(w, "provider-a", "BET", "15.00", "sqs-crash")), w.ID)
-	waitFor(t, 20*time.Second, "redelivered as a duplicate", func() bool {
+	waitFor(t, 30*time.Second, "redelivered as a duplicate", func() bool {
 		s := c.Stats()
 		return s.Handled == 1 && s.Duplicates == 1
 	})
+	// The queue's own visibility is 2s; the 7s set on receive must win.
+	if after := time.Since(sent); after < 6*time.Second {
+		t.Fatalf("redelivered after %v, before the 7s visibility set on receive", after)
+	}
 	waitFor(t, 10*time.Second, "queue empty", func() bool { return q.depth(t, q.queueURL) == 0 })
 	if n := e.count(t, `SELECT count(*) FROM wager_transactions WHERE external_transaction_id = 'sqs-crash'`); n != 1 {
 		t.Fatalf("transactions = %d", n)

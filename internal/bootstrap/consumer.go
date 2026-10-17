@@ -53,6 +53,7 @@ func newConsumer(cfg config.Config, svc *wagering.Service, readiness *health.Rea
 		HandlerTimeout:   cfg.ConsumerHandlerTimeout,
 		BackoffMax:       cfg.ConsumerBackoffMax,
 		PauseInterval:    cfg.ConsumerPauseInterval,
+		Visibility:       cfg.ConsumerVisibilityTimeout,
 		Senders:          senders,
 		OperatorSenderID: cfg.SQSOperatorSenderID,
 	}, logger, metrics)

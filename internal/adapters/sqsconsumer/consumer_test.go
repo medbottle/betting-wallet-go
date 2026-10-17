@@ -38,6 +38,9 @@ type fakeSQS struct {
 	receives   int
 	// lastReceive is the input of the latest ReceiveMessage.
 	lastReceive *sqs.ReceiveMessageInput
+	// settles records the context of every delete, visibility change and
+	// DLQ send.
+	settles []settleCtx
 	// nonBlocking makes an empty receive return at once (the redrive's
 	// short poll on a drained DLQ).
 	nonBlocking bool
@@ -70,29 +73,52 @@ func (f *fakeSQS) ReceiveMessage(ctx context.Context, in *sqs.ReceiveMessageInpu
 	return nil, ctx.Err()
 }
 
-func (f *fakeSQS) DeleteMessage(_ context.Context, in *sqs.DeleteMessageInput, _ ...func(*sqs.Options)) (*sqs.DeleteMessageOutput, error) {
+func (f *fakeSQS) DeleteMessage(ctx context.Context, in *sqs.DeleteMessageInput, _ ...func(*sqs.Options)) (*sqs.DeleteMessageOutput, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.settles = append(f.settles, seen(ctx))
 	f.deleted = append(f.deleted, aws.ToString(in.ReceiptHandle))
 	return &sqs.DeleteMessageOutput{}, nil
 }
 
-func (f *fakeSQS) ChangeMessageVisibility(_ context.Context, in *sqs.ChangeMessageVisibilityInput, _ ...func(*sqs.Options)) (*sqs.ChangeMessageVisibilityOutput, error) {
+func (f *fakeSQS) ChangeMessageVisibility(ctx context.Context, in *sqs.ChangeMessageVisibilityInput, _ ...func(*sqs.Options)) (*sqs.ChangeMessageVisibilityOutput, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.settles = append(f.settles, seen(ctx))
 	h := aws.ToString(in.ReceiptHandle)
 	f.visibility[h] = append(f.visibility[h], in.VisibilityTimeout)
 	return &sqs.ChangeMessageVisibilityOutput{}, nil
 }
 
-func (f *fakeSQS) SendMessage(_ context.Context, in *sqs.SendMessageInput, _ ...func(*sqs.Options)) (*sqs.SendMessageOutput, error) {
+func (f *fakeSQS) SendMessage(ctx context.Context, in *sqs.SendMessageInput, _ ...func(*sqs.Options)) (*sqs.SendMessageOutput, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.settles = append(f.settles, seen(ctx))
 	if f.sendErr != nil {
 		return nil, f.sendErr
 	}
 	f.sent = append(f.sent, in)
 	return &sqs.SendMessageOutput{}, nil
+}
+
+// settleCtx is what a settle call's context looked like when it was made.
+type settleCtx struct {
+	err      error
+	deadline time.Duration // until the deadline; 0 without one
+}
+
+func seen(ctx context.Context) settleCtx {
+	s := settleCtx{err: ctx.Err()}
+	if d, ok := ctx.Deadline(); ok {
+		s.deadline = time.Until(d)
+	}
+	return s
+}
+
+func (f *fakeSQS) settled() []settleCtx {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]settleCtx(nil), f.settles...)
 }
 
 func (f *fakeSQS) snapshot() (deleted []string, visibility map[string][]int32, sent []*sqs.SendMessageInput) {
@@ -112,14 +138,19 @@ type fakeSubmitter struct {
 	results map[string]error
 	dups    map[string]bool
 	block   map[string]chan struct{}
+	// onSubmit, when set, runs at the start of every call.
+	onSubmit func()
 }
 
 func (s *fakeSubmitter) Submit(ctx context.Context, cmd wagering.SubmitCommand) (wagering.SubmitResult, error) {
 	id := cmd.Inbox.MessageID
 	s.mu.Lock()
 	s.calls = append(s.calls, id)
-	err, dup, block := s.results[id], s.dups[id], s.block[id]
+	err, dup, block, hook := s.results[id], s.dups[id], s.block[id], s.onSubmit
 	s.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
 	if block != nil {
 		select {
 		case <-block:
@@ -203,6 +234,24 @@ type fixedClock struct{}
 
 func (fixedClock) Now() time.Time { return time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC) }
 
+// steppingClock moves only when told to.
+type steppingClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (c *steppingClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *steppingClock) advance(d time.Duration) {
+	c.mu.Lock()
+	c.now = c.now.Add(d)
+	c.mu.Unlock()
+}
+
 // Broker identities of the tests (SenderId principals).
 const (
 	senderA    = "111111111111"      // provider-a
@@ -254,13 +303,18 @@ func newTestConsumer(t *testing.T, api *fakeSQS, sub *fakeSubmitter, ready *fake
 
 func newTestConsumerWith(t *testing.T, api *fakeSQS, sub *fakeSubmitter, ready *fakeReadiness, m app.Metrics) *Consumer {
 	t.Helper()
+	return newTestConsumerClock(t, api, sub, ready, m, fixedClock{})
+}
+
+func newTestConsumerClock(t *testing.T, api *fakeSQS, sub *fakeSubmitter, ready *fakeReadiness, m app.Metrics, clock app.Clock) *Consumer {
+	t.Helper()
 	if sub.results == nil {
 		sub.results = map[string]error{}
 	}
-	c := New(api, sub, ready, fixedClock{}, Config{
+	c := New(api, sub, ready, clock, Config{
 		Queue: "in.fifo", DLQ: "dlq.fifo", WaitSeconds: 20, MaxMessages: 10,
 		HandlerTimeout: 2 * time.Second, BackoffMax: time.Minute, PauseInterval: 5 * time.Millisecond,
-		Senders: testSenders, OperatorSenderID: operator,
+		Visibility: time.Minute, Senders: testSenders, OperatorSenderID: operator,
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)), m)
 	if err := c.Resolve(context.Background()); err != nil {
 		t.Fatal(err)
@@ -448,6 +502,102 @@ func TestUnrecordedInvariantViolationIsPermanent(t *testing.T) {
 	}
 	if got := aws.ToString(sent[0].MessageAttributes[AttrFailureCode].StringValue); got != string(wager.CodeInternalInvariantViolation) {
 		t.Fatalf("DLQ failureCode %s", got)
+	}
+}
+
+// TestGroupReleasedBeforeItOutlivesItsVisibility: messages of one group
+// run in sequence, so a slow group could still be running when the batch's
+// visibility ends. Before starting each message the consumer checks that
+// its handler deadline plus the settle margin still fits, and otherwise
+// releases it and the rest of the group (ARCHITECTURE §10, §26).
+func TestGroupReleasedBeforeItOutlivesItsVisibility(t *testing.T) {
+	api := newFakeSQS([]types.Message{msg("a", "w1", 1), msg("b", "w1", 1), msg("c", "w1", 1), msg("d", "w1", 1), msg("e", "w1", 1)})
+	clock := &steppingClock{now: time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)}
+	// Each message takes 20s. Visibility 60s, handler deadline 2s and 5s to
+	// settle: a message may start up to 53s after the receive, so a (0s),
+	// b (20s) and c (40s) run, and d (60s) and e are released untouched.
+	sub := &fakeSubmitter{onSubmit: func() { clock.advance(20 * time.Second) }}
+	c := newTestConsumerClock(t, api, sub, &fakeReadiness{ready: true}, nil, clock)
+	runUntil(t, c, func() bool { d, v, _ := api.snapshot(); return len(d) == 3 && len(v) == 2 })
+
+	d, v, _ := api.snapshot()
+	if strings.Join(sub.called(), ",") != "a,b,c" || strings.Join(d, ",") != "a,b,c" {
+		t.Fatalf("ran %v, deleted %v; want a, b and c", sub.called(), d)
+	}
+	if len(v["d"]) != 1 || v["d"][0] != 0 || len(v["e"]) != 1 || v["e"][0] != 0 {
+		t.Fatalf("visibility %v: d and e must be released with 0", v)
+	}
+	if s := c.Stats(); s.Released != 2 || s.Retried != 0 {
+		t.Fatalf("stats %+v", s)
+	}
+	api.mu.Lock()
+	in := api.lastReceive
+	api.mu.Unlock()
+	if in.VisibilityTimeout != 60 {
+		t.Fatalf("receive visibility = %d, want the configured 60s", in.VisibilityTimeout)
+	}
+}
+
+// tickingClock moves 1ms forward on every read, like real time between
+// the receive and the start of a message.
+type tickingClock struct{ steppingClock }
+
+func (c *tickingClock) Now() time.Time {
+	c.advance(time.Millisecond)
+	return c.steppingClock.Now()
+}
+
+// TestFirstMessageOfAGroupAlwaysStarts: at the smallest visibility the
+// configuration allows (handler deadline + settle margin) any elapsed time
+// would fail the check, so the first message of a group is never checked;
+// otherwise it would be released and received again forever.
+func TestFirstMessageOfAGroupAlwaysStarts(t *testing.T) {
+	api := newFakeSQS([]types.Message{msg("a", "w1", 1), msg("b", "w1", 1)})
+	clock := &tickingClock{steppingClock{now: time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)}}
+	c := New(api, &fakeSubmitter{results: map[string]error{}}, &fakeReadiness{ready: true}, clock, Config{
+		Queue: "in.fifo", DLQ: "dlq.fifo", WaitSeconds: 20, MaxMessages: 10,
+		HandlerTimeout: 2 * time.Second, BackoffMax: time.Minute, PauseInterval: 5 * time.Millisecond,
+		Visibility: 2*time.Second + opTimeout, Senders: testSenders, OperatorSenderID: operator,
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	if err := c.Resolve(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	runUntil(t, c, func() bool { d, v, _ := api.snapshot(); return len(d) == 1 && len(v) == 1 })
+	d, v, _ := api.snapshot()
+	if d[0] != "a" || v["b"][0] != 0 {
+		t.Fatalf("deleted %v, visibility %v: a must run, b be released", d, v)
+	}
+}
+
+// TestSettleCallsOutliveStop: the delete, visibility and DLQ calls take a
+// context without the poll loop's cancellation and with their own 5s
+// timeout, so a stopping consumer still settles its messages (ARCHITECTURE
+// §14, §23).
+func TestSettleCallsOutliveStop(t *testing.T) {
+	api := newFakeSQS([]types.Message{msg("a", "w1", 1), msg("b", "w1", 1), rawMsg("bad", "{", "w2", 1)})
+	gate := make(chan struct{})
+	sub := &fakeSubmitter{block: map[string]chan struct{}{"a": gate}}
+	c := newTestConsumer(t, api, sub, &fakeReadiness{ready: true})
+	if err := c.Start(); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { _, _, sent := api.snapshot(); return len(sub.called()) == 1 && len(sent) == 1 })
+	stopped := make(chan error, 1)
+	go func() { stopped <- c.Stop(context.Background()) }()
+	time.Sleep(20 * time.Millisecond) // Stop has cancelled the loop's context
+	close(gate)
+	if err := <-stopped; err != nil {
+		t.Fatal(err)
+	}
+	settles := api.settled()
+	// The DLQ send and delete of "bad", the delete of "a", the release of "b".
+	if len(settles) != 4 {
+		t.Fatalf("settle calls = %d, want 4", len(settles))
+	}
+	for i, s := range settles {
+		if s.err != nil || s.deadline <= 0 || s.deadline > opTimeout {
+			t.Errorf("settle call %d: err %v, deadline in %v; want a live context bounded by %v", i, s.err, s.deadline, opTimeout)
+		}
 	}
 }
 

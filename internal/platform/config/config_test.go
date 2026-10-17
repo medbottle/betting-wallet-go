@@ -80,7 +80,8 @@ func TestLoadFromDefaults(t *testing.T) {
 		t.Errorf("relay defaults: %+v", c)
 	}
 	if c.SQSInboundQueue != "wager-transactions.fifo" || c.SQSInboundDLQ != "wager-transactions-dlq.fifo" || c.ConsumerWaitSeconds != 20 ||
-		c.ConsumerMaxMessages != 10 || c.ConsumerHandlerTimeout != 15*time.Second || c.ConsumerBackoffMax != time.Minute || c.ConsumerPauseInterval != time.Second {
+		c.ConsumerMaxMessages != 10 || c.ConsumerHandlerTimeout != 15*time.Second || c.ConsumerBackoffMax != time.Minute || c.ConsumerPauseInterval != time.Second ||
+		c.ConsumerVisibilityTimeout != time.Minute {
 		t.Errorf("consumer defaults differ from ARCHITECTURE §10/§23: %+v", c)
 	}
 	if c.MetricsAddr != ":9090" {
@@ -144,6 +145,8 @@ func TestLoadFromRejectsInvalid(t *testing.T) {
 		{"wait above 20", func(m map[string]string) { m["CONSUMER_WAIT_SECONDS"] = "21" }, "CONSUMER_WAIT_SECONDS"},
 		{"zero messages", func(m map[string]string) { m["CONSUMER_MAX_MESSAGES"] = "0" }, "CONSUMER_MAX_MESSAGES"},
 		{"zero handler timeout", func(m map[string]string) { m["CONSUMER_HANDLER_TIMEOUT"] = "0s" }, "CONSUMER_HANDLER_TIMEOUT"},
+		{"visibility below handler and settle", func(m map[string]string) { m["CONSUMER_VISIBILITY_TIMEOUT"] = "19s" }, "CONSUMER_VISIBILITY_TIMEOUT"},
+		{"fractional visibility", func(m map[string]string) { m["CONSUMER_VISIBILITY_TIMEOUT"] = "60500ms" }, "CONSUMER_VISIBILITY_TIMEOUT"},
 		{"no provider senders", func(m map[string]string) { delete(m, "SQS_PROVIDER_SENDERS") }, "SQS_PROVIDER_SENDERS"},
 		{"sender without provider", func(m map[string]string) { m["SQS_PROVIDER_SENDERS"] = "111111111111" }, "SQS_PROVIDER_SENDERS"},
 		{"sender with session part", func(m map[string]string) { m["SQS_PROVIDER_SENDERS"] = "AROAX:session=provider-a" }, "SQS_PROVIDER_SENDERS"},

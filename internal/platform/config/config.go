@@ -90,8 +90,12 @@ type Config struct {
 	ConsumerWaitSeconds    int32         `env:"CONSUMER_WAIT_SECONDS" envDefault:"20"`
 	ConsumerMaxMessages    int32         `env:"CONSUMER_MAX_MESSAGES" envDefault:"10"`
 	ConsumerHandlerTimeout time.Duration `env:"CONSUMER_HANDLER_TIMEOUT" envDefault:"15s"`
-	ConsumerBackoffMax     time.Duration `env:"CONSUMER_BACKOFF_MAX" envDefault:"60s"`
-	ConsumerPauseInterval  time.Duration `env:"CONSUMER_PAUSE_INTERVAL" envDefault:"1s"`
+	// ConsumerVisibilityTimeout is set on every receive, so the consumer
+	// knows when an unfinished message becomes visible again (ARCHITECTURE
+	// §10, §26).
+	ConsumerVisibilityTimeout time.Duration `env:"CONSUMER_VISIBILITY_TIMEOUT" envDefault:"60s"`
+	ConsumerBackoffMax        time.Duration `env:"CONSUMER_BACKOFF_MAX" envDefault:"60s"`
+	ConsumerPauseInterval     time.Duration `env:"CONSUMER_PAUSE_INTERVAL" envDefault:"1s"`
 
 	// Outbox relay (ARCHITECTURE §9; poll interval and concurrency §22).
 	OutboxLease            time.Duration `env:"OUTBOX_LEASE" envDefault:"30s"`
@@ -220,6 +224,11 @@ func (c Config) Validate() error {
 	}
 	if c.ConsumerMaxMessages < 1 || c.ConsumerMaxMessages > 10 {
 		errs = append(errs, errors.New("CONSUMER_MAX_MESSAGES must be between 1 and 10"))
+	}
+	// ReceiveMessage takes whole seconds up to 12h; one handler deadline
+	// plus 5s to settle the message must fit (the consumer's settle timeout).
+	if v := c.ConsumerVisibilityTimeout; v%time.Second != 0 || v > 12*time.Hour || v < c.ConsumerHandlerTimeout+5*time.Second {
+		errs = append(errs, errors.New("CONSUMER_VISIBILITY_TIMEOUT must be whole seconds, at most 12h, and at least CONSUMER_HANDLER_TIMEOUT + 5s"))
 	}
 	// SendMessageBatch takes at most 10 entries.
 	if c.OutboxBatchSize < 1 || c.OutboxBatchSize > 10 {

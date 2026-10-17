@@ -35,8 +35,11 @@ const ConsumerName = "wager-transactions"
 // none (ARCHITECTURE §10).
 const fallbackGroup = "invalid-messages"
 
-// opTimeout bounds each delete, visibility change and DLQ send. They run
-// on their own context so they still happen during shutdown.
+// opTimeout bounds each delete, visibility change and DLQ send. Their
+// context keeps the poll loop's values but not its cancellation
+// (context.WithoutCancel), so they still happen during shutdown
+// (ARCHITECTURE §14, §23). It is also the margin left after a message's
+// handler deadline for settling it within its visibility.
 const opTimeout = 5 * time.Second
 
 // DLQ message attributes (ARCHITECTURE §10).
@@ -92,6 +95,10 @@ type Config struct {
 	HandlerTimeout time.Duration
 	BackoffMax     time.Duration
 	PauseInterval  time.Duration
+	// Visibility is set on every receive (whole seconds), so the consumer
+	// knows when an unfinished message becomes visible again. It must
+	// leave room for one handler deadline plus settling.
+	Visibility time.Duration
 	// Senders maps a producer's broker identity (the SenderId up to any ':')
 	// to the provider its messages act for.
 	Senders map[string]string
@@ -167,6 +174,9 @@ func (c *Consumer) Start() error {
 	if len(c.cfg.Senders) == 0 {
 		return errors.New("consumer: no provider sender identities configured")
 	}
+	if c.cfg.Visibility < c.cfg.HandlerTimeout+opTimeout {
+		return fmt.Errorf("consumer: visibility %s must cover the handler timeout %s plus %s to settle", c.cfg.Visibility, c.cfg.HandlerTimeout, opTimeout)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	c.cancel, c.done, c.started = cancel, make(chan struct{}), true
 	go func() {
@@ -234,6 +244,7 @@ func (c *Consumer) loop(ctx context.Context) {
 			QueueUrl:            aws.String(c.queueURL),
 			MaxNumberOfMessages: c.cfg.MaxMessages,
 			WaitTimeSeconds:     c.cfg.WaitSeconds,
+			VisibilityTimeout:   int32(c.cfg.Visibility / time.Second),
 			MessageSystemAttributeNames: []types.MessageSystemAttributeName{
 				types.MessageSystemAttributeNameMessageGroupId, types.MessageSystemAttributeNameApproximateReceiveCount,
 				types.MessageSystemAttributeNameSenderId,
@@ -247,7 +258,7 @@ func (c *Consumer) loop(ctx context.Context) {
 			}
 			continue
 		}
-		c.handleBatch(ctx, out.Messages)
+		c.handleBatch(ctx, out.Messages, c.clock.Now())
 	}
 }
 
@@ -261,9 +272,14 @@ func (c *Consumer) wait(ctx context.Context) {
 }
 
 // handleBatch runs each MessageGroupId's messages in order, groups in
-// parallel (ARCHITECTURE §10). After a transient failure, or once
-// stopping, the group's remaining messages are released untouched.
-func (c *Consumer) handleBatch(stop context.Context, msgs []types.Message) {
+// parallel (ARCHITECTURE §10). The group's remaining messages are released
+// untouched after a transient failure, once stopping, or when the next one
+// after the first might not finish before the batch's visibility ends: it
+// would become visible again while it runs, and another instance could
+// take it, or a later message of its group, out of order.
+func (c *Consumer) handleBatch(stop context.Context, msgs []types.Message, receivedAt time.Time) {
+	// Settling must outlive Stop: it releases what will not run (§14).
+	settle := context.WithoutCancel(stop)
 	var order []string
 	groups := map[string][]types.Message{}
 	for _, m := range msgs {
@@ -280,11 +296,19 @@ func (c *Consumer) handleBatch(stop context.Context, msgs []types.Message) {
 			defer wg.Done()
 			for i, m := range msgs {
 				if stop.Err() != nil {
-					c.release(msgs[i:])
+					c.release(settle, msgs[i:])
 					return
 				}
-				if !c.handle(stop, m) {
-					c.release(msgs[i+1:])
+				// The first message always fits: Start requires visibility
+				// >= handler deadline + settle margin.
+				if i > 0 && !c.fitsVisibility(receivedAt) {
+					c.logger.Info("group could outlive its visibility, released the rest",
+						slog.String("messageGroupId", groupOf(m)), slog.Int("released", len(msgs)-i))
+					c.release(settle, msgs[i:])
+					return
+				}
+				if !c.handle(stop, settle, m) {
+					c.release(settle, msgs[i+1:])
 					return
 				}
 			}
@@ -293,27 +317,36 @@ func (c *Consumer) handleBatch(stop context.Context, msgs []types.Message) {
 	wg.Wait()
 }
 
+// fitsVisibility reports whether a message of the batch received at
+// receivedAt, started now, can finish its handler and be settled before
+// its visibility ends.
+func (c *Consumer) fitsVisibility(receivedAt time.Time) bool {
+	return c.clock.Now().Sub(receivedAt)+c.cfg.HandlerTimeout+opTimeout <= c.cfg.Visibility
+}
+
 // handle processes one message and settles it with SQS. It reports false
-// when the message was left for redelivery (the group must stop).
+// when the message was left for redelivery (the group must stop). stop is
+// cancelled by Stop; settle is the context of the SQS calls that settle
+// the message, which outlive Stop.
 //
 // The order follows the HTTP transport (ARCHITECTURE §11): authenticate
 // the sender, parse the envelope, check its providerId against the
 // sender's provider, then run the use case. The first three persist
 // nothing and fail permanently.
-func (c *Consumer) handle(stop context.Context, m types.Message) bool {
+func (c *Consumer) handle(stop, settle context.Context, m types.Message) bool {
 	sqsID := aws.ToString(m.MessageId)
 	body := []byte(aws.ToString(m.Body))
 	sender := originalSender(m, c.cfg.OperatorSenderID)
 	log := c.logger.With(slog.String("sqsMessageId", sqsID), slog.String("senderId", sender))
 	principal, err := c.authenticate(sender)
 	if err != nil {
-		return c.deadLetterCode(m, peekMessageID(body), sender, codeForbidden, err, log)
+		return c.deadLetterCode(settle, m, peekMessageID(body), sender, codeForbidden, err, log)
 	}
 	providerID, _ := principal.ProviderID()
 	log = log.With(slog.String("providerId", providerID))
 	p, envID, err := parseEnvelope(body)
 	if err != nil {
-		return c.deadLetter(m, envID, sender, err, log)
+		return c.deadLetter(settle, m, envID, sender, err, log)
 	}
 	log = log.With(slog.String("messageId", p.MessageID))
 	if err := principal.CanSubmitTransaction(p.Raw.ProviderID); err != nil {
@@ -321,12 +354,12 @@ func (c *Consumer) handle(stop context.Context, m types.Message) bool {
 		if errors.Is(err, authz.ErrProviderMismatch) {
 			code = codeProviderMismatch
 		}
-		return c.deadLetterCode(m, envID, sender, code, fmt.Errorf("%w: the sender acts for %s, the message names %q", err, providerID, p.Raw.ProviderID), log)
+		return c.deadLetterCode(settle, m, envID, sender, code, fmt.Errorf("%w: the sender acts for %s, the message names %q", err, providerID, p.Raw.ProviderID), log)
 	}
 
 	// The handler deadline is independent of Stop: in-flight work finishes
 	// or rolls back on its own (ARCHITECTURE §14).
-	hctx, cancel := context.WithTimeout(context.Background(), c.cfg.HandlerTimeout)
+	hctx, cancel := context.WithTimeout(settle, c.cfg.HandlerTimeout)
 	res, err := c.submitter.Submit(hctx, wagering.SubmitCommand{
 		Raw:           p.Raw,
 		CorrelationID: p.MessageID,
@@ -341,13 +374,13 @@ func (c *Consumer) handle(stop context.Context, m types.Message) bool {
 		} else {
 			c.handled.Add(1)
 		}
-		c.delete(m, log)
+		c.delete(settle, m, log)
 		return true
 	}
 	if code, ok := permanentCode(err); ok {
-		return c.deadLetterCode(m, envID, sender, code, err, log)
+		return c.deadLetterCode(settle, m, envID, sender, code, err, log)
 	}
-	c.retry(stop, m, err, log)
+	c.retry(stop, settle, m, err, log)
 	return false
 }
 
@@ -407,20 +440,20 @@ func permanentCode(err error) (wager.FailureCode, bool) {
 	return "", false
 }
 
-func (c *Consumer) deadLetter(m types.Message, envID, sender string, err error, log *slog.Logger) bool {
+func (c *Consumer) deadLetter(ctx context.Context, m types.Message, envID, sender string, err error, log *slog.Logger) bool {
 	code := wager.CodeInvalidRequest
 	var ve *wager.ValidationError
 	if errors.As(err, &ve) {
 		code = ve.Code
 	}
-	return c.deadLetterCode(m, envID, sender, code, err, log)
+	return c.deadLetterCode(ctx, m, envID, sender, code, err, log)
 }
 
 // deadLetterCode sends the message to the DLQ, then deletes it. A failed
 // send leaves the message for redelivery; the send is deduplicated by the
 // SQS MessageId if it is repeated within 5 minutes. The copy names the
 // sender it was attributed to, since its own SenderId is the consumer's.
-func (c *Consumer) deadLetterCode(m types.Message, envID, sender string, code wager.FailureCode, cause error, log *slog.Logger) bool {
+func (c *Consumer) deadLetterCode(ctx context.Context, m types.Message, envID, sender string, code wager.FailureCode, cause error, log *slog.Logger) bool {
 	attrs := map[string]types.MessageAttributeValue{
 		AttrFailureClass:      strAttr(FailureClassPermanent),
 		AttrFailureCode:       strAttr(string(code)),
@@ -432,26 +465,26 @@ func (c *Consumer) deadLetterCode(m types.Message, envID, sender string, code wa
 	if sender != "" {
 		attrs[AttrOriginalSenderID] = strAttr(sender)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), opTimeout)
-	defer cancel()
-	_, err := c.api.SendMessage(ctx, &sqs.SendMessageInput{
+	sendCtx, cancel := context.WithTimeout(ctx, opTimeout)
+	_, err := c.api.SendMessage(sendCtx, &sqs.SendMessageInput{
 		QueueUrl:               aws.String(c.dlqURL),
 		MessageBody:            m.Body,
 		MessageGroupId:         aws.String(groupOf(m)),
 		MessageDeduplicationId: m.MessageId,
 		MessageAttributes:      attrs,
 	})
+	cancel()
 	if err != nil {
 		log.Error("dead-letter send failed, message left for redelivery", slog.String("failureCode", string(code)), slog.String("error", err.Error()))
 		c.retried.Add(1)
 		c.metrics.Retry(app.RetryConsumer)
-		c.setVisibility(m, c.backoff(m), log)
+		c.setVisibility(ctx, m, c.backoff(m), log)
 		return false
 	}
 	c.deadLettered.Add(1)
 	c.metrics.DeadLettered(code)
 	log.Warn("message sent to the DLQ", slog.String("failureCode", string(code)), slog.String("error", cause.Error()))
-	c.delete(m, log)
+	c.delete(ctx, m, log)
 	return true
 }
 
@@ -459,8 +492,9 @@ func (c *Consumer) deadLetterCode(m types.Message, envID, sender string, code wa
 // seconds of visibility; the redrive policy moves it to the DLQ after
 // maxReceiveCount receives. Once stopping it is released at once instead,
 // so another instance can take it. A database failure triggers an
-// immediate readiness check, which pauses polling if it fails.
-func (c *Consumer) retry(stop context.Context, m types.Message, err error, log *slog.Logger) {
+// immediate readiness check, which pauses polling if it fails. stop tells
+// whether the consumer is stopping; the calls run on settle.
+func (c *Consumer) retry(stop, settle context.Context, m types.Message, err error, log *slog.Logger) {
 	c.retried.Add(1)
 	c.metrics.Retry(app.RetryConsumer)
 	visibility := c.backoff(m)
@@ -468,9 +502,9 @@ func (c *Consumer) retry(stop context.Context, m types.Message, err error, log *
 		visibility = 0
 	}
 	log.Warn("transient failure, message left for redelivery", slog.Int("visibilitySeconds", int(visibility)), slog.String("error", err.Error()))
-	c.setVisibility(m, visibility, log)
+	c.setVisibility(settle, m, visibility, log)
 	if errors.Is(err, app.ErrTransient) {
-		ctx, cancel := context.WithTimeout(context.Background(), opTimeout)
+		ctx, cancel := context.WithTimeout(settle, opTimeout)
 		c.readiness.CheckNow(ctx)
 		cancel()
 	}
@@ -489,28 +523,29 @@ func (c *Consumer) backoff(m types.Message) int32 {
 }
 
 // release returns messages that were received but not started.
-func (c *Consumer) release(msgs []types.Message) {
+func (c *Consumer) release(ctx context.Context, msgs []types.Message) {
 	for _, m := range msgs {
 		c.released.Add(1)
-		c.setVisibility(m, 0, c.logger.With(slog.String("sqsMessageId", aws.ToString(m.MessageId))))
+		c.setVisibility(ctx, m, 0, c.logger.With(slog.String("sqsMessageId", aws.ToString(m.MessageId))))
 	}
 }
 
-func (c *Consumer) setVisibility(m types.Message, seconds int32, log *slog.Logger) {
-	ctx, cancel := context.WithTimeout(context.Background(), opTimeout)
+// setVisibility changes the message's visibility within opTimeout.
+func (c *Consumer) setVisibility(ctx context.Context, m types.Message, seconds int32, log *slog.Logger) {
+	ctx, cancel := context.WithTimeout(ctx, opTimeout)
 	defer cancel()
 	if _, err := c.api.ChangeMessageVisibility(ctx, &sqs.ChangeMessageVisibilityInput{
 		QueueUrl: aws.String(c.queueURL), ReceiptHandle: m.ReceiptHandle, VisibilityTimeout: seconds,
 	}); err != nil {
-		// The queue's visibility timeout still returns it later.
+		// The visibility set on receive still returns it later.
 		log.Warn("change visibility failed", slog.String("error", err.Error()))
 	}
 }
 
-// delete runs only after the handling committed. If it fails the message
-// comes back and the inbox reports it as a duplicate.
-func (c *Consumer) delete(m types.Message, log *slog.Logger) {
-	ctx, cancel := context.WithTimeout(context.Background(), opTimeout)
+// delete runs only after the handling committed, within opTimeout. If it
+// fails the message comes back and the inbox reports it as a duplicate.
+func (c *Consumer) delete(ctx context.Context, m types.Message, log *slog.Logger) {
+	ctx, cancel := context.WithTimeout(ctx, opTimeout)
 	defer cancel()
 	if _, err := c.api.DeleteMessage(ctx, &sqs.DeleteMessageInput{QueueUrl: aws.String(c.queueURL), ReceiptHandle: m.ReceiptHandle}); err != nil {
 		log.Warn("delete failed, message will be redelivered as a duplicate", slog.String("error", err.Error()))

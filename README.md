@@ -153,7 +153,7 @@ IAM's job in AWS.
 | Sender | a key mapped to no provider goes to the DLQ as `FORBIDDEN`; a `data.providerId` of another provider as `PROVIDER_MISMATCH`; nothing is persisted |
 | `MessageGroupId` | the `walletId`: per-wallet order, different wallets in parallel |
 | `MessageDeduplicationId` | the envelope `messageId` (best effort; the inbox and the database constraints are the guarantee) |
-| Visibility timeout / handler deadline | 60s / 15s |
+| Visibility timeout / handler deadline | 60s, set on every receive / 15s; after a group's first message, the next starts only while its deadline plus 5s still fits the visibility, otherwise it and the rest of the group are released for redelivery |
 | Attempts | transient failures retry with visibility `min(2^receiveCount, 60)`s; after 10 receives the redrive policy moves the message to `wager-transactions-dlq.fifo` |
 | Readiness | polling pauses while `/health/ready` fails, so an outage does not use up attempts |
 | Invalid or permanent | sent to the DLQ at once with `failureClass=PERMANENT`, `failureCode`, `originalMessageId`, `envelopeMessageId` and `originalSenderId` (the sender it was attributed to), then deleted; nothing is persisted |
@@ -283,6 +283,7 @@ from the `provider_id` claim. `/health/*` needs no token.
 | `CONSUMER_WAIT_SECONDS` | `20` | app | long-poll wait (0-20) |
 | `CONSUMER_MAX_MESSAGES` | `10` | app | messages per receive (1-10) |
 | `CONSUMER_HANDLER_TIMEOUT` | `15s` | app | deadline of one message |
+| `CONSUMER_VISIBILITY_TIMEOUT` | `60s` | app | visibility set on every receive; whole seconds, at least the handler deadline + 5s |
 | `CONSUMER_BACKOFF_MAX` | `60s` | app | longest visibility after a transient failure |
 | `CONSUMER_PAUSE_INTERVAL` | `1s` | app | readiness recheck while polling is paused |
 | `OUTBOX_LEASE` | `30s` | app | claim lease (ARCHITECTURE §9) |
