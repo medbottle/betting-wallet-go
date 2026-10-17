@@ -60,7 +60,13 @@ func TestPermissions(t *testing.T) {
 		{"internal reads any provider path", internal.CanReadProviderTransaction("provider-b"), nil},
 		{"no role reads provider path", noRoles.CanReadProviderTransaction("provider-a"), ErrForbidden},
 
-		// GET /wagering/transactions/{id}
+		// GET /wagering/transactions/{id}, before the lookup
+		{"provider looks transactions up", provA.CanLookUpTransactions(), nil},
+		{"internal looks transactions up", internal.CanLookUpTransactions(), nil},
+		{"no role cannot look up", noRoles.CanLookUpTransactions(), ErrForbidden},
+		{"zero principal cannot look up", zero.CanLookUpTransactions(), ErrForbidden},
+
+		// GET /wagering/transactions/{id}, once loaded
 		{"provider reads own transaction", provA.CanReadTransaction("provider-a"), nil},
 		{"provider reads other's transaction", provA.CanReadTransaction("provider-b"), ErrNotFound},
 		{"provider reads internal opening", provA.CanReadTransaction(""), ErrNotFound},

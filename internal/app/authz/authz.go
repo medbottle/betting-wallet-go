@@ -107,6 +107,18 @@ func (p Principal) CanReadProviderTransaction(pathProviderID string) error {
 	}
 }
 
+// CanLookUpTransactions: GET /wagering/transactions/{id}, before the
+// lookup. Only a provider or the internal service may look a transaction
+// up; anyone else is refused before anything is read, so the answer never
+// depends on whether the transaction exists (CHALLENGE §13). The
+// transaction found is then checked by CanReadTransaction.
+func (p Principal) CanLookUpTransactions() error {
+	if !p.valid() || !(p.Has(RoleProvider) || p.Has(RoleWalletInternal)) {
+		return ErrForbidden
+	}
+	return nil
+}
+
 // CanReadTransaction: GET /wagering/transactions/{id}, once the transaction
 // is loaded. A provider reads only its own (another provider's answers
 // 404); the internal service reads any. txProviderID is "" for internal

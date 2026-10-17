@@ -81,8 +81,13 @@ func (h handlers) submit(w http.ResponseWriter, r *http.Request) {
 
 // getTransaction is GET /wagering/transactions/{transactionId}: 200 with
 // the resource whatever its status; 404 when absent or another provider's.
+// A caller with neither role is refused (403) before the lookup, whether
+// the transaction exists or not.
 func (h handlers) getTransaction(w http.ResponseWriter, r *http.Request) {
 	p, err := principal(r)
+	if err == nil {
+		err = p.CanLookUpTransactions()
+	}
 	if err != nil {
 		h.writeAppError(w, r, err)
 		return
