@@ -22,6 +22,16 @@ var transientCodes = map[string]bool{
 	"57014": true, // query_canceled (statement_timeout or a cancel; ARCHITECTURE §24, Q2)
 }
 
+// unavailableCodes are server-side outages, also transient: the connection
+// was terminated or the server cannot take it (ARCHITECTURE §27, H-1).
+// Class 53 (insufficient resources) is matched by prefix. They are not
+// concurrency conflicts, so they stay out of the metric of transientCodes.
+var unavailableCodes = map[string]bool{
+	"57P01": true, // admin_shutdown (fast shutdown, pg_terminate_backend)
+	"57P02": true, // crash_shutdown
+	"57P03": true, // cannot_connect_now (starting up or shutting down)
+}
+
 // constraintSentinels maps unique constraints that carry a business meaning
 // to their sentinel; every other integrity violation is an invariant
 // violation.
@@ -41,7 +51,9 @@ func classify(err error) error {
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
 		switch {
-		case transientCodes[pgErr.Code], strings.HasPrefix(pgErr.Code, "08"): // 08: connection exception
+		case transientCodes[pgErr.Code], unavailableCodes[pgErr.Code],
+			strings.HasPrefix(pgErr.Code, "08"), // connection exception
+			strings.HasPrefix(pgErr.Code, "53"): // insufficient resources
 			return fmt.Errorf("%w: %w", app.ErrTransient, err)
 		case constraintSentinels[pgErr.ConstraintName] != nil && pgErr.Code == "23505":
 			return fmt.Errorf("%w: %w", constraintSentinels[pgErr.ConstraintName], err)

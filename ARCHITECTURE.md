@@ -116,7 +116,7 @@ flowchart LR
 
 **Por que `FOR NO KEY UPDATE` e não `FOR UPDATE`** (corrigido no slice 6): o `INSERT` da própria linha no passo 1 verifica a FK `wager_transactions → wallets`, e essa verificação toma `FOR KEY SHARE` na linha da carteira até o fim da transação. `FOR UPDATE` conflita com `FOR KEY SHARE`; `FOR NO KEY UPDATE` não. Com `FOR UPDATE`, duas operações diferentes na mesma carteira inseriam suas linhas (cada uma com `KEY SHARE` na carteira) e depois esperavam uma pela outra no passo 2: deadlock em 35 de 40 disputas medidas, com uma das apostas do caso 100.00 vs. 2 x 80.00 recebendo 503 em vez de `INSUFFICIENT_FUNDS`. O argumento acima, de que inserts antes do lock só disputam índices únicos, ignorava esse lock da FK. `FOR NO KEY UPDATE` continua sendo lock pessimista por carteira (conflita consigo mesmo, então escritores da mesma carteira entram em fila) e é o lock que o próprio Postgres toma num `UPDATE` de colunas que não são chave, como o do saldo. O que `FOR UPDATE` acrescentaria é proteção contra `DELETE` ou alteração de chave da carteira, já proibidos por trigger. O teste `TestNoDeadlockBetweenOperationsOnOneWallet` disputa duas operações na mesma carteira 40 vezes e exige zero `40P01`; ele falha se o lock voltar a ser `FOR UPDATE`.
 
-**Timeouts**: `lock_timeout = 5s` e `statement_timeout = 10s` (padrão de toda transação, seção 24). Os códigos `55P03`, `40P01`, `40001`, `57014` (comando cancelado, seção 24), erro de conexão e deadline de contexto são tratados como transitórios: rollback e retry.
+**Timeouts**: `lock_timeout = 5s` e `statement_timeout = 10s` (padrão de toda transação, seção 24). Os códigos `55P03`, `40P01`, `40001`, `57014` (comando cancelado, seção 24), `57P01`/`57P02`/`57P03` e a classe `53` (servidor encerrando a conexão ou sem recursos, seção 27), erro de conexão e deadline de contexto são tratados como transitórios: rollback e retry.
 
 **Por quê**: o agregado faz a aritmética e produz `balanceBefore`/`balanceAfter`. Com 50 duplicatas em paralelo, o lock enfileira as requisições sem as tempestades de retry do controle otimista. Carteiras distintas não competem entre si.
 
@@ -156,8 +156,9 @@ stateDiagram-v2
 - **Caminho síncrono**: `PENDING` vai a um estado terminal ou a `PENDING_REFERENCE` *na mesma transação*. Não há commit intermediário de aceite, então nunca existe `PENDING` confirmado no banco.
 - **Retomado por worker**: apenas `PENDING_REFERENCE`. O worker também busca `PENDING` vencido de forma defensiva.
 - **Falha transitória** (não persistida): o rollback desfaz tudo, o HTTP responde 503 e o SQS reentrega. Exemplos:
-  - perda de conexão;
-  - `40001`, `40P01` e `55P03`;
+  - perda de conexão, inclusive a encerrada pelo servidor (`57P01`, `57P02`, `57P03`) e a falta de recursos (classe `53`);
+  - `40001`, `40P01`, `55P03` e `57014`;
+  - qualquer erro não classificado (premissa A6), no submit e no worker (seção 27, H-1);
   - deadline de contexto;
   - erro 5xx ou throttling do SQS.
 - **Falha permanente** (`FAILED`, `INTERNAL_INVARIANT_VIOLATION`): violação de invariante que deveria ser impossível, como o CHECK de saldo ou de versão disparando apesar da verificação do domínio, um ledger inconsistente, ou o próprio domínio recusando a operação com `ErrInvalidTransaction` ou `ErrInvalidTransition` (por exemplo, uma carteira travada que não é a da transação). O submit e o worker tratam todos do mesmo jeito.
@@ -796,7 +797,7 @@ Tudo abaixo segue as seções 3, 4, 6, 8 e 9; os pontos que os documentos não d
 - Retorno `nil` faz commit; erro ou panic faz rollback (o panic é relançado). O rollback usa um contexto sem cancelamento, para funcionar mesmo com o contexto do chamador já cancelado.
 - Sem retry interno: um erro transitório faz rollback e volta como `ErrTransient`; quem repete é o transporte (HTTP 503, reentrega do SQS; seção 5). Um commit cuja conexão caiu tem resultado desconhecido e também é `ErrTransient`; repetir é seguro pela idempotência.
 
-**Classificação de erros**: `40001`, `40P01`, `55P03`, `57014` (decidido em Q2, seção 24), classe `08`, erros de conexão e deadline/cancelamento de contexto → `ErrTransient` (seção 4). `23505` em `wallets_player_currency_key` → `ErrWalletAlreadyExists`. Qualquer outro `23xxx` (CHECKs, FKs, índices únicos de salvaguarda, triggers `23000`) → `ErrInvariantViolation` (seção 5). O resto volta sem classificação e é tratado como transitório pelos transportes (premissa A6; seção 23, G8).
+**Classificação de erros**: `40001`, `40P01`, `55P03`, `57014` (decidido em Q2, seção 24), `57P01`, `57P02`, `57P03` e as classes `08` e `53` (seção 27), erros de conexão e deadline/cancelamento de contexto → `ErrTransient` (seção 4). `23505` em `wallets_player_currency_key` → `ErrWalletAlreadyExists`. Qualquer outro `23xxx` (CHECKs, FKs, índices únicos de salvaguarda, triggers `23000`) → `ErrInvariantViolation` (seção 5). O resto volta sem classificação e é tratado como transitório pelos transportes (premissa A6; seção 23, G8).
 
 **Repositórios** (só o que os fluxos de submit, abertura e reconciliação usam):
 - Carteira: `Insert`, `GetForUpdate` (`FOR NO KEY UPDATE`, seção 4), `UpdateBalance` com `WHERE version = $esperada` (0 linhas = violação de invariante, seção 4).
@@ -892,8 +893,8 @@ Tudo abaixo segue as seções 3, 4, 6, 8 e 9; os pontos que os documentos não d
 **Iteração** (`wagering.Service.ResolveNext`):
 - Contexto e `statement_timeout` de 10s por iteração (seção 14).
 - `NextAttemptAt` de um reagendamento usa `attempts + 1` na fórmula da seção 8: a tentativa em curso é a de número `attempts + 1`, então a espera seguinte cresce a partir dela (premissa A8).
-- Erro transitório (ou contexto cancelado no shutdown): rollback, a linha continua vencida e qualquer instância a retoma.
-- Qualquer outro erro: rollback e `FAILED`/`INTERNAL_INVARIANT_VIOLATION` numa transação separada, que trava a linha (`GetForUpdate`, só se ainda não terminal) e depois a carteira, como na seção 5. Assim uma linha quebrada não fica em retry infinito (premissa A9).
+- Erro transitório ou não classificado (ou contexto cancelado no shutdown): rollback, a linha continua vencida e qualquer instância a retoma.
+- Violação de invariante (a mesma categoria D do submit: `ErrInvariantViolation`, `ErrInvalidTransaction`, `ErrInvalidTransition`; seção 27, H-1): rollback e `FAILED`/`INTERNAL_INVARIANT_VIOLATION` numa transação separada, que trava a linha (`GetForUpdate`, só se ainda não terminal) e depois a carteira, como na seção 5. Assim uma linha quebrada não fica em retry infinito (premissa A9).
 - `ClaimDue` também pega `PENDING` vencido, como defesa (seção 5).
 - O fluxo de gravação é o mesmo do submit (`persist`, `findReference`), sem duplicação.
 
@@ -1116,6 +1117,18 @@ Uma revisão independente contra o desafio apontou um risco eliminatório (H1, "
 
 ---
 
+## 27. Decisões da revisão do avaliador
+
+Uma revisão independente, feita como um avaliador estrito a partir de um clone limpo, não encontrou item eliminatório e apontou os pontos abaixo. As correções seguem os documentos; o que eles não decidiam está registrado aqui.
+
+**H-1, falha transitória no worker gravava `FAILED`** (seções 3 e 6.3 do desafio): o worker gravava `FAILED/INTERNAL_INVARIANT_VIOLATION` para qualquer erro que não fosse `ErrTransient`, e o adapter não classificava `57P01` (conexão encerrada por `pg_terminate_backend`, fast shutdown ou failover) nem a classe `53`. Reproduzido: um `REFUND` em `PENDING_REFERENCE` virava `FAILED` quando a sessão do worker era encerrada enquanto ele esperava o lock da carteira; a `BET` chegava depois e o reembolso nunca era aplicado.
+- O worker agora grava `FAILED` só para violação de invariante, com o mesmo critério do submit (`ErrInvariantViolation`, `ErrInvalidTransaction`, `ErrInvalidTransition`). Erros transitórios e não classificados fazem rollback e a linha é tentada de novo, como a premissa A6 já fazia no HTTP (premissa A9 atualizada).
+- `classify` trata `57P01`, `57P02`, `57P03` e a classe `53` como transitórios. Eles não entram em `db_concurrency_conflicts_total`, que continua contando só conflitos de concorrência.
+- Um erro não classificado que se repete deixa a linha em retry a cada iteração do worker, com log `worker step failed`; isso é preferível a perder a operação, e o alerta vem do log e da linha ainda pendente.
+- Testes: `TestClassify` com os novos códigos; integração `TestWorkerRetriesTerminatedConnection` (encerra a sessão do worker com `pg_terminate_backend` enquanto ele espera o lock; a operação continua pendente e é aplicada quando a referência chega) e `TestWorkerRetriesUnclassifiedError` (um `XX000` injetado no lock). Os dois falham com o código anterior.
+
+---
+
 ## Esboço do schema
 
 > O schema implementado está em `migrations/`; a seção 16 registra onde ele refina este esboço.
@@ -1214,7 +1227,7 @@ Pontos que os documentos deixam abertos e como foram lidos. As seções citadas 
 - **A6. Erros não classificados respondem 503, retryable**: não persistiram nada e toda escrita é idempotente, então repetir é seguro; são logados em nível de erro. No SQS, o equivalente é o erro transitório (seção 23, G8).
 - **A7. `TRANSACTION_NOT_FOUND` é um código estável novo** (seção 12, "Leitura"), porque o corpo de erro exige um código.
 - **A8. O reagendamento do worker conta a tentativa em curso**: usa `attempts + 1` na fórmula da seção 8, então as esperas crescem 1s, 2s, 4s... até 60s (antes do jitter).
-- **A9. Qualquer falha não transitória no worker grava `FAILED`** (violação de invariante, ou erro de domínio que não deveria acontecer para uma linha persistida), para uma linha quebrada não ser tentada para sempre. No submit, as violações de invariante (do banco ou do domínio, `ErrInvalidTransaction`/`ErrInvalidTransition`) também gravam `FAILED` (seção 26, L1); os erros não classificados seguem a A6.
+- **A9. Só violações de invariante gravam `FAILED` no worker** (do banco ou do domínio, `ErrInvalidTransaction`/`ErrInvalidTransition`), para uma linha quebrada não ser tentada para sempre. Erros transitórios e não classificados fazem rollback e a linha é tentada de novo (seção 27, H-1); antes da revisão do avaliador, qualquer erro não transitório gravava `FAILED`. No submit, as violações de invariante (do banco ou do domínio, `ErrInvalidTransaction`/`ErrInvalidTransition`) também gravam `FAILED` (seção 26, L1); os erros não classificados seguem a A6.
 - **A10. O jitter da outbox é aditivo, até uma base**: sorteado em `[0, OUTBOX_BACKOFF_BASE)` (seção 22).
 - **A11. O corpo publicado é o JSONB armazenado**: mesmo conteúdo do snapshot, com ordem de chaves e espaços do Postgres; consumidores devem fazer parse, não comparar bytes.
 - **A12. Separação de credenciais do broker configurada, mas não verificada localmente**: o MiniStack só aplica IAM ao SQS com `AUTH=true`, modo que o projeto não usa, porque nele as chaves são geradas pelo emulador e teriam de ser provisionadas para cada papel e lidas pela aplicação e pelos testes. No modo padrão ele aceita qualquer credencial e não aplica políticas; os testes negativos são pulados com essa razão. As políticas de `deploy/aws/iam-policies.json` continuam sendo a definição para a AWS, sem aplicação local.

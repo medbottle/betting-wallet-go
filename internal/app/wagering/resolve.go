@@ -27,10 +27,10 @@ const ResolveIterationTimeout = 10 * time.Second
 //
 // The row lock is the claim: if the process dies, the transaction aborts
 // and any instance can claim the row again. didWork is false when nothing
-// was due. A transient error rolls back and is returned; the row stays due.
-// Any other failure rolls back and the row is recorded as FAILED in a
-// separate transaction (ARCHITECTURE §5), so a broken row cannot be retried
-// forever.
+// was due. A transient or unclassified error rolls back and is returned;
+// the row stays due. An invariant violation (the same category D as in
+// Submit) rolls back and the row is recorded as FAILED in a separate
+// transaction (ARCHITECTURE §5), so a broken row cannot be retried forever.
 func (s *Service) ResolveNext(ctx context.Context) (didWork bool, err error) {
 	start := time.Now()
 	outcome := "error"
@@ -93,7 +93,10 @@ func (s *Service) ResolveNext(ctx context.Context) (didWork bool, err error) {
 			s.metrics.TransactionOutcome(app.TransportWorker, res.Status(), res.FailureCode())
 		}
 		return true, nil
-	case claimed == uuid.Nil, errors.Is(err, app.ErrTransient), ctx.Err() != nil:
+	case claimed == uuid.Nil, ctx.Err() != nil, !isInvariantViolation(err):
+		// Transient or unclassified: rolled back, the row stays due and any
+		// instance retries it (ARCHITECTURE §27, H-1). Only an invariant
+		// violation, which no retry can fix, is recorded as FAILED.
 		return claimed != uuid.Nil, err
 	default:
 		if ferr := s.failClaimed(ctx, claimed, err); ferr != nil {
