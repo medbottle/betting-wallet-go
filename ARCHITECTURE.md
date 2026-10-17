@@ -4,6 +4,29 @@ Documento de decisões de arquitetura. Cada seção traz **Decisão**, **Por qu�
 
 Especificação de referência: [docs/CHALLENGE.md](docs/CHALLENGE.md).
 
+## Resumo (uma página)
+
+As decisões principais e onde cada uma está detalhada. As seções 1 a 14 são o desenho; as 15 a 25 registram o que cada slice decidiu; as 26 a 28, as correções das revisões independentes.
+
+| Tema (desafio) | Decisão | Onde |
+| --- | --- | --- |
+| Dinheiro (§5.1, §6.1) | `Money` = `int64` em unidades mínimas + moeda ISO 4217, escala 2; parser estrito sem float, overflow checado em parse, soma, subtração e negação; `BIGINT` + `CHAR(3)` no banco; um teste de AST barra `float32`/`float64` fora das métricas | §2, §17 |
+| Banco e transações (§4) | `pgx` com SQL explícito; `TxRunner.InTx` deixa a fronteira transacional visível no caso de uso; `READ COMMITTED` com locks explícitos, `REPEATABLE READ READ ONLY` na reconciliação | §3, §18 |
+| Concorrência (§5.6, §5.7, §8) | Lock pessimista por carteira (`SELECT ... FOR NO KEY UPDATE`), sem lock global; ordem de locks sem ciclo; `UPDATE` condicionado à versão; CHECK de saldo ≥ 0 | §4 |
+| Invariantes no banco (§5.3, §5.8) | Unicidade de operação, chave e lançamento; uma reversão por referência; ledger append-only por trigger e privilégios; trigger adiado liga cada mudança de saldo ao seu lançamento | §16, Esboço do schema |
+| Estados e falhas (§6.3) | Máquina de estados validada no domínio e no banco; transitório = rollback e retry; `FAILED` só para violação de invariante | §5, §27 (H-1) |
+| Idempotência (§5.2, §9) | Persistida em Postgres: `(provider, chave)` e `(provider, externalId)` únicos; hash SHA-256 de JSON canônico, igual em HTTP e SQS; replay devolve o resultado original | §6 |
+| Referências e reversões (§7) | `PENDING_REFERENCE` com worker `SKIP LOCKED`, backoff exponencial e TTL; regras de REFUND/ROLLBACK/WIN; uma reversão por operação | §7, §8, §21, §27 (L-1) |
+| Inbox e outbox (§6.5, §11) | Inbox na mesma transação do domínio; outbox com claim por lease, publicação fora de transação, `eventId` estável; relay pausa sem SQS | §9, §22, §27 (M-1, L-2) |
+| SQS (§10) | `MessageGroupId` = carteira; remoção só depois do commit; DLQ explícita para permanentes; redrive pelo `dlqredrive`; provedor tomado do `SenderId` autenticado | §10, §23, §26 (H1) |
+| Autenticação e autorização (§2) | Keycloak, `client_credentials`, JWT validado localmente (RS256, `iss`, `aud`, `exp`); `providerId` só da claim; papéis `provider` e `wallet-internal`; no broker, IAM aplicado pelo MiniStack com `AUTH=true` | §11, §19, §28 |
+| Códigos e contrato HTTP (§7, §9) | `failureCode` estáveis por categoria (entrada, rejeição, conflito, falha, transitório) e status HTTP de cada caso | §12, §13 |
+| Fx e shutdown (§4) | Fx só em `internal/bootstrap` e `cmd/`; módulos por papel; ordem de start e stop, drain e orçamento de 30s | §1, §14 |
+| Observabilidade (§12) | Logs JSON com os ids da operação; métricas Prometheus da lista do desafio; health de Postgres e SQS | §15, §25 |
+| Múltiplas instâncias (§8, §13) | Três processos via compose; quedas, reinício e indisponibilidade de Postgres e SQS simulados | §25 |
+
+Limitações, interpretações e o que ficou de fora: "Premissas e limitações", "Interpretações adotadas" e "Trabalho não concluído", no fim do documento.
+
 ---
 
 ## 1. Layout de pacotes e direção das dependências
