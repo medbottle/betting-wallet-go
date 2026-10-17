@@ -70,8 +70,11 @@ func (e apiEnv) events(t *testing.T, eventType, transactionID string) int {
 }
 
 // TestWorkerResolvesLateReference: CHALLENGE §13 item 7, resolution path.
-// A REFUND and a WIN arrive before their BET; once the BET is processed the
-// worker applies both, each exactly once.
+// A REFUND and a WIN arrive before their BETs; once the BETs are processed
+// the worker applies both, each exactly once. Each has its own BET: a WIN
+// on a BET that was refunded is rejected (ARCHITECTURE §27, L-1), so a
+// shared BET would make the outcome depend on which one the worker
+// applies first.
 func TestWorkerResolvesLateReference(t *testing.T) {
 	t.Parallel()
 	e := newAPIEnv(t, withReference(10*time.Minute, testBackoffBase, testBackoffMax))
@@ -79,7 +82,7 @@ func TestWorkerResolvesLateReference(t *testing.T) {
 	w := e.openWallet(t, "100.00")
 
 	refund := e.submit(t, "provider-a", op(w, "provider-a", "REFUND", "25.00", "late-refund", "late-bet"))
-	win := e.submit(t, "provider-a", op(w, "provider-a", "WIN", "5.00", "late-win", "late-bet"))
+	win := e.submit(t, "provider-a", op(w, "provider-a", "WIN", "5.00", "late-win", "late-win-bet"))
 	if refund.Status != http.StatusAccepted || win.Status != http.StatusAccepted {
 		t.Fatalf("early operations: %d %d", refund.Status, win.Status)
 	}
@@ -89,8 +92,10 @@ func TestWorkerResolvesLateReference(t *testing.T) {
 		t.Fatalf("refund resolved before its bet: %s", r.Raw)
 	}
 
-	if bet := e.submit(t, "provider-a", op(w, "provider-a", "BET", "25.00", "late-bet")); bet.Status != http.StatusOK {
-		t.Fatalf("bet: %d %s", bet.Status, bet.Raw)
+	for _, id := range []string{"late-bet", "late-win-bet"} {
+		if bet := e.submit(t, "provider-a", op(w, "provider-a", "BET", "25.00", id)); bet.Status != http.StatusOK {
+			t.Fatalf("bet %s: %d %s", id, bet.Status, bet.Raw)
+		}
 	}
 	gotRefund := e.waitStatus(t, "provider-a", "provider-a", "late-refund", "PROCESSED", 5*time.Second)
 	e.waitStatus(t, "provider-a", "provider-a", "late-win", "PROCESSED", 5*time.Second)
@@ -112,8 +117,8 @@ func TestWorkerResolvesLateReference(t *testing.T) {
 			t.Errorf("%s: %d ledger entries, want 1", id, n)
 		}
 	}
-	// 100 - 25 (bet) + 25 (refund) + 5 (win)
-	e.assertConsistent(t, w, "105.00")
+	// 100 - 25 - 25 (bets) + 25 (refund) + 5 (win)
+	e.assertConsistent(t, w, "80.00")
 }
 
 // TestWorkerExpiresReference: CHALLENGE §13 item 7, expiry path.
