@@ -103,6 +103,11 @@ services:
       SQS_INBOUND_DLQ: wager-transactions-dlq.fifo
       SQS_CONSUMER_ACCESS_KEY_ID: ${SQS_CONSUMER_ACCESS_KEY_ID:-wallet-consumer}
       SQS_CONSUMER_SECRET_ACCESS_KEY: ${SQS_CONSUMER_SECRET_ACCESS_KEY:-wallet-consumer-local-secret}
+      # Producer identities the consumer trusts (§10/§11): the SenderId of
+      # each provider's producer, and of the redrive operator. Locally each
+      # is a 12-digit MiniStack account, which MiniStack reports as SenderId.
+      SQS_PROVIDER_SENDERS: ${SQS_PROVIDER_SENDERS:-111111111111=provider-a,222222222222=provider-b}
+      SQS_OPERATOR_SENDER_ID: ${SQS_OPERATOR_SENDER_ID:-333333333333}
       LOG_LEVEL: ${LOG_LEVEL:-info}
       RUN_HTTP: "true"
       RUN_CONSUMER: "true"

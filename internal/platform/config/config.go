@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"reflect"
+	"regexp"
 	"strings"
 	"time"
 
@@ -75,6 +76,15 @@ type Config struct {
 	SQSInboundDLQ              string `env:"SQS_INBOUND_DLQ" envDefault:"wager-transactions-dlq.fifo"`
 	SQSConsumerAccessKeyID     string `env:"SQS_CONSUMER_ACCESS_KEY_ID,required,notEmpty"`
 	SQSConsumerSecretAccessKey string `env:"SQS_CONSUMER_SECRET_ACCESS_KEY,required,notEmpty"`
+	// SQSProviderSenders maps each producer's broker identity to the
+	// provider its messages act for, as senderId=providerId pairs separated
+	// by commas (ARCHITECTURE §10/§11). The sender id is the SenderId SQS
+	// reports, up to any ':' (an IAM user or role unique id; locally a
+	// MiniStack account). Read it with ProviderSenders.
+	SQSProviderSenders string `env:"SQS_PROVIDER_SENDERS"`
+	// SQSOperatorSenderID is the redrive operator's sender id: only its
+	// messages may name their original sender (ARCHITECTURE §10).
+	SQSOperatorSenderID string `env:"SQS_OPERATOR_SENDER_ID"`
 
 	// Consumer (ARCHITECTURE §10; pause interval §23).
 	ConsumerWaitSeconds    int32         `env:"CONSUMER_WAIT_SECONDS" envDefault:"20"`
@@ -201,6 +211,9 @@ func (c Config) Validate() error {
 			errs = append(errs, fmt.Errorf("%s must be a FIFO queue (.fifo)", q.name))
 		}
 	}
+	if c.RunConsumer {
+		errs = append(errs, c.validateSenders()...)
+	}
 	// ReceiveMessage limits: wait 0-20s, 1-10 messages.
 	if c.ConsumerWaitSeconds < 0 || c.ConsumerWaitSeconds > 20 {
 		errs = append(errs, errors.New("CONSUMER_WAIT_SECONDS must be between 0 and 20"))
@@ -251,6 +264,66 @@ func (c Config) SlogLevel() (slog.Level, error) {
 	default:
 		return 0, fmt.Errorf("LOG_LEVEL must be one of debug, info, warn, error (got %q)", c.LogLevel)
 	}
+}
+
+// providerIDFormat is the providers_id_format CHECK of the providers table.
+var providerIDFormat = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$`)
+
+// ProviderSenders parses SQS_PROVIDER_SENDERS into sender id -> provider
+// id. A sender appears once; several senders may act for one provider
+// (for example during a key rotation).
+func (c Config) ProviderSenders() (map[string]string, error) {
+	out := map[string]string{}
+	if strings.TrimSpace(c.SQSProviderSenders) == "" {
+		return out, nil
+	}
+	for _, pair := range strings.Split(c.SQSProviderSenders, ",") {
+		sender, provider, ok := strings.Cut(pair, "=")
+		switch {
+		case !ok || !validSenderID(sender) || !providerIDFormat.MatchString(provider):
+			return nil, fmt.Errorf("SQS_PROVIDER_SENDERS: %q is not senderId=providerId (sender: printable ASCII without spaces, ',', '=' or ':')", pair)
+		case out[sender] != "":
+			return nil, fmt.Errorf("SQS_PROVIDER_SENDERS: sender %q appears twice", sender)
+		}
+		out[sender] = provider
+	}
+	return out, nil
+}
+
+// validateSenders checks the broker identities the consumer trusts
+// (ARCHITECTURE §10): at least one provider sender, and an operator that
+// is not also a provider.
+func (c Config) validateSenders() []error {
+	senders, err := c.ProviderSenders()
+	if err != nil {
+		return []error{err}
+	}
+	var errs []error
+	if len(senders) == 0 {
+		errs = append(errs, errors.New("SQS_PROVIDER_SENDERS must map at least one sender when RUN_CONSUMER is true"))
+	}
+	switch {
+	case !validSenderID(c.SQSOperatorSenderID):
+		errs = append(errs, errors.New("SQS_OPERATOR_SENDER_ID must be set when RUN_CONSUMER is true (printable ASCII without spaces, ',', '=' or ':')"))
+	case senders[c.SQSOperatorSenderID] != "":
+		errs = append(errs, errors.New("SQS_OPERATOR_SENDER_ID must not also be a provider sender"))
+	}
+	return errs
+}
+
+// validSenderID: 1-128 printable ASCII characters without spaces and
+// without the separators of SQS_PROVIDER_SENDERS or the ':' that starts the
+// session part of a role's SenderId.
+func validSenderID(s string) bool {
+	if len(s) < 1 || len(s) > 128 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < 0x21 || s[i] > 0x7e || s[i] == ',' || s[i] == '=' || s[i] == ':' {
+			return false
+		}
+	}
+	return true
 }
 
 // withEnvNames rewrites the library's parse errors, which name the Go

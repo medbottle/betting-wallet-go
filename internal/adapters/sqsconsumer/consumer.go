@@ -1,7 +1,9 @@
 // Package sqsconsumer consumes wager-transactions.fifo (ARCHITECTURE §10)
 // and hands each message to SubmitWagerTransaction with an inbox entry
-// (§9). A message is deleted only after its handling committed; transient
-// failures change its visibility; permanent ones go to the DLQ explicitly.
+// (§9). The provider a message acts for comes from its sender's broker
+// identity, never from the body alone (§11). A message is deleted only
+// after its handling committed; transient failures change its visibility;
+// permanent ones go to the DLQ explicitly.
 package sqsconsumer
 
 import (
@@ -10,6 +12,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -19,6 +22,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
 
 	"github.com/medbottle/betting-wallet-go/internal/app"
+	"github.com/medbottle/betting-wallet-go/internal/app/authz"
 	"github.com/medbottle/betting-wallet-go/internal/app/wagering"
 	"github.com/medbottle/betting-wallet-go/internal/domain/wager"
 	"github.com/medbottle/betting-wallet-go/internal/platform/health"
@@ -44,6 +48,20 @@ const (
 	FailureClassPermanent = "PERMANENT"
 )
 
+// AttrOriginalSenderID carries the original producer of a message the
+// redrive operator resent. The consumer trusts it only on messages whose
+// SenderId is the operator's (ARCHITECTURE §10).
+const AttrOriginalSenderID = "originalSenderId"
+
+// Authorization codes of ARCHITECTURE §12, used as the DLQ failureCode.
+const (
+	codeForbidden        wager.FailureCode = "FORBIDDEN"
+	codeProviderMismatch wager.FailureCode = "PROVIDER_MISMATCH"
+)
+
+// errUnknownSender means a message's broker identity maps to no provider.
+var errUnknownSender = errors.New("sqs: sender is not a registered provider identity")
+
 // API is the part of the SQS client the consumer uses.
 type API interface {
 	GetQueueUrl(ctx context.Context, in *sqs.GetQueueUrlInput, optFns ...func(*sqs.Options)) (*sqs.GetQueueUrlOutput, error)
@@ -64,7 +82,8 @@ type Readiness interface {
 	CheckNow(ctx context.Context)
 }
 
-// Config holds the queue names and timings (ARCHITECTURE §10/§23).
+// Config holds the queue names, timings and trusted senders (ARCHITECTURE
+// §10/§23).
 type Config struct {
 	Queue          string
 	DLQ            string
@@ -73,6 +92,12 @@ type Config struct {
 	HandlerTimeout time.Duration
 	BackoffMax     time.Duration
 	PauseInterval  time.Duration
+	// Senders maps a producer's broker identity (the SenderId up to any ':')
+	// to the provider its messages act for.
+	Senders map[string]string
+	// OperatorSenderID is the redrive operator's identity: only its messages
+	// may name their original sender in AttrOriginalSenderID.
+	OperatorSenderID string
 }
 
 // Stats counts message outcomes.
@@ -138,6 +163,9 @@ func (c *Consumer) Start() error {
 	}
 	if c.cfg.HandlerTimeout <= 0 || c.cfg.PauseInterval <= 0 || c.cfg.MaxMessages < 1 {
 		return errors.New("consumer: handler timeout, pause interval and max messages must be positive")
+	}
+	if len(c.cfg.Senders) == 0 {
+		return errors.New("consumer: no provider sender identities configured")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	c.cancel, c.done, c.started = cancel, make(chan struct{}), true
@@ -208,7 +236,9 @@ func (c *Consumer) loop(ctx context.Context) {
 			WaitTimeSeconds:     c.cfg.WaitSeconds,
 			MessageSystemAttributeNames: []types.MessageSystemAttributeName{
 				types.MessageSystemAttributeNameMessageGroupId, types.MessageSystemAttributeNameApproximateReceiveCount,
+				types.MessageSystemAttributeNameSenderId,
 			},
+			MessageAttributeNames: []string{AttrOriginalSenderID},
 		})
 		if err != nil {
 			if ctx.Err() == nil {
@@ -265,14 +295,34 @@ func (c *Consumer) handleBatch(stop context.Context, msgs []types.Message) {
 
 // handle processes one message and settles it with SQS. It reports false
 // when the message was left for redelivery (the group must stop).
+//
+// The order follows the HTTP transport (ARCHITECTURE §11): authenticate
+// the sender, parse the envelope, check its providerId against the
+// sender's provider, then run the use case. The first three persist
+// nothing and fail permanently.
 func (c *Consumer) handle(stop context.Context, m types.Message) bool {
 	sqsID := aws.ToString(m.MessageId)
-	log := c.logger.With(slog.String("sqsMessageId", sqsID))
-	p, envID, err := parseEnvelope([]byte(aws.ToString(m.Body)))
+	body := []byte(aws.ToString(m.Body))
+	sender := originalSender(m, c.cfg.OperatorSenderID)
+	log := c.logger.With(slog.String("sqsMessageId", sqsID), slog.String("senderId", sender))
+	principal, err := c.authenticate(sender)
 	if err != nil {
-		return c.deadLetter(m, envID, err, log)
+		return c.deadLetterCode(m, peekMessageID(body), sender, codeForbidden, err, log)
+	}
+	providerID, _ := principal.ProviderID()
+	log = log.With(slog.String("providerId", providerID))
+	p, envID, err := parseEnvelope(body)
+	if err != nil {
+		return c.deadLetter(m, envID, sender, err, log)
 	}
 	log = log.With(slog.String("messageId", p.MessageID))
+	if err := principal.CanSubmitTransaction(p.Raw.ProviderID); err != nil {
+		code := codeForbidden
+		if errors.Is(err, authz.ErrProviderMismatch) {
+			code = codeProviderMismatch
+		}
+		return c.deadLetterCode(m, envID, sender, code, fmt.Errorf("%w: the sender acts for %s, the message names %q", err, providerID, p.Raw.ProviderID), log)
+	}
 
 	// The handler deadline is independent of Stop: in-flight work finishes
 	// or rolls back on its own (ARCHITECTURE §14).
@@ -295,10 +345,41 @@ func (c *Consumer) handle(stop context.Context, m types.Message) bool {
 		return true
 	}
 	if code, ok := permanentCode(err); ok {
-		return c.deadLetterCode(m, envID, code, err, log)
+		return c.deadLetterCode(m, envID, sender, code, err, log)
 	}
 	c.retry(stop, m, err, log)
 	return false
+}
+
+// originalSender is the broker identity a message is attributed to: the
+// SenderId SQS reports or, when the redrive operator sent it, the original
+// sender it names in AttrOriginalSenderID (ARCHITECTURE §10). No other
+// sender is trusted with that attribute. "" when unknown.
+func originalSender(m types.Message, operatorSenderID string) string {
+	s := principalID(m.Attributes[string(types.MessageSystemAttributeNameSenderId)])
+	if s != "" && s == principalID(operatorSenderID) {
+		return principalID(aws.ToString(m.MessageAttributes[AttrOriginalSenderID].StringValue))
+	}
+	return s
+}
+
+// principalID is a SenderId up to any ':'. An IAM role's SenderId is
+// <role id>:<session name>, and the caller picks the session name; the
+// role id is the identity.
+func principalID(senderID string) string {
+	id, _, _ := strings.Cut(senderID, ":")
+	return id
+}
+
+// authenticate maps a sender to the provider it acts for. The principal
+// holds the provider role only: it may submit operations for that
+// provider and nothing else (ARCHITECTURE §11).
+func (c *Consumer) authenticate(sender string) (authz.Principal, error) {
+	providerID, ok := c.cfg.Senders[sender]
+	if sender == "" || !ok {
+		return authz.Principal{}, fmt.Errorf("%w: %q", errUnknownSender, sender)
+	}
+	return authz.NewPrincipal(sender, providerID, []string{string(authz.RoleProvider)})
 }
 
 // permanentCode classifies a use case error (ARCHITECTURE §10/§23):
@@ -316,26 +397,27 @@ func permanentCode(err error) (wager.FailureCode, bool) {
 	case errors.As(err, &ce):
 		return ce.Code, true
 	case errors.Is(err, app.ErrProviderNotAllowed):
-		return "FORBIDDEN", true
+		return codeForbidden, true
 	case errors.Is(err, app.ErrInboxHashMismatch):
 		return wager.CodeInvalidRequest, true
 	}
 	return "", false
 }
 
-func (c *Consumer) deadLetter(m types.Message, envID string, err error, log *slog.Logger) bool {
+func (c *Consumer) deadLetter(m types.Message, envID, sender string, err error, log *slog.Logger) bool {
 	code := wager.CodeInvalidRequest
 	var ve *wager.ValidationError
 	if errors.As(err, &ve) {
 		code = ve.Code
 	}
-	return c.deadLetterCode(m, envID, code, err, log)
+	return c.deadLetterCode(m, envID, sender, code, err, log)
 }
 
 // deadLetterCode sends the message to the DLQ, then deletes it. A failed
 // send leaves the message for redelivery; the send is deduplicated by the
-// SQS MessageId if it is repeated within 5 minutes.
-func (c *Consumer) deadLetterCode(m types.Message, envID string, code wager.FailureCode, cause error, log *slog.Logger) bool {
+// SQS MessageId if it is repeated within 5 minutes. The copy names the
+// sender it was attributed to, since its own SenderId is the consumer's.
+func (c *Consumer) deadLetterCode(m types.Message, envID, sender string, code wager.FailureCode, cause error, log *slog.Logger) bool {
 	attrs := map[string]types.MessageAttributeValue{
 		AttrFailureClass:      strAttr(FailureClassPermanent),
 		AttrFailureCode:       strAttr(string(code)),
@@ -343,6 +425,9 @@ func (c *Consumer) deadLetterCode(m types.Message, envID string, code wager.Fail
 	}
 	if envID != "" {
 		attrs[AttrEnvelopeMessageID] = strAttr(envID)
+	}
+	if sender != "" {
+		attrs[AttrOriginalSenderID] = strAttr(sender)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), opTimeout)
 	defer cancel()

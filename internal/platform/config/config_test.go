@@ -16,6 +16,36 @@ func validVars() map[string]string {
 		"SQS_PUBLISHER_SECRET_ACCESS_KEY": "publisher-secret",
 		"SQS_CONSUMER_ACCESS_KEY_ID":      "consumer",
 		"SQS_CONSUMER_SECRET_ACCESS_KEY":  "consumer-secret",
+		"SQS_PROVIDER_SENDERS":            "111111111111=provider-a,222222222222=provider-b",
+		"SQS_OPERATOR_SENDER_ID":          "333333333333",
+	}
+}
+
+func TestProviderSenders(t *testing.T) {
+	c, err := LoadFrom(validVars())
+	if err != nil {
+		t.Fatalf("LoadFrom: %v", err)
+	}
+	got, err := c.ProviderSenders()
+	if err != nil || len(got) != 2 || got["111111111111"] != "provider-a" || got["222222222222"] != "provider-b" {
+		t.Fatalf("senders = %v, %v", got, err)
+	}
+
+	// Several identities may act for one provider (key rotation); AWS
+	// unique ids are accepted as they are.
+	c.SQSProviderSenders = "AIDAEXAMPLEUSER01=provider-a,AROAEXAMPLEROLE01=provider-a"
+	if got, err := c.ProviderSenders(); err != nil || got["AIDAEXAMPLEUSER01"] != "provider-a" || got["AROAEXAMPLEROLE01"] != "provider-a" {
+		t.Fatalf("senders = %v, %v", got, err)
+	}
+}
+
+func TestSendersOnlyRequiredForTheConsumer(t *testing.T) {
+	vars := validVars()
+	delete(vars, "SQS_PROVIDER_SENDERS")
+	delete(vars, "SQS_OPERATOR_SENDER_ID")
+	vars["RUN_CONSUMER"] = "false"
+	if _, err := LoadFrom(vars); err != nil {
+		t.Fatalf("no consumer, no senders needed: %v", err)
 	}
 }
 
@@ -114,6 +144,15 @@ func TestLoadFromRejectsInvalid(t *testing.T) {
 		{"wait above 20", func(m map[string]string) { m["CONSUMER_WAIT_SECONDS"] = "21" }, "CONSUMER_WAIT_SECONDS"},
 		{"zero messages", func(m map[string]string) { m["CONSUMER_MAX_MESSAGES"] = "0" }, "CONSUMER_MAX_MESSAGES"},
 		{"zero handler timeout", func(m map[string]string) { m["CONSUMER_HANDLER_TIMEOUT"] = "0s" }, "CONSUMER_HANDLER_TIMEOUT"},
+		{"no provider senders", func(m map[string]string) { delete(m, "SQS_PROVIDER_SENDERS") }, "SQS_PROVIDER_SENDERS"},
+		{"sender without provider", func(m map[string]string) { m["SQS_PROVIDER_SENDERS"] = "111111111111" }, "SQS_PROVIDER_SENDERS"},
+		{"sender with session part", func(m map[string]string) { m["SQS_PROVIDER_SENDERS"] = "AROAX:session=provider-a" }, "SQS_PROVIDER_SENDERS"},
+		{"bad provider id", func(m map[string]string) { m["SQS_PROVIDER_SENDERS"] = "111111111111=provider a" }, "SQS_PROVIDER_SENDERS"},
+		{"duplicate sender", func(m map[string]string) {
+			m["SQS_PROVIDER_SENDERS"] = "111111111111=provider-a,111111111111=provider-b"
+		}, "appears twice"},
+		{"missing operator sender", func(m map[string]string) { delete(m, "SQS_OPERATOR_SENDER_ID") }, "SQS_OPERATOR_SENDER_ID"},
+		{"operator is a provider", func(m map[string]string) { m["SQS_OPERATOR_SENDER_ID"] = "111111111111" }, "SQS_OPERATOR_SENDER_ID"},
 		{"zero pool size", func(m map[string]string) { m["DB_MAX_CONNS"] = "0" }, "DB_MAX_CONNS"},
 		{"bad bool", func(m map[string]string) { m["RUN_HTTP"] = "maybe" }, "RUN_HTTP"},
 		{"empty listen address", func(m map[string]string) { m["HTTP_ADDR"] = " " }, "HTTP_ADDR"},

@@ -344,9 +344,24 @@ stateDiagram-v2
 - **`MessageDeduplicationId = messageId`**, igual à identidade da inbox. É apenas best effort; as garantias vêm da inbox e das constraints.
 
 **Recepção**:
-- Long poll (`WaitTimeSeconds = 20`, `MaxNumberOfMessages = 10`, `AttributeNames = [MessageGroupId, ApproximateReceiveCount]`).
+- Long poll (`WaitTimeSeconds = 20`, `MaxNumberOfMessages = 10`, `AttributeNames = [MessageGroupId, ApproximateReceiveCount, SenderId]`, `MessageAttributeNames = [originalSenderId]`).
 - Mensagens do mesmo grupo em um lote são processadas em sequência; grupos diferentes, em paralelo.
 - Visibility timeout de 60s e deadline por mensagem de 15s.
+
+**Identidade do produtor** (o `providerId` vem da identidade autenticada, nunca só do corpo; seção 11):
+- Cada provedor publica com uma identidade própria no broker: um usuário ou role IAM por provedor. A política de recurso de `wager-transactions.fifo` só permite `SendMessage` a essas identidades e ao operador do redrive (`deploy/aws/iam-policies.json`).
+- O consumidor pede o atributo de sistema `SenderId` e o mapeia para o provedor pela configuração `SQS_PROVIDER_SENDERS` (pares `senderId=providerId`). Vale o `SenderId` até o primeiro `:`: numa role ele é `<id da role>:<nome da sessão>`, e o nome da sessão é escolhido por quem assume a role.
+- A ordem é a do HTTP (autenticar, ler o corpo, conferir o `providerId`, executar o caso de uso), e os três primeiros passos acontecem antes de qualquer acesso ao banco:
+  1. remetente sem provedor mapeado, ou mensagem sem `SenderId`: DLQ com `FORBIDDEN`;
+  2. envelope inválido: DLQ com o código do envelope (abaixo);
+  3. `data.providerId` diferente do provedor do remetente: DLQ com `PROVIDER_MISMATCH`.
+
+  Os três são falhas permanentes e não gravam nada (nem inbox, nem transação). Um provedor não consegue enviar, reproduzir nem reverter operações de outro. Depois deles, o caso de uso ainda consulta o registro de provedores: provedor mapeado mas inativo recebe `FORBIDDEN`.
+- **Por que configuração, e não uma tabela**: o vínculo identidade → provedor é configuração de implantação, como o mapper fixo `provider_id` de cada client do Keycloak no HTTP. Os ids do IAM pertencem à conta AWS de cada ambiente, e um seed numa migration levaria identidades locais para produção. A tabela `providers` continua sendo o registro de negócio (ativo/inativo) dos dois transportes. A configuração é validada no start: com `RUN_CONSUMER=true`, sem nenhum remetente mapeado, ou com o operador também mapeado como provedor, o processo não sobe.
+- **Reenvio pelo operador**: o `dlqredrive` publica com a identidade do operador, então o `SenderId` do reenvio é o dele. O remetente original vai no atributo de mensagem `originalSenderId`, que o consumidor só aceita quando o `SenderId` é o do operador (`SQS_OPERATOR_SENDER_ID`); de qualquer outro remetente o atributo é ignorado.
+  - O `dlqredrive` preenche o atributo com o `SenderId` da mensagem na DLQ (o redrive da fila preserva o `SenderId` e os atributos). Só mantém o atributo que a mensagem já trazia quando ela mesma veio do operador (um segundo redrive); de outro remetente, sobrescreve.
+  - A cópia que o consumidor manda à DLQ traz `originalSenderId` com o remetente atribuído, porque o `SenderId` da cópia é o do consumidor.
+- **No MiniStack**: o `SenderId` é a conta de quem envia, e uma chave de acesso de 12 dígitos é a própria conta (verificado em 2026-10-17 com a imagem 1.5.27). Localmente, cada identidade conferida é portanto uma conta: `provider-a` = `111111111111`, `provider-b` = `222222222222`, operador = `333333333333`. As demais chaves (consumidor, publisher) ficam na conta padrão `000000000000`, dona das filas, e não são identidade de provedor nem de operador. O `dlqredrive` acha as filas na conta delas com `SQS_QUEUE_OWNER_ACCOUNT_ID` (`QueueOwnerAWSAccountId`). Como o modo padrão do MiniStack não autentica chaves (premissa A12), qualquer um pode apresentar `111111111111`: os testes locais provam o vínculo do remetente ao provedor no consumidor, e autenticar a identidade no broker é papel do IAM na AWS (premissa A22).
 
 **Ordem no lote após falha transitória**: se a mensagem k do grupo G falhar de forma transitória, as mensagens seguintes de G no mesmo lote **não são processadas**. Elas são liberadas com `ChangeMessageVisibility(0)`. O FIFO não as entrega antes de k enquanto k estiver em voo, então a ordem do grupo é preservada.
 
@@ -362,18 +377,20 @@ stateDiagram-v2
 
 **Mensagem inválida ou erro permanente**:
 - Inclui:
+  - remetente que não é identidade de um provedor (`FORBIDDEN`);
+  - `data.providerId` de outro provedor que não o do remetente (`PROVIDER_MISMATCH`);
   - envelope ou JSON inválido;
   - violação de schema ou de `Money`;
   - `kind = OPENING`;
   - hash divergente na inbox;
   - conflito de idempotência ou de ID externo;
-  - provedor desconhecido.
+  - provedor desconhecido ou inativo.
 - Tratamento: `SendMessage` explícito para a DLQ e, em seguida, `DeleteMessage` na fila de entrada. Nenhum registro de domínio é gravado.
 - **Por quê**: esperar o redrive bloquearia o grupo inteiro da carteira por 10 visibility timeouts.
 - **Campos do envio à DLQ** (não dependem do envelope):
   - `MessageGroupId` = atributo de sistema `MessageGroupId` da mensagem recebida, sempre presente em FIFO; fallback defensivo: `invalid-messages`.
   - `MessageDeduplicationId` = `MessageId` atribuído pelo SQS à mensagem recebida, estável entre recebimentos. Assim, um envio duplicado por queda entre send e delete é deduplicado na janela de 5 minutos.
-  - Atributos `failureClass=PERMANENT`, `failureCode`, `originalMessageId` (do SQS) e `envelopeMessageId` (se parseável).
+  - Atributos `failureClass=PERMANENT`, `failureCode`, `originalMessageId` (do SQS), `envelopeMessageId` (se parseável) e `originalSenderId` (o remetente atribuído, se houver).
 
 **Rejeição de negócio**: é commitada como `REJECTED`, e a mensagem é removida.
 
@@ -382,7 +399,7 @@ stateDiagram-v2
 2. Mensagens com `failureClass=PERMANENT` exigem correção pelo produtor. **Não** são reenviadas como estão.
 3. Mensagens sem esse atributo (vindas do redrive por esgotamento transitório) são reenviadas com a ferramenta `cmd/dlqredrive`:
    - lê da DLQ;
-   - faz `SendMessage` para a fila de origem com o mesmo body e o mesmo `MessageGroupId`, e `MessageDeduplicationId = <MessageId>:redrive:<unixSeconds>`;
+   - faz `SendMessage` para a fila de origem com o mesmo body e o mesmo `MessageGroupId`, `MessageDeduplicationId = <MessageId>:redrive:<unixSeconds>` e o atributo `originalSenderId` com o remetente original (ver "Identidade do produtor");
    - remove da DLQ após o envio.
 4. É seguro porque o `messageId` do envelope não muda: a inbox e a idempotência absorvem mensagens que já tinham sido processadas.
 5. O `StartMessageMoveTask` da AWS pode ser usado onde houver suporte a FIFO, mas não dependemos dele.
@@ -392,9 +409,9 @@ stateDiagram-v2
 **Saída de eventos**: SQS FIFO `wallet-events.fifo`, com DLQ `wallet-events-dlq.fifo` para consumidores downstream, `MessageGroupId = aggregateId` (`walletId`) e `MessageDeduplicationId = eventId`.
 
 **Controle de acesso no broker**:
-- Credenciais separadas para consumidor e publisher.
-- Políticas de fila: o consumidor recebe `ReceiveMessage`, `DeleteMessage` e `ChangeMessageVisibility` na entrada, e `SendMessage` na DLQ de entrada. O publisher recebe somente `SendMessage` em `wallet-events.fifo`.
-- As políticas de menor privilégio de cada identidade (consumidor, publisher e operador do `dlqredrive`) estão em `deploy/aws/iam-policies.json`, para uma conta AWS real.
+- Credenciais separadas para consumidor, publisher, operador do `dlqredrive` e cada provedor (produtor).
+- Políticas de fila: o consumidor recebe `ReceiveMessage`, `DeleteMessage` e `ChangeMessageVisibility` na entrada, e `SendMessage` na DLQ de entrada. O publisher recebe somente `SendMessage` em `wallet-events.fifo`. Cada produtor recebe somente `SendMessage` na entrada, e a política de recurso da entrada nega `SendMessage` a qualquer identidade que não seja um produtor ou o operador.
+- As políticas de menor privilégio de cada identidade (consumidor, publisher, operador e produtores) e a política da fila de entrada estão em `deploy/aws/iam-policies.json`, para uma conta AWS real.
 - **IAM no emulador**: o MiniStack (seção 15) só aplica IAM ao SQS quando iniciado com `AUTH=true`, modo que este projeto não usa. Nesse modo as chaves de acesso são geradas pelo próprio emulador, então teriam de ser provisionadas para cada papel e lidas pela aplicação e pelos testes. No modo padrão, o adotado, ele aceita qualquer credencial e não avalia políticas.
   - Os testes negativos (as credenciais do publisher não conseguem `ReceiveMessage` na entrada; as do consumidor não publicam numa fila de eventos) são pulados com essa razão explícita (seções 22 e 23, premissa A12).
   - As políticas de `deploy/aws/iam-policies.json` continuam sendo a definição para a AWS.
@@ -443,6 +460,7 @@ stateDiagram-v2
 - `providerId` no body diferente da claim: `403 PROVIDER_MISMATCH`, sem efeitos.
 - `providerId` no path diferente da claim, ou transação de outro provedor: `404`, para não revelar existência.
 - Alternativa: usar `azp` como `providerId`. Seria mais simples, mas acopla o nome do client ao domínio.
+- **No SQS** a identidade é a do remetente no broker: o `SenderId` é mapeado para o provedor por `SQS_PROVIDER_SENDERS`, e o consumidor confere `data.providerId` com a mesma regra (`CanSubmitTransaction`) antes de qualquer efeito. Divergência vai para a DLQ com `PROVIDER_MISMATCH`; remetente desconhecido, com `FORBIDDEN` (seção 10, "Identidade do produtor").
 
 **Registro de provedores**: a tabela `providers` (seed `provider-a`, `provider-b`) é consultada por HTTP e SQS. Provedor desconhecido ou inativo é rejeitado. Não há vínculo entre provedor e jogador/carteira: qualquer provedor registrado pode operar qualquer carteira.
 
@@ -487,7 +505,7 @@ stateDiagram-v2
 
 **Categoria E: transitória** (`503`, não persistida, retry): `TEMPORARILY_UNAVAILABLE`.
 
-**Autenticação**: `UNAUTHENTICATED` (401), `FORBIDDEN` (403), `PROVIDER_MISMATCH` (403).
+**Autenticação**: `UNAUTHENTICATED` (401), `FORBIDDEN` (403), `PROVIDER_MISMATCH` (403). No SQS, `FORBIDDEN` e `PROVIDER_MISMATCH` são o `failureCode` da DLQ (seção 10).
 
 **Leitura**: `TRANSACTION_NOT_FOUND` (404): transação inexistente ou de outro provedor, sem revelar qual (seção 20).
 
@@ -937,7 +955,7 @@ Regras para consumidores: a entrega é at-least-once, então deduplicar por `eve
 - **G8**: erro não classificado no handler é transitório (sem remoção, visibility com backoff), como a premissa A6 faz no HTTP; o redrive da fila manda para a DLQ depois de 10 recebimentos.
 
 **Interpretações**:
-- **Códigos na DLQ**: provedor desconhecido ou inativo usa `FORBIDDEN`, o mesmo código que o HTTP devolve para `ErrProviderNotAllowed`; hash divergente na inbox usa `INVALID_REQUEST` ("mensagem inválida", seção 10). Conflitos usam `IDEMPOTENCY_KEY_CONFLICT`/`EXTERNAL_ID_CONFLICT`. Nenhum código novo foi criado.
+- **Códigos na DLQ**: provedor desconhecido ou inativo usa `FORBIDDEN`, o mesmo código que o HTTP devolve para `ErrProviderNotAllowed`; hash divergente na inbox usa `INVALID_REQUEST` ("mensagem inválida", seção 10). Conflitos usam `IDEMPOTENCY_KEY_CONFLICT`/`EXTERNAL_ID_CONFLICT`. Nenhum código novo foi criado. A revisão de conformidade (seção 26) acrescentou remetente desconhecido (`FORBIDDEN`) e `providerId` de outro provedor (`PROVIDER_MISMATCH`), também códigos existentes.
 - **`correlationId` no SQS**: o envelope não tem campo de correlação, então o `messageId` do envelope é usado como `correlationId` e como `causationId` da transação e dos eventos.
 - **Replay pela inbox**: se o `messageId` é novo mas a operação já existe (mesma chave, por exemplo enviada antes pelo HTTP), a inbox é concluída com a transação existente e o status dela; a mensagem é removida. Se a operação existente ainda estiver `PENDING` (só uma linha antiga deixada para o worker, seção 5), o handler devolve erro transitório e a mensagem volta depois, porque a inbox não aceita `PENDING` como resultado.
 - **Duplicata**: `messageId` existente com o mesmo hash devolve a transação original sem tocar em nada; um registro de inbox commitado sem conclusão não deveria existir (insert e conclusão estão na mesma transação) e, se aparecer, é tratado como erro não classificado.
@@ -1034,6 +1052,24 @@ Séries para alertar: `wager_transactions_total{status="FAILED"}`, `outbox_parke
 Todo teste termina com os invariantes: nenhuma operação pendente, reconciliação consistente com o saldo esperado, um lançamento por operação processada que move dinheiro, outbox esvaziada sem estacionados e cada `eventId` commitado recebido em `wallet-events.fifo` (repetições são permitidas e logadas).
 
 **Limitação**: a suíte roda no host e dirige a pilha pelo `docker compose`, então não roda com `-race` neste ambiente (sem gcc no host, e a imagem Go usada para o `-race` não tem o CLI do Docker). Os processos testados são os binários da imagem, que não são compilados com o detector de corrida em nenhum caso; o detector cobre os testes unitários e de integração (premissa N7).
+
+---
+
+## 26. Decisões da revisão de conformidade
+
+Uma revisão independente contra o desafio apontou um risco eliminatório (H1, "acesso não autorizado" da seção 14 do desafio) e pontos menores. As correções seguem os documentos; o que eles não decidiam está registrado aqui e nas interpretações.
+
+**H1, provedor de uma mensagem SQS** (seções 2 e 14 do desafio): o consumidor tomava `data.providerId` só do corpo, então quem pudesse publicar na fila agia em nome de qualquer provedor. Agora o provedor vem da identidade do remetente no broker (seção 10, "Identidade do produtor"; seção 11):
+- configuração: `SQS_PROVIDER_SENDERS` e `SQS_OPERATOR_SENDER_ID` na aplicação; `SQS_OPERATOR_SENDER_ID` e `SQS_QUEUE_OWNER_ACCOUNT_ID` no `dlqredrive`;
+- remetente desconhecido: `FORBIDDEN`; `providerId` de outro provedor: `PROVIDER_MISMATCH` (seção 12); ambos permanentes e sem nada gravado; nenhum código novo;
+- a fila única da seção 10 do desafio é mantida; o vínculo vem do `SenderId`, não de uma fila por provedor;
+- `originalSenderId` preserva o remetente no redrive e só é aceito do operador;
+- as políticas dos produtores e a política de recurso da fila de entrada estão em `deploy/aws/iam-policies.json`.
+
+**Testes de H1**:
+- Unitários: mapa de remetentes, atributo aceito só do operador, sessão de role, ordem autenticar → envelope → `providerId`, atributos da cópia na DLQ, redrive mantendo ou sobrescrevendo o atributo, validação da configuração.
+- Integração (MiniStack, Postgres e Keycloak reais): as credenciais de `provider-a` não conseguem criar, reproduzir nem reverter operações de `provider-b` (DLQ com `PROVIDER_MISMATCH`, nenhuma linha nova de transação, inbox, ledger ou outbox, a operação de `provider-b` intacta); a chave da conta padrão e o operador sem `originalSenderId` recebem `FORBIDDEN`; um provedor inativo também; o redrive com a identidade do operador, que resolve as filas na conta dona, é processado como `provider-a`.
+- Múltiplas instâncias: as mensagens da suíte são enviadas com a chave de `provider-a`.
 
 ---
 
@@ -1139,12 +1175,15 @@ Pontos que os documentos deixam abertos e como foram lidos. As seções citadas 
 - **A11. O corpo publicado é o JSONB armazenado**: mesmo conteúdo do snapshot, com ordem de chaves e espaços do Postgres; consumidores devem fazer parse, não comparar bytes.
 - **A12. Separação de credenciais do broker configurada, mas não verificada localmente**: o MiniStack só aplica IAM ao SQS com `AUTH=true`, modo que o projeto não usa, porque nele as chaves são geradas pelo emulador e teriam de ser provisionadas para cada papel e lidas pela aplicação e pelos testes. No modo padrão ele aceita qualquer credencial e não aplica políticas; os testes negativos são pulados com essa razão. As políticas de `deploy/aws/iam-policies.json` continuam sendo a definição para a AWS, sem aplicação local.
 - **A13. O `messageId` do envelope é o `correlationId` no SQS**: o envelope do desafio não tem campo de correlação; o `messageId` vai como `correlationId` e `causationId` da transação e dos eventos.
-- **A14. Os códigos da DLQ reutilizam os existentes**: provedor desconhecido ou inativo é `FORBIDDEN` (o mesmo do HTTP); hash divergente na inbox é `INVALID_REQUEST`.
+- **A14. Os códigos da DLQ reutilizam os existentes**: remetente desconhecido e provedor desconhecido ou inativo são `FORBIDDEN` (o mesmo do HTTP); `providerId` de outro provedor que não o do remetente é `PROVIDER_MISMATCH` (o mesmo do HTTP); hash divergente na inbox é `INVALID_REQUEST`.
 - **A15. Replay sobre uma linha `PENDING` antiga é transitório no SQS**: a inbox só aceita resultados terminais ou `PENDING_REFERENCE`, então a mensagem volta até o worker mover a linha.
 - **A16. Durante o shutdown, falha transitória libera a mensagem na hora** (visibility 0, em vez do backoff), para outra instância assumir (seção 14).
 - **A17. Nomes e rótulos das métricas são deste projeto**: o desafio lista o que medir, não nomes (seção 25).
 - **A18. Indisponibilidade do SQS é simulada com pausa, não restart**: reiniciar o MiniStack apagaria as filas em memória, o que o SQS real não faz.
 - **A19. O atraso da outbox é global**: igual em todas as instâncias; agregue com `max`.
+- **A20. No SQS, a identidade autenticada é o remetente no broker**: a seção 2 do desafio pede que a identidade autenticada determine o `providerId` e que a mensageria seja controlada por credenciais e políticas do broker. O consumidor mapeia o `SenderId` (até o `:` de uma sessão de role) para o provedor por configuração, `SQS_PROVIDER_SENDERS`, como o mapper fixo `provider_id` faz no Keycloak, e exige `data.providerId` igual (seção 10).
+- **A21. O redrive preserva o remetente original**: no atributo `originalSenderId`, que o consumidor aceita só de mensagens cujo `SenderId` é o do operador (`SQS_OPERATOR_SENDER_ID`); de outro remetente ele é ignorado (seção 10).
+- **A22. Localmente, cada identidade do broker é uma conta do MiniStack**: ele informa como `SenderId` a conta de quem envia e trata uma chave de 12 dígitos como a própria conta, então provedores e operador usam chaves de 12 dígitos. O modo padrão não autentica chaves (A12): os testes provam o vínculo do remetente ao provedor no consumidor; autenticar o remetente é papel do IAM na AWS.
 
 **Notas de teste**:
 - **N4.** A liberação do restante do grupo após falha transitória é testada só com SQS falso (quais mensagens vêm num lote é decisão do broker); os caminhos com broker real (DLQ, redrive, queda antes do delete, pausa, parada) são testes de integração.
@@ -1159,6 +1198,8 @@ Pontos que os documentos deixam abertos e como foram lidos. As seções citadas 
 - **Precedência de erros**: erro de entrada prevalece sobre conflito de idempotência (seção 6).
 - **Ordem dos eventos de saída**: não é garantida entre publishers. Os consumidores usam `walletVersion`.
 - **IAM no emulador**: o MiniStack só aplica IAM ao SQS com `AUTH=true` (verificado em 2026-10-17 com a imagem 1.5.27: um usuário IAM sem política recebe `AccessDenied` e uma chave desconhecida é recusada). O projeto usa o modo padrão, em que qualquer credencial é aceita e nenhuma política é avaliada, porque com `AUTH=true` as chaves seriam geradas pelo emulador e teriam de ser provisionadas para cada papel e lidas pela aplicação e pelos testes. As credenciais separadas estão configuradas e os testes negativos (publisher e consumidor) são pulados com essa razão. As políticas de menor privilégio de cada identidade para uma conta AWS real estão em `deploy/aws/iam-policies.json` (seção 10), sem aplicação local.
+- **Identidade do remetente no emulador**: no modo padrão o MiniStack aceita qualquer chave, então qualquer um pode apresentar a chave `111111111111` de `provider-a`. Os testes locais provam que o consumidor vincula o `SenderId` ao provedor e recusa o resto; que só o produtor de cada provedor consiga aquele `SenderId` é garantido pelo IAM na AWS (A12, A22).
+- **`messageId` global na inbox**: a seção 6.5 do desafio fixa a unicidade em `(consumerName, messageId)`, sem o provedor. Se um provedor reutiliza o `messageId` de outro, a mensagem que chega depois tem hash diferente e vai para a DLQ como `INVALID_REQUEST`, sem efeito; uma operação de outro provedor nunca é reproduzida por ela, porque o `providerId` é conferido antes. Produtores devem usar ids globalmente únicos (UUIDs).
 - **`StartMessageMoveTask`**: o suporte a FIFO no emulador não é garantido. Usamos `cmd/dlqredrive`.
 - **Retenção**: sem limpeza de `inbox_messages` e `outbox_events` publicados neste escopo, já que a aplicação não tem `DELETE`. Uma rotina de retenção ficaria para trabalho futuro, executada com outro papel.
 - **Keycloak em testcontainers**: o issuer é a URL mapeada no host, sem `KC_HOSTNAME` fixo.

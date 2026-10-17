@@ -65,9 +65,11 @@ All queues are FIFO and have content-based deduplication turned off. Producers
 always send an explicit `MessageDeduplicationId`.
 
 Each role uses its own broker credentials: the consumer, the outbox
-publisher and the `dlqredrive` operator. Their least-privilege IAM policies
-for a real AWS account are in
-[deploy/aws/iam-policies.json](deploy/aws/iam-policies.json). MiniStack
+publisher, the `dlqredrive` operator and each provider's producer. Their
+least-privilege IAM policies, and the queue policy that lets only the
+producers and the operator send to `wager-transactions.fifo`, are in
+[deploy/aws/iam-policies.json](deploy/aws/iam-policies.json) for a real AWS
+account. MiniStack
 enforces IAM for SQS only when started with `AUTH=true`, which this project
 does not use: in that mode the emulator generates the access keys, so they
 would have to be provisioned for every role and read by the app and the
@@ -128,24 +130,43 @@ strings:
 }
 ```
 
+The provider a message acts for comes from the sender's broker identity,
+never from `data.providerId` alone (ARCHITECTURE §10, "Identidade do
+produtor"). The consumer reads the `SenderId` SQS reports and maps it to a
+provider with `SQS_PROVIDER_SENDERS`; `data.providerId` must name that
+provider. In AWS the sender id is the producer's IAM user or role id.
+MiniStack reports the caller's account as `SenderId` and treats a 12-digit
+access key as that account, so locally each producer sends with its own
+12-digit key:
+
+| Producer | Access key / secret (local test values) | Acts for |
+| --- | --- | --- |
+| provider-a | `111111111111` / `provider-a-broker-local-secret` | `provider-a` |
+| provider-b | `222222222222` / `provider-b-broker-local-secret` | `provider-b` |
+
+MiniStack does not authenticate keys in the mode used here, so this shows
+the consumer's sender-to-provider check, not broker authentication, which is
+IAM's job in AWS.
+
 | Item | Value |
 | --- | --- |
+| Sender | a key mapped to no provider goes to the DLQ as `FORBIDDEN`; a `data.providerId` of another provider as `PROVIDER_MISMATCH`; nothing is persisted |
 | `MessageGroupId` | the `walletId`: per-wallet order, different wallets in parallel |
 | `MessageDeduplicationId` | the envelope `messageId` (best effort; the inbox and the database constraints are the guarantee) |
 | Visibility timeout / handler deadline | 60s / 15s |
 | Attempts | transient failures retry with visibility `min(2^receiveCount, 60)`s; after 10 receives the redrive policy moves the message to `wager-transactions-dlq.fifo` |
 | Readiness | polling pauses while `/health/ready` fails, so an outage does not use up attempts |
-| Invalid or permanent | sent to the DLQ at once with `failureClass=PERMANENT`, `failureCode`, `originalMessageId` and `envelopeMessageId`, then deleted; nothing is persisted |
+| Invalid or permanent | sent to the DLQ at once with `failureClass=PERMANENT`, `failureCode`, `originalMessageId`, `envelopeMessageId` and `originalSenderId` (the sender it was attributed to), then deleted; nothing is persisted |
 | Business rejection | committed as `REJECTED`, message deleted |
 | Duplicate `messageId` | same payload: deleted without effect; different payload: DLQ (`INVALID_REQUEST`) |
 
 The message is deleted only after its transaction committed. Follow the
 outcome with `GET /providers/{providerId}/wagering/transactions/{externalId}`.
 
-Send one from the host:
+Send one from the host as provider-a's producer:
 
 ```sh
-AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test aws --endpoint-url http://localhost:4566 --region us-east-1 sqs send-message --queue-url http://localhost:4566/000000000000/wager-transactions.fifo --message-group-id <walletId> --message-deduplication-id msg-123 --message-body file://message.json
+AWS_ACCESS_KEY_ID=111111111111 AWS_SECRET_ACCESS_KEY=provider-a-broker-local-secret aws --endpoint-url http://localhost:4566 --region us-east-1 sqs send-message --queue-url http://localhost:4566/000000000000/wager-transactions.fifo --message-group-id <walletId> --message-deduplication-id msg-123 --message-body file://message.json
 ```
 
 #### DLQ redrive procedure
@@ -156,11 +177,16 @@ AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test aws --endpoint-url http://loca
    `wager-transactions-dlq.fifo` (`--message-attribute-names All`).
 3. Resend the others (transient attempts exhausted) with `dlqredrive`, which
    keeps the body and `MessageGroupId`, uses
-   `MessageDeduplicationId=<MessageId>:redrive:<unixSeconds>`, deletes each
-   message from the DLQ after the send, and skips the permanent ones:
+   `MessageDeduplicationId=<MessageId>:redrive:<unixSeconds>`, names the
+   original producer in the `originalSenderId` attribute (the consumer
+   accepts it only from the operator's identity, `SQS_OPERATOR_SENDER_ID`),
+   deletes each message from the DLQ after the send, and skips the permanent
+   ones. Locally the operator's 12-digit key is its own MiniStack account, so
+   it finds the queues in their owner's account with
+   `SQS_QUEUE_OWNER_ACCOUNT_ID`:
 
    ```sh
-   docker compose run --rm --no-deps --entrypoint /app/dlqredrive -e SQS_OPERATOR_ACCESS_KEY_ID=wallet-operator -e SQS_OPERATOR_SECRET_ACCESS_KEY=wallet-operator-local-secret app
+   docker compose run --rm --no-deps --entrypoint /app/dlqredrive -e SQS_OPERATOR_ACCESS_KEY_ID=333333333333 -e SQS_OPERATOR_SECRET_ACCESS_KEY=wallet-operator-local-secret -e SQS_QUEUE_OWNER_ACCOUNT_ID=000000000000 app
    ```
 
    It prints `redriven=N skipped_permanent=M`. Skipped messages stay in
@@ -250,7 +276,10 @@ from the `provider_id` claim. `/health/*` needs no token.
 | `SQS_PUBLISHER_ACCESS_KEY_ID` / `SQS_PUBLISHER_SECRET_ACCESS_KEY` | — (required) | app | publisher-only credentials (ARCHITECTURE §10) |
 | `SQS_INBOUND_QUEUE` / `SQS_INBOUND_DLQ` | `wager-transactions.fifo` / `wager-transactions-dlq.fifo` | app, dlqredrive | inbound queue and its DLQ |
 | `SQS_CONSUMER_ACCESS_KEY_ID` / `SQS_CONSUMER_SECRET_ACCESS_KEY` | — (required) | app | consumer-only credentials (ARCHITECTURE §10) |
+| `SQS_PROVIDER_SENDERS` | — (required with `RUN_CONSUMER`) | app | `senderId=providerId` pairs, comma separated: the producer identities the consumer trusts (ARCHITECTURE §10) |
+| `SQS_OPERATOR_SENDER_ID` | — (required with `RUN_CONSUMER`; required by dlqredrive) | app, dlqredrive | the redrive operator's sender id, the only one whose `originalSenderId` is trusted |
 | `SQS_OPERATOR_ACCESS_KEY_ID` / `SQS_OPERATOR_SECRET_ACCESS_KEY` | — (required) | dlqredrive | operator credentials for the redrive tool (ARCHITECTURE §23) |
+| `SQS_QUEUE_OWNER_ACCOUNT_ID` | — (the operator's account) | dlqredrive | account that owns the queues, when the operator's is another one (locally `000000000000`) |
 | `CONSUMER_WAIT_SECONDS` | `20` | app | long-poll wait (0-20) |
 | `CONSUMER_MAX_MESSAGES` | `10` | app | messages per receive (1-10) |
 | `CONSUMER_HANDLER_TIMEOUT` | `15s` | app | deadline of one message |

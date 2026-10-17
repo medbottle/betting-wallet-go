@@ -389,11 +389,18 @@ func envelope(t *testing.T, messageID string, body map[string]any) string {
 	return string(raw)
 }
 
-// sendSQS publishes to the inbound queue with a fresh deduplication id, so
-// a repeated envelope is a delivery the broker cannot drop.
+// providerA sends as provider-a's producer: a 12-digit key is its own
+// MiniStack account, whose id is the SenderId the consumers map to
+// provider-a (SQS_PROVIDER_SENDERS in docker-compose.yml, ARCHITECTURE §10).
+var providerA = sqspublisher.NewClient(sqspublisher.ClientConfig{Endpoint: sqsEndpoint, Region: "us-east-1",
+	AccessKeyID: "111111111111", SecretAccessKey: "provider-a-broker-local-secret"})
+
+// sendSQS publishes to the inbound queue as provider-a with a fresh
+// deduplication id, so a repeated envelope is a delivery the broker cannot
+// drop.
 func sendSQS(t *testing.T, body, group string) {
 	t.Helper()
-	if _, err := sqsc.SendMessage(ctxT(t), &sqs.SendMessageInput{
+	if _, err := providerA.SendMessage(ctxT(t), &sqs.SendMessageInput{
 		QueueUrl: aws.String(qURL[inboundQueue]), MessageBody: aws.String(body),
 		MessageGroupId: aws.String(group), MessageDeduplicationId: aws.String(uuid.NewString()),
 	}); err != nil {

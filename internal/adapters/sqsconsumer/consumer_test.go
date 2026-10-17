@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -35,6 +36,8 @@ type fakeSQS struct {
 	sent       []*sqs.SendMessageInput
 	sendErr    error
 	receives   int
+	// lastReceive is the input of the latest ReceiveMessage.
+	lastReceive *sqs.ReceiveMessageInput
 	// nonBlocking makes an empty receive return at once (the redrive's
 	// short poll on a drained DLQ).
 	nonBlocking bool
@@ -51,6 +54,7 @@ func (f *fakeSQS) GetQueueUrl(_ context.Context, in *sqs.GetQueueUrlInput, _ ...
 func (f *fakeSQS) ReceiveMessage(ctx context.Context, in *sqs.ReceiveMessageInput, _ ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error) {
 	f.mu.Lock()
 	f.receives++
+	f.lastReceive = in
 	if len(f.batches) > 0 {
 		b := f.batches[0]
 		f.batches = f.batches[1:]
@@ -199,17 +203,48 @@ type fixedClock struct{}
 
 func (fixedClock) Now() time.Time { return time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC) }
 
+// Broker identities of the tests (SenderId principals).
+const (
+	senderA    = "111111111111"      // provider-a
+	senderB    = "222222222222"      // provider-b
+	roleSender = "AROAEXAMPLEROLE01" // provider-a, as an IAM role
+	operator   = "333333333333"      // the redrive operator
+)
+
+var testSenders = map[string]string{senderA: "provider-a", senderB: "provider-b", roleSender: "provider-a"}
+
+// msg is validBody (provider-a) under envID, sent by provider-a.
 func msg(envID, group string, receiveCount int) types.Message {
 	body := strings.Replace(validBody, `"msg-123"`, `"`+envID+`"`, 1)
 	return rawMsg(envID, body, group, receiveCount)
 }
 
 func rawMsg(handle, body, group string, receiveCount int) types.Message {
-	attrs := map[string]string{"ApproximateReceiveCount": fmt.Sprint(receiveCount)}
+	attrs := map[string]string{"ApproximateReceiveCount": fmt.Sprint(receiveCount), "SenderId": senderA}
 	if group != "" {
 		attrs["MessageGroupId"] = group
 	}
 	return types.Message{MessageId: aws.String("sqs-" + handle), ReceiptHandle: aws.String(handle), Body: aws.String(body), Attributes: attrs}
+}
+
+// withSender sets the SenderId SQS reports; "" removes it.
+func withSender(m types.Message, sender string) types.Message {
+	attrs := map[string]string{}
+	for k, v := range m.Attributes {
+		attrs[k] = v
+	}
+	delete(attrs, "SenderId")
+	if sender != "" {
+		attrs["SenderId"] = sender
+	}
+	m.Attributes = attrs
+	return m
+}
+
+// withOriginalSender sets the originalSenderId message attribute.
+func withOriginalSender(m types.Message, sender string) types.Message {
+	m.MessageAttributes = map[string]types.MessageAttributeValue{AttrOriginalSenderID: strAttr(sender)}
+	return m
 }
 
 func newTestConsumer(t *testing.T, api *fakeSQS, sub *fakeSubmitter, ready *fakeReadiness) *Consumer {
@@ -225,6 +260,7 @@ func newTestConsumerWith(t *testing.T, api *fakeSQS, sub *fakeSubmitter, ready *
 	c := New(api, sub, ready, fixedClock{}, Config{
 		Queue: "in.fifo", DLQ: "dlq.fifo", WaitSeconds: 20, MaxMessages: 10,
 		HandlerTimeout: 2 * time.Second, BackoffMax: time.Minute, PauseInterval: 5 * time.Millisecond,
+		Senders: testSenders, OperatorSenderID: operator,
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)), m)
 	if err := c.Resolve(context.Background()); err != nil {
 		t.Fatal(err)
@@ -302,12 +338,109 @@ func TestOutcomes(t *testing.T) {
 		if hasEnv == (orig == "sqs-garbage") {
 			t.Errorf("%s: envelopeMessageId present = %v", orig, hasEnv)
 		}
+		if got := aws.ToString(in.MessageAttributes[AttrOriginalSenderID].StringValue); got != senderA {
+			t.Errorf("%s: the DLQ copy names sender %q, want %s", orig, got, senderA)
+		}
 	}
 	if s := c.Stats(); s.Handled != 1 || s.Duplicates != 1 || s.DeadLetter != 5 {
 		t.Fatalf("stats %+v", s)
 	}
 	if got := sub.called(); len(got) != 6 {
 		t.Fatalf("garbage must not reach the use case: %v", got)
+	}
+}
+
+// TestSenderDecidesTheProvider: the provider a message acts for comes from
+// the SenderId SQS reports, never from data.providerId alone (ARCHITECTURE
+// §10/§11). validBody names provider-a. A refused message goes to the DLQ
+// before the use case runs, so nothing is persisted.
+func TestSenderDecidesTheProvider(t *testing.T) {
+	cases := []struct {
+		m      types.Message
+		code   string // "" when the use case runs
+		sender string // originalSenderId of the DLQ copy
+	}{
+		{msg("own", "w1", 1), "", ""},
+		{withSender(msg("other-provider", "w2", 1), senderB), "PROVIDER_MISMATCH", senderB},
+		{withSender(msg("unknown", "w3", 1), "999999999999"), "FORBIDDEN", "999999999999"},
+		// The sender is authenticated before the envelope is parsed.
+		{withSender(rawMsg("unknown-garbage", "not json", "w4", 1), "999999999999"), "FORBIDDEN", "999999999999"},
+		{withSender(msg("no-sender", "w5", 1), ""), "FORBIDDEN", ""},
+		// Only the operator may name the original sender.
+		{withOriginalSender(withSender(msg("forged", "w6", 1), senderB), senderA), "PROVIDER_MISMATCH", senderB},
+		{withOriginalSender(withSender(msg("redriven", "w7", 1), operator), senderA), "", ""},
+		{withOriginalSender(withSender(msg("redriven-other", "w8", 1), operator), senderB), "PROVIDER_MISMATCH", senderB},
+		{withSender(msg("operator-alone", "w9", 1), operator), "FORBIDDEN", ""},
+		// An IAM role's SenderId is <role id>:<session>; the role id counts.
+		{withSender(msg("role-session", "w10", 1), roleSender+":any-session"), "", ""},
+	}
+	var batch []types.Message
+	for _, tc := range cases {
+		batch = append(batch, tc.m)
+	}
+	api := newFakeSQS(batch)
+	sub := &fakeSubmitter{}
+	m := &countingMetrics{}
+	c := newTestConsumerWith(t, api, sub, &fakeReadiness{ready: true}, m)
+	runUntil(t, c, func() bool { d, _, _ := api.snapshot(); return len(d) == len(cases) })
+
+	api.mu.Lock()
+	in := api.lastReceive
+	api.mu.Unlock()
+	if !slices.Contains(in.MessageSystemAttributeNames, types.MessageSystemAttributeNameSenderId) ||
+		!slices.Contains(in.MessageAttributeNames, AttrOriginalSenderID) {
+		t.Fatalf("receive must ask for SenderId and %s: %+v", AttrOriginalSenderID, in)
+	}
+	_, _, sent := api.snapshot()
+	dlq := map[string]*sqs.SendMessageInput{}
+	for _, s := range sent {
+		dlq[aws.ToString(s.MessageAttributes[AttrOriginalMessageID].StringValue)] = s
+	}
+	var submitted []string
+	for _, tc := range cases {
+		id := aws.ToString(tc.m.MessageId)
+		s, dead := dlq[id]
+		if tc.code == "" {
+			if dead {
+				t.Errorf("%s: dead-lettered with %s", id, aws.ToString(s.MessageAttributes[AttrFailureCode].StringValue))
+			}
+			submitted = append(submitted, strings.TrimPrefix(id, "sqs-"))
+			continue
+		}
+		if !dead {
+			t.Errorf("%s: not dead-lettered, want %s", id, tc.code)
+			continue
+		}
+		if got := aws.ToString(s.MessageAttributes[AttrFailureCode].StringValue); got != tc.code ||
+			aws.ToString(s.MessageAttributes[AttrFailureClass].StringValue) != FailureClassPermanent {
+			t.Errorf("%s: failure %s/%s, want %s/PERMANENT", id, got, aws.ToString(s.MessageAttributes[AttrFailureClass].StringValue), tc.code)
+		}
+		if got := aws.ToString(s.MessageAttributes[AttrOriginalSenderID].StringValue); got != tc.sender {
+			t.Errorf("%s: DLQ copy names sender %q, want %q", id, got, tc.sender)
+		}
+	}
+	got := sub.called()
+	sort.Strings(got)
+	sort.Strings(submitted)
+	if !slices.Equal(got, submitted) {
+		t.Fatalf("use case ran for %v, want only %v", got, submitted)
+	}
+	if m.dlq[codeProviderMismatch] != 3 || m.dlq[codeForbidden] != 4 {
+		t.Errorf("DLQ metrics %v", m.dlq)
+	}
+}
+
+func TestStartRequiresSenders(t *testing.T) {
+	api := newFakeSQS()
+	c := New(api, &fakeSubmitter{}, &fakeReadiness{}, fixedClock{}, Config{
+		Queue: "in.fifo", DLQ: "dlq.fifo", HandlerTimeout: time.Second, PauseInterval: time.Second, MaxMessages: 1,
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	if err := c.Resolve(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Start(); err == nil {
+		_ = c.Stop(context.Background())
+		t.Fatal("started without any trusted sender")
 	}
 }
 

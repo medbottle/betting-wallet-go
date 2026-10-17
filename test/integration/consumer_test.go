@@ -22,6 +22,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/medbottle/betting-wallet-go/internal/adapters/sqsconsumer"
+	"github.com/medbottle/betting-wallet-go/internal/adapters/sqspublisher"
 	"github.com/medbottle/betting-wallet-go/internal/app"
 	"github.com/medbottle/betting-wallet-go/internal/app/wagering"
 	"github.com/medbottle/betting-wallet-go/internal/platform/clock"
@@ -67,14 +68,27 @@ func newInboundQueues(t *testing.T, visibility, maxReceive int) inboundQueues {
 	return q
 }
 
-// send publishes body as a producer would; dedup defaults to a fresh id
-// so tests can prove redeliveries that SQS itself would not drop.
+// send publishes body as provider-a's producer would; dedup defaults to a
+// fresh id so tests can prove redeliveries that SQS itself would not drop.
 func (q inboundQueues) send(t *testing.T, body, group string) {
 	t.Helper()
-	if _, err := q.admin.SendMessage(ctxT(t), &sqs.SendMessageInput{
+	q.sendAs(t, providerAKey, providerASecret, body, group, "")
+}
+
+// sendAs publishes body with the given broker credentials, naming
+// originalSender in originalSenderId when it is not empty.
+func (q inboundQueues) sendAs(t *testing.T, key, secret, body, group, originalSender string) {
+	t.Helper()
+	in := &sqs.SendMessageInput{
 		QueueUrl: aws.String(q.queueURL), MessageBody: aws.String(body),
 		MessageGroupId: aws.String(group), MessageDeduplicationId: aws.String(uuid.NewString()),
-	}); err != nil {
+	}
+	if originalSender != "" {
+		in.MessageAttributes = map[string]types.MessageAttributeValue{
+			sqsconsumer.AttrOriginalSenderID: {DataType: aws.String("String"), StringValue: aws.String(originalSender)},
+		}
+	}
+	if _, err := sqsClient(q.endpoint, key, secret).SendMessage(ctxT(t), in); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -177,6 +191,7 @@ func startConsumer(t *testing.T, e apiEnv, q inboundQueues, opts consumerOpts) (
 	c := sqsconsumer.New(opts.api, svc, opts.readiness, clock.System{}, sqsconsumer.Config{
 		Queue: q.queue, DLQ: q.dlq, WaitSeconds: 1, MaxMessages: 10,
 		HandlerTimeout: 15 * time.Second, BackoffMax: opts.backoffMax, PauseInterval: 50 * time.Millisecond,
+		Senders: providerSenders, OperatorSenderID: operatorKey,
 	}, slog.New(slog.NewJSONHandler(io.Discard, nil)), opts.metrics)
 	if err := c.Resolve(ctxT(t)); err != nil {
 		t.Fatal(err)
@@ -304,21 +319,34 @@ func TestConsumerDeadLetters(t *testing.T) {
 	e.waitStatus(t, "provider-a", "provider-a", "dl-ok", "PROCESSED", 15*time.Second)
 	before := e.count(t, `SELECT count(*) FROM wager_transactions`)
 
+	if _, err := e.repo.db.owner.Exec(ctxT(t), `UPDATE providers SET active = false WHERE provider_id = 'provider-b'`); err != nil {
+		t.Fatal(err)
+	}
+
 	amountAsNumber := strings.Replace(envelope(t, "msg-number", op(w, "provider-a", "BET", "5.00", "dl-number")), `"amount":"5.00"`, `"amount":5.00`, 1)
 	conflict := op(w, "provider-a", "BET", "7.00", "dl-ok") // same key as the processed one, another amount
-	cases := map[string]struct {
-		body, code string
-		envID      string
-	}{
-		"hash":     {envelope(t, "msg-reused", op(w, "provider-a", "BET", "6.00", "dl-ok")), "INVALID_REQUEST", "msg-reused"},
-		"json":     {`{"messageId": "msg-broken", `, "INVALID_REQUEST", ""},
-		"opening":  {envelope(t, "msg-opening", op(w, "provider-a", "OPENING", "5.00", "dl-opening")), "UNSUPPORTED_KIND", "msg-opening"},
-		"provider": {envelope(t, "msg-provider", op(w, "provider-z", "BET", "5.00", "dl-provider")), "FORBIDDEN", "msg-provider"},
-		"number":   {amountAsNumber, "INVALID_MONEY", "msg-number"},
-		"conflict": {envelope(t, "msg-conflict", conflict), "IDEMPOTENCY_KEY_CONFLICT", "msg-conflict"},
+	type dlCase struct {
+		key, secret, body, code, envID string
+		sender                         string // the originalSenderId of the DLQ copy
+	}
+	fromA := func(body, code, envID string) dlCase {
+		return dlCase{providerAKey, providerASecret, body, code, envID, providerAKey}
+	}
+	cases := map[string]dlCase{
+		"hash":     fromA(envelope(t, "msg-reused", op(w, "provider-a", "BET", "6.00", "dl-ok")), "INVALID_REQUEST", "msg-reused"),
+		"json":     fromA(`{"messageId": "msg-broken", `, "INVALID_REQUEST", ""),
+		"opening":  fromA(envelope(t, "msg-opening", op(w, "provider-a", "OPENING", "5.00", "dl-opening")), "UNSUPPORTED_KIND", "msg-opening"),
+		"provider": fromA(envelope(t, "msg-provider", op(w, "provider-z", "BET", "5.00", "dl-provider")), "PROVIDER_MISMATCH", "msg-provider"),
+		"number":   fromA(amountAsNumber, "INVALID_MONEY", "msg-number"),
+		"conflict": fromA(envelope(t, "msg-conflict", conflict), "IDEMPOTENCY_KEY_CONFLICT", "msg-conflict"),
+		// A key of the default account is no provider identity.
+		"unknown-sender": {readerKey, readerSecret, envelope(t, "msg-unknown", op(w, "provider-a", "BET", "5.00", "dl-unknown")),
+			"FORBIDDEN", "msg-unknown", queueOwner},
+		"inactive-provider": {providerBKey, providerBSecret, envelope(t, "msg-inactive", op(w, "provider-b", "BET", "5.00", "dl-inactive")),
+			"FORBIDDEN", "msg-inactive", providerBKey},
 	}
 	for name, tc := range cases {
-		q.send(t, tc.body, "g-"+name)
+		q.sendAs(t, tc.key, tc.secret, tc.body, "g-"+name, "")
 	}
 	waitFor(t, 20*time.Second, "dead-lettered", func() bool { return c.Stats().DeadLetter == int64(len(cases)) })
 	waitFor(t, 10*time.Second, "source queue empty", func() bool { return q.depth(t, q.queueURL) == 0 })
@@ -335,7 +363,8 @@ func TestConsumerDeadLetters(t *testing.T) {
 			continue
 		}
 		if m.Body != tc.body || m.Attrs["failureClass"] != "PERMANENT" || m.Attrs["failureCode"] != tc.code ||
-			m.Attrs["envelopeMessageId"] != tc.envID || m.Attrs["originalMessageId"] == "" || m.DedupID != m.Attrs["originalMessageId"] {
+			m.Attrs["envelopeMessageId"] != tc.envID || m.Attrs["originalMessageId"] == "" || m.DedupID != m.Attrs["originalMessageId"] ||
+			m.Attrs["originalSenderId"] != tc.sender {
 			t.Errorf("%s: %+v", name, m)
 		}
 	}
@@ -348,10 +377,89 @@ func TestConsumerDeadLetters(t *testing.T) {
 	e.assertConsistent(t, w, "95.00")
 
 	// The redrive tool leaves the permanent messages in the DLQ.
-	res, err := sqsconsumer.Redrive(ctxT(t), sqsClient(q.endpoint, operatorKey, operatorSecret), q.dlqURL, q.queueURL, time.Now)
+	res, err := sqsconsumer.Redrive(ctxT(t), sqsClient(q.endpoint, operatorKey, operatorSecret), q.dlqURL, q.queueURL, operatorKey, time.Now)
 	if err != nil || res.Redriven != 0 || res.Skipped != len(cases) {
 		t.Fatalf("redrive = %+v, %v", res, err)
 	}
+}
+
+// TestConsumerProviderIsTheSender: CHALLENGE §2 and §14 over SQS. The
+// provider a message acts for comes from its broker identity, the SenderId
+// MiniStack reports, never from data.providerId alone (ARCHITECTURE
+// §10/§11). provider-a's credentials cannot submit, replay or reverse
+// anything for provider-b: each attempt goes to the DLQ as a permanent
+// failure, and no transaction, inbox, ledger or outbox row is written.
+func TestConsumerProviderIsTheSender(t *testing.T) {
+	t.Parallel()
+	e := newAPIEnv(t)
+	q := newInboundQueues(t, 60, 10)
+	c, _ := startConsumer(t, e, q, consumerOpts{})
+	w := e.openWallet(t, "100.00")
+
+	// provider-b's own bet, sent with provider-b's credentials.
+	betB := op(w, "provider-b", "BET", "10.00", "b-bet")
+	q.sendAs(t, providerBKey, providerBSecret, envelope(t, "msg-b-bet", betB), w.ID, "")
+	original := e.waitStatus(t, "provider-b", "provider-b", "b-bet", "PROCESSED", 15*time.Second)
+	waitFor(t, 10*time.Second, "provider-b's message handled", func() bool { return c.Stats().Handled == 1 })
+	rows := func() [4]int {
+		return [4]int{
+			e.count(t, `SELECT count(*) FROM wager_transactions WHERE wallet_id = $1`, w.ID),
+			e.count(t, `SELECT count(*) FROM inbox_messages`),
+			e.count(t, `SELECT count(*) FROM wallet_ledger_entries WHERE wallet_id = $1`, w.ID),
+			e.count(t, `SELECT count(*) FROM outbox_events WHERE aggregate_id = $1`, w.ID),
+		}
+	}
+	before := rows()
+
+	type attempt struct {
+		key, secret, body, forged, code, sender string
+	}
+	fromA := func(body, forged string) attempt {
+		return attempt{providerAKey, providerASecret, body, forged, "PROVIDER_MISMATCH", providerAKey}
+	}
+	attempts := map[string]attempt{
+		// A new operation in provider-b's name.
+		"new": fromA(envelope(t, "msg-a-new", op(w, "provider-b", "BET", "20.00", "a-as-b")), ""),
+		// provider-b's key and payload under a new messageId: a replay of
+		// provider-b's operation.
+		"replay": fromA(envelope(t, "msg-a-replay", betB), ""),
+		// A rollback of provider-b's bet: it would credit the player.
+		"reversal": fromA(envelope(t, "msg-a-reversal", op(w, "provider-b", "ROLLBACK", "10.00", "a-rollback", "b-bet")), ""),
+		// Naming provider-b's identity as the original sender: only the
+		// redrive operator is trusted with that attribute.
+		"forged": fromA(envelope(t, "msg-a-forged", op(w, "provider-b", "BET", "20.00", "a-forged")), providerBKey),
+		// The operator's own messages act for no provider.
+		"operator": {operatorKey, operatorSecret, envelope(t, "msg-operator", op(w, "provider-b", "BET", "20.00", "op-as-b")), "", "FORBIDDEN", ""},
+	}
+	for name, a := range attempts {
+		q.sendAs(t, a.key, a.secret, a.body, "g-"+name, a.forged)
+	}
+	waitFor(t, 20*time.Second, "attempts dead-lettered", func() bool { return c.Stats().DeadLetter == int64(len(attempts)) })
+	waitFor(t, 10*time.Second, "source queue empty", func() bool { return q.depth(t, q.queueURL) == 0 })
+
+	got := q.readDLQ(t, len(attempts), 15*time.Second)
+	if len(got) != len(attempts) {
+		t.Fatalf("DLQ has %d messages, want %d", len(got), len(attempts))
+	}
+	for _, m := range got {
+		name := strings.TrimPrefix(m.GroupID, "g-")
+		a, ok := attempts[name]
+		if !ok || m.Body != a.body || m.Attrs["failureClass"] != "PERMANENT" || m.Attrs["failureCode"] != a.code ||
+			m.Attrs["originalSenderId"] != a.sender {
+			t.Errorf("%s: %+v", name, m)
+		}
+	}
+	if after := rows(); after != before {
+		t.Fatalf("refused messages wrote rows (transactions, inbox, ledger, outbox): %v -> %v", before, after)
+	}
+	if s := c.Stats(); s.Handled != 1 || s.Duplicates != 0 {
+		t.Fatalf("stats %+v: only provider-b's own message may reach the use case", s)
+	}
+	again := e.call(t, http.MethodGet, "/providers/provider-b/wagering/transactions/b-bet", "provider-b", nil)
+	if again.str("transactionId") != original.str("transactionId") || again.str("status") != "PROCESSED" || again.amount("balance") != "90.00" {
+		t.Fatalf("provider-b's operation changed: %s", again.Raw)
+	}
+	e.assertConsistent(t, w, "90.00")
 }
 
 // TestConsumerBusinessRejection: a confirmed rejection is terminal; it is
@@ -523,7 +631,9 @@ func (r transientRunner) InTx(ctx context.Context, opts app.TxOptions, fn func(c
 // message with growing visibility; after maxReceiveCount receives the
 // redrive policy moves it to the DLQ without failureClass; once the cause
 // is fixed, cmd/dlqredrive's logic sends it back and it is processed
-// (ARCHITECTURE §10).
+// (ARCHITECTURE §10). The resend comes from the operator's own identity,
+// which resolves the queues in their owner's account, and names provider-a
+// as the original sender, which the consumer accepts from the operator.
 func TestConsumerTransientRetriesThenRedrive(t *testing.T) {
 	t.Parallel()
 	e := newAPIEnv(t)
@@ -548,12 +658,24 @@ func TestConsumerTransientRetriesThenRedrive(t *testing.T) {
 	}
 
 	down.Store(false)
-	res, err := sqsconsumer.Redrive(ctxT(t), sqsClient(q.endpoint, operatorKey, operatorSecret), q.dlqURL, q.queueURL, time.Now)
+	operator := sqsClient(q.endpoint, operatorKey, operatorSecret)
+	queueURL, err := sqspublisher.ResolveQueueURLInAccount(ctxT(t), operator, q.queue, queueOwner)
+	if err != nil || queueURL != q.queueURL {
+		t.Fatalf("operator resolves %q, %v; want %s", queueURL, err, q.queueURL)
+	}
+	dlqURL, err := sqspublisher.ResolveQueueURLInAccount(ctxT(t), operator, q.dlq, queueOwner)
+	if err != nil || dlqURL != q.dlqURL {
+		t.Fatalf("operator resolves %q, %v; want %s", dlqURL, err, q.dlqURL)
+	}
+	res, err := sqsconsumer.Redrive(ctxT(t), operator, dlqURL, queueURL, operatorKey, time.Now)
 	if err != nil || res.Redriven != 1 || res.Skipped != 0 {
 		t.Fatalf("redrive = %+v, %v", res, err)
 	}
 	e.waitStatus(t, "provider-a", "provider-a", "sqs-transient", "PROCESSED", 15*time.Second)
 	waitFor(t, 10*time.Second, "queues empty", func() bool { return q.depth(t, q.queueURL) == 0 && q.depth(t, q.dlqURL) == 0 })
+	if s := c.Stats(); s.DeadLetter != 0 {
+		t.Fatalf("the redriven message was refused: %+v", s)
+	}
 	e.assertConsistent(t, w, "88.00")
 }
 

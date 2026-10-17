@@ -57,9 +57,20 @@ type Publisher struct {
 
 var _ app.EventPublisher = (*Publisher)(nil)
 
-// ResolveQueueURL looks a queue up by name.
+// ResolveQueueURL looks a queue up by name in the caller's own account.
 func ResolveQueueURL(ctx context.Context, client *sqs.Client, name string) (string, error) {
-	out, err := client.GetQueueUrl(ctx, &sqs.GetQueueUrlInput{QueueName: aws.String(name)})
+	return ResolveQueueURLInAccount(ctx, client, name, "")
+}
+
+// ResolveQueueURLInAccount looks a queue up by name in ownerAccountID
+// (QueueOwnerAWSAccountId), for a caller from another account; an empty
+// owner is the caller's own account.
+func ResolveQueueURLInAccount(ctx context.Context, client *sqs.Client, name, ownerAccountID string) (string, error) {
+	in := &sqs.GetQueueUrlInput{QueueName: aws.String(name)}
+	if ownerAccountID != "" {
+		in.QueueOwnerAWSAccountId = aws.String(ownerAccountID)
+	}
+	out, err := client.GetQueueUrl(ctx, in)
 	if err != nil {
 		return "", fmt.Errorf("sqs: resolve queue %s: %w", name, err)
 	}

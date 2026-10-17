@@ -17,9 +17,9 @@ import (
 )
 
 // ConsumerModule provides the wager-transactions consumer with its own
-// credentials (ARCHITECTURE §10). Its hook resolves the inbound queue and
-// DLQ URLs on start (§14 step 4); the runners hook starts it only when
-// RUN_CONSUMER is set.
+// credentials and the producer identities it trusts (ARCHITECTURE §10).
+// Its hook resolves the inbound queue and DLQ URLs on start (§14 step 4);
+// the runners hook starts it only when RUN_CONSUMER is set.
 var ConsumerModule = fx.Module("consumer",
 	fx.Provide(newConsumer),
 	fx.Invoke(registerConsumerQueues),
@@ -30,7 +30,11 @@ var ConsumerModule = fx.Module("consumer",
 type consumerTransport struct{ *http.Transport }
 
 func newConsumer(cfg config.Config, svc *wagering.Service, readiness *health.Readiness, clock app.Clock, logger *slog.Logger,
-	metrics app.Metrics) (*sqsconsumer.Consumer, consumerTransport) {
+	metrics app.Metrics) (*sqsconsumer.Consumer, consumerTransport, error) {
+	senders, err := cfg.ProviderSenders()
+	if err != nil {
+		return nil, consumerTransport{}, err
+	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	// The long poll holds a request for up to CONSUMER_WAIT_SECONDS.
 	timeout := sqsHTTPTimeout + time.Duration(cfg.ConsumerWaitSeconds)*time.Second
@@ -42,15 +46,17 @@ func newConsumer(cfg config.Config, svc *wagering.Service, readiness *health.Rea
 		HTTPClient:      &http.Client{Timeout: timeout, Transport: transport},
 	})
 	c := sqsconsumer.New(client, svc, readiness, clock, sqsconsumer.Config{
-		Queue:          cfg.SQSInboundQueue,
-		DLQ:            cfg.SQSInboundDLQ,
-		WaitSeconds:    cfg.ConsumerWaitSeconds,
-		MaxMessages:    cfg.ConsumerMaxMessages,
-		HandlerTimeout: cfg.ConsumerHandlerTimeout,
-		BackoffMax:     cfg.ConsumerBackoffMax,
-		PauseInterval:  cfg.ConsumerPauseInterval,
+		Queue:            cfg.SQSInboundQueue,
+		DLQ:              cfg.SQSInboundDLQ,
+		WaitSeconds:      cfg.ConsumerWaitSeconds,
+		MaxMessages:      cfg.ConsumerMaxMessages,
+		HandlerTimeout:   cfg.ConsumerHandlerTimeout,
+		BackoffMax:       cfg.ConsumerBackoffMax,
+		PauseInterval:    cfg.ConsumerPauseInterval,
+		Senders:          senders,
+		OperatorSenderID: cfg.SQSOperatorSenderID,
 	}, logger, metrics)
-	return c, consumerTransport{transport}
+	return c, consumerTransport{transport}, nil
 }
 
 func registerConsumerQueues(lc fx.Lifecycle, c *sqsconsumer.Consumer, t consumerTransport, cfg config.Config, logger *slog.Logger) {

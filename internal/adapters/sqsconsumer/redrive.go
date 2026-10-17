@@ -2,6 +2,7 @@ package sqsconsumer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"time"
@@ -34,19 +35,29 @@ type RedriveResult struct {
 // only after the send succeeded. It returns when a receive comes back
 // empty.
 //
+// The resend's SenderId is the operator's, so it names the original
+// producer in AttrOriginalSenderID: the DLQ message's SenderId, or, for a
+// message this operator (operatorSenderID) already resent once, the
+// attribute it carries. Any other sender's attribute is overwritten.
+//
 // Skipped messages stay in flight until the DLQ's visibility timeout, so
 // a later message of the same group (FIFO order) is only reachable when
 // it came in the same batch; run the tool again after the timeout to
 // reach the rest.
-func Redrive(ctx context.Context, api RedriveAPI, dlqURL, queueURL string, now func() time.Time) (RedriveResult, error) {
+func Redrive(ctx context.Context, api RedriveAPI, dlqURL, queueURL, operatorSenderID string, now func() time.Time) (RedriveResult, error) {
 	var res RedriveResult
+	if principalID(operatorSenderID) == "" {
+		return res, errors.New("the operator's sender id is required")
+	}
 	for {
 		out, err := api.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{
-			QueueUrl:                    aws.String(dlqURL),
-			MaxNumberOfMessages:         10,
-			WaitTimeSeconds:             2,
-			MessageSystemAttributeNames: []types.MessageSystemAttributeName{types.MessageSystemAttributeNameMessageGroupId},
-			MessageAttributeNames:       []string{AttrFailureClass},
+			QueueUrl:            aws.String(dlqURL),
+			MaxNumberOfMessages: 10,
+			WaitTimeSeconds:     2,
+			MessageSystemAttributeNames: []types.MessageSystemAttributeName{
+				types.MessageSystemAttributeNameMessageGroupId, types.MessageSystemAttributeNameSenderId,
+			},
+			MessageAttributeNames: []string{AttrFailureClass, AttrOriginalSenderID},
 		})
 		if err != nil {
 			return res, fmt.Errorf("receive from DLQ: %w", err)
@@ -59,11 +70,16 @@ func Redrive(ctx context.Context, api RedriveAPI, dlqURL, queueURL string, now f
 				res.Skipped++
 				continue
 			}
+			var attrs map[string]types.MessageAttributeValue
+			if sender := originalSender(m, operatorSenderID); sender != "" {
+				attrs = map[string]types.MessageAttributeValue{AttrOriginalSenderID: strAttr(sender)}
+			}
 			if _, err := api.SendMessage(ctx, &sqs.SendMessageInput{
 				QueueUrl:               aws.String(queueURL),
 				MessageBody:            m.Body,
 				MessageGroupId:         aws.String(groupOf(m)),
 				MessageDeduplicationId: aws.String(aws.ToString(m.MessageId) + ":redrive:" + strconv.FormatInt(now().Unix(), 10)),
+				MessageAttributes:      attrs,
 			}); err != nil {
 				return res, fmt.Errorf("send %s to the source queue: %w", aws.ToString(m.MessageId), err)
 			}

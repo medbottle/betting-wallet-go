@@ -32,11 +32,27 @@ const (
 	publisherSecret = "wallet-publisher-local-secret"
 	consumerKey     = "wallet-consumer"
 	consumerSecret  = "wallet-consumer-local-secret"
-	operatorKey     = "wallet-operator"
-	operatorSecret  = "wallet-operator-local-secret"
 	readerKey       = "test-reader"
 	readerSecret    = "test-reader-secret"
 )
+
+// Broker identities whose SenderId the consumer checks (ARCHITECTURE §10).
+// MiniStack reports the caller's account as SenderId and treats a 12-digit
+// access key as that account, so each of these is its own account and has
+// its own SenderId: the key itself. Every other key above shares the
+// default account queueOwner, which owns the queues.
+const (
+	providerAKey    = "111111111111"
+	providerASecret = "provider-a-broker-local-secret"
+	providerBKey    = "222222222222"
+	providerBSecret = "provider-b-broker-local-secret"
+	operatorKey     = "333333333333"
+	operatorSecret  = "wallet-operator-local-secret"
+	queueOwner      = "000000000000"
+)
+
+// providerSenders is the SQS_PROVIDER_SENDERS of the tests.
+var providerSenders = map[string]string{providerAKey: "provider-a", providerBKey: "provider-b"}
 
 var (
 	msOnce      sync.Once

@@ -1,5 +1,5 @@
 {
-  "_comment": "Least-privilege IAM policies for the three broker identities of ARCHITECTURE.md §10/§23, for a real AWS account. Replace REGION and ACCOUNT_ID. MiniStack enforces IAM for SQS only with AUTH=true, which this project does not use, so these are not applied locally; they stay the AWS definition (ARCHITECTURE §10, assumption A12).",
+  "_comment": "Least-privilege IAM policies of the broker identities of ARCHITECTURE.md §10/§23 (consumer, publisher, redrive operator and one producer per provider), plus the resource policy of wager-transactions.fifo, for a real AWS account. Replace REGION and ACCOUNT_ID; the principals are IAM users named after their key here. The consumer maps each producer's SenderId (its IAM unique id, aws iam get-user --query User.UserId) to its provider with SQS_PROVIDER_SENDERS, and trusts the operator's SenderId (SQS_OPERATOR_SENDER_ID) to name the original sender of a redriven message. MiniStack enforces IAM for SQS only with AUTH=true, which this project does not use, so these are not applied locally; they stay the AWS definition (ARCHITECTURE §10, assumption A12).",
   "wallet-consumer": {
     "Version": "2012-10-17",
     "Statement": [
@@ -42,6 +42,62 @@
         "Effect": "Allow",
         "Action": ["sqs:SendMessage", "sqs:GetQueueUrl"],
         "Resource": "arn:aws:sqs:REGION:ACCOUNT_ID:wager-transactions.fifo"
+      }
+    ]
+  },
+  "provider-a-producer": {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Sid": "SubmitOperations",
+        "Effect": "Allow",
+        "Action": ["sqs:SendMessage", "sqs:GetQueueUrl"],
+        "Resource": "arn:aws:sqs:REGION:ACCOUNT_ID:wager-transactions.fifo"
+      }
+    ]
+  },
+  "provider-b-producer": {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Sid": "SubmitOperations",
+        "Effect": "Allow",
+        "Action": ["sqs:SendMessage", "sqs:GetQueueUrl"],
+        "Resource": "arn:aws:sqs:REGION:ACCOUNT_ID:wager-transactions.fifo"
+      }
+    ]
+  },
+  "wager-transactions.fifo queue policy": {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Sid": "ProducersAndRedriveMaySend",
+        "Effect": "Allow",
+        "Principal": {
+          "AWS": [
+            "arn:aws:iam::ACCOUNT_ID:user/provider-a-producer",
+            "arn:aws:iam::ACCOUNT_ID:user/provider-b-producer",
+            "arn:aws:iam::ACCOUNT_ID:user/wallet-operator"
+          ]
+        },
+        "Action": "sqs:SendMessage",
+        "Resource": "arn:aws:sqs:REGION:ACCOUNT_ID:wager-transactions.fifo"
+      },
+      {
+        "Sid": "NobodyElseMaySend",
+        "Effect": "Deny",
+        "Principal": "*",
+        "Action": "sqs:SendMessage",
+        "Resource": "arn:aws:sqs:REGION:ACCOUNT_ID:wager-transactions.fifo",
+        "Condition": {
+          "ArnNotEquals": {
+            "aws:PrincipalArn": [
+              "arn:aws:iam::ACCOUNT_ID:user/provider-a-producer",
+              "arn:aws:iam::ACCOUNT_ID:user/provider-b-producer",
+              "arn:aws:iam::ACCOUNT_ID:user/wallet-operator"
+            ]
+          }
+        }
       }
     ]
   }
