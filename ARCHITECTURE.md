@@ -1243,3 +1243,5 @@ Pontos que os documentos deixam abertos e como foram lidos. As seções citadas 
 - **Políticas do broker aplicadas**: definidas em `deploy/aws/iam-policies.json`, mas não provisionadas nem verificadas localmente: o MiniStack só as aplicaria com `AUTH=true` (premissa A12).
 - **Retenção de `inbox_messages` e `outbox_events`**: sem rotina de limpeza (ver acima).
 - **Ledger de partidas dobradas** (opcional na seção 6.4 do desafio): não adotado; o ledger é de lançamentos simples por carteira.
+- **Integração contínua**: o repositório não tem pipeline. gofmt, vet, testes unitários, integração e múltiplas instâncias, com e sem `-race`, rodam pelos comandos do README.
+- **Binários da aplicação com `-race`**: na suíte de múltiplas instâncias, os processos testados são os da imagem de produção, sem o detector; só o processo de teste roda com `-race` (seção 25, premissa N7).
