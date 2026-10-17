@@ -618,7 +618,7 @@ deploy/
   ministack/init-queues.sh
   postgres/init/01-roles.sh
 test/
-  integration/       # //go:build integration — testcontainers (PG, Keycloak, LocalStack)
+  integration/       # //go:build integration — testcontainers (PG, Keycloak, MiniStack)
   multiinstance/     # //go:build multiinstance — 3 processos via compose (docker-compose.multi.yml, seção 25)
 docker-compose.yml  Dockerfile  .env.example  README.md  ARCHITECTURE.md
 ```
@@ -785,7 +785,7 @@ Tudo abaixo segue as seções 3, 4, 6, 8 e 9; os pontos que os documentos não d
 - Retorno `nil` faz commit; erro ou panic faz rollback (o panic é relançado). O rollback usa um contexto sem cancelamento, para funcionar mesmo com o contexto do chamador já cancelado.
 - Sem retry interno: um erro transitório faz rollback e volta como `ErrTransient`; quem repete é o transporte (HTTP 503, reentrega do SQS; seção 5). Um commit cuja conexão caiu tem resultado desconhecido e também é `ErrTransient`; repetir é seguro pela idempotência.
 
-**Classificação de erros**: `40001`, `40P01`, `55P03`, `57014` (decidido em Q2, seção 24), classe `08`, erros de conexão e deadline/cancelamento de contexto → `ErrTransient` (seção 4). `23505` em `wallets_player_currency_key` → `ErrWalletAlreadyExists`. Qualquer outro `23xxx` (CHECKs, FKs, índices únicos de salvaguarda, triggers `23000`) → `ErrInvariantViolation` (seção 5). O resto volta sem classificação, incluindo `57014` (Q2 em aberto).
+**Classificação de erros**: `40001`, `40P01`, `55P03`, `57014` (decidido em Q2, seção 24), classe `08`, erros de conexão e deadline/cancelamento de contexto → `ErrTransient` (seção 4). `23505` em `wallets_player_currency_key` → `ErrWalletAlreadyExists`. Qualquer outro `23xxx` (CHECKs, FKs, índices únicos de salvaguarda, triggers `23000`) → `ErrInvariantViolation` (seção 5). O resto volta sem classificação e é tratado como transitório pelos transportes (premissa A6; seção 23, G8).
 
 **Repositórios** (só o que os fluxos de submit, abertura e reconciliação usam):
 - Carteira: `Insert`, `GetForUpdate` (`FOR NO KEY UPDATE`, seção 4), `UpdateBalance` com `WHERE version = $esperada` (0 linhas = violação de invariante, seção 4).
@@ -1220,6 +1220,7 @@ Pontos que os documentos deixam abertos e como foram lidos. As seções citadas 
 - **`FAILED` é terminal e bloqueia o `externalTransactionId`** (seção 5). Exige intervenção operacional.
 - **Existência de carteira observável por provedores**: `WALLET_NOT_FOUND` (404) e `PLAYER_WALLET_MISMATCH` permitem que um provedor autenticado descubra se um `walletId` existe. O risco é aceito porque os IDs são UUIDv7 não sequenciais e o provedor já precisa conhecer a carteira para operar.
 - **Vários `WIN` podem referenciar a mesma `BET`**, e o valor do `WIN` não é comparado ao da aposta.
+- **Resposta perdida de `POST /wallets`**: se o `201` se perde, um novo envio recebe `409 WALLET_ALREADY_EXISTS` sem o id da carteira existente, e não há busca por `(playerId, currency)`. A seção 9 do desafio só exige o conflito; recuperar a resposta perdida fica fora do escopo.
 - **Precedência de erros**: erro de entrada prevalece sobre conflito de idempotência (seção 6).
 - **Ordem dos eventos de saída**: não é garantida entre publishers. Os consumidores usam `walletVersion`.
 - **IAM no emulador**: o MiniStack só aplica IAM ao SQS com `AUTH=true` (verificado em 2026-10-17 com a imagem 1.5.27: um usuário IAM sem política recebe `AccessDenied` e uma chave desconhecida é recusada). O projeto usa o modo padrão, em que qualquer credencial é aceita e nenhuma política é avaliada, porque com `AUTH=true` as chaves seriam geradas pelo emulador e teriam de ser provisionadas para cada papel e lidas pela aplicação e pelos testes. As credenciais separadas estão configuradas e os testes negativos (publisher e consumidor) são pulados com essa razão. As políticas de menor privilégio de cada identidade para uma conta AWS real estão em `deploy/aws/iam-policies.json` (seção 10), sem aplicação local.

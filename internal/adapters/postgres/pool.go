@@ -1,6 +1,8 @@
-// Package postgres holds the pgx-based persistence adapter: connection pool,
-// schema version check and migration runner. Repositories and the TxRunner
-// arrive in later slices.
+// Package postgres holds the pgx-based persistence adapter (ARCHITECTURE
+// §3, §18): connection pool, schema version check and migration runner,
+// the TxRunner and the repositories bound to its transaction, the pool
+// readers behind the pre-read and the GET endpoints, and the
+// classification of Postgres errors into the app's sentinels.
 package postgres
 
 import (

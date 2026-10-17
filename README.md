@@ -9,7 +9,10 @@ SQS, Keycloak). Spec: [docs/CHALLENGE.md](docs/CHALLENGE.md). Design decisions:
 > `dlqredrive` tool), the reference worker and the outbox relay run on the
 > full schema, domain and persistence adapter; committed events are
 > published to `wallet-events.fifo`; Prometheus metrics are served on
-> `:9090`; the CHALLENGE §13 scenarios run against three instances.
+> `:9090`; the CHALLENGE §13 scenarios run against three instances. The
+> fixes from the independent compliance review (SQS provider bound to the
+> sender's broker identity, balance tied to the ledger in the database,
+> and the rest) are in ARCHITECTURE.md §26.
 > Interpretations, limitations and unfinished work: ARCHITECTURE.md,
 > "Interpretações adotadas", "Premissas e limitações" and "Trabalho não
 > concluído".
@@ -46,8 +49,17 @@ curl -i http://localhost:8081/health/ready
 
 Stop and wipe the data: `docker compose down -v`.
 
-Every compose variable has a local default. To override one, run
-`cp .env.example .env` and edit it.
+Compose reads `.env` only to fill the variables `docker-compose.yml`
+interpolates, each with a local default: `POSTGRES_PASSWORD`,
+`WALLET_OWNER_PASSWORD`, `WALLET_APP_PASSWORD`, `KEYCLOAK_ADMIN`,
+`KEYCLOAK_ADMIN_PASSWORD`, `AWS_REGION`, `SQS_PUBLISHER_ACCESS_KEY_ID` /
+`SQS_PUBLISHER_SECRET_ACCESS_KEY`, `SQS_CONSUMER_ACCESS_KEY_ID` /
+`SQS_CONSUMER_SECRET_ACCESS_KEY`, `SQS_PROVIDER_SENDERS`,
+`SQS_OPERATOR_SENDER_ID` and `LOG_LEVEL`. To override one, run
+`cp .env.example .env` and edit it. The other variables in `.env.example`
+(timeouts, `REFERENCE_*`, `OUTBOX_*`, `CONSUMER_*` and so on) do not reach
+the containers: set them in the `app` service's `environment` in
+`docker-compose.yml`, or export them when running the binaries on the host.
 
 ### Queues
 
@@ -424,7 +436,7 @@ integration tests.
 | `go test -race ./...` | the same with the race detector | Go + gcc (cgo) |
 | `go vet ./...` | vet (add `-tags=integration` to vet integration code too) | Go |
 | `gofmt -l .` | lists unformatted files (should print nothing) | Go |
-| `go test -tags=integration -count=1 ./test/integration/...` | real Postgres via testcontainers: migrations up/down, Fx start/stop with goroutine-leak check, every schema constraint, trigger and grant, the repositories, wallet locking and transaction atomicity, token verification against a real Keycloak (started once per run), the HTTP API end to end including the concurrency scenarios of CHALLENGE §13, the reference worker (late references, expiry, contention, abandoned claims, restart), the outbox relay against a real MiniStack (publishing, contention, crash recovery, backoff, parking), the SQS consumer against a real MiniStack (inbox, duplicates, DLQ, HTTP/SQS crossover, crash before delete, transient retries and redrive, readiness pause, graceful stop) | Docker |
+| `go test -tags=integration -count=1 ./test/integration/...` | real Postgres via testcontainers: migrations up/down, Fx start/stop with goroutine-leak check, every schema constraint, trigger and grant, the repositories, wallet locking and transaction atomicity, token verification against a real Keycloak (started once per run), the HTTP API end to end including the concurrency scenarios of CHALLENGE §13, the reference worker (late references, expiry, contention, abandoned claims, restart), the outbox relay against a real MiniStack (publishing, contention, crash recovery, backoff, parking), the SQS consumer against a real MiniStack (sender identity and provider binding, inbox, duplicates, DLQ, HTTP/SQS crossover, crash before delete, transient retries and redrive, readiness pause, graceful stop) | Docker |
 | `go test -tags=integration -race -count=1 ./test/integration/...` | the same with the race detector | Docker + gcc |
 
 With no local C toolchain (for example, on Windows without gcc), run the race
@@ -514,4 +526,4 @@ go test -run=^$ -fuzz=FuzzParseRoundTrip -fuzztime=1m ./internal/domain/money/
 ### Make shortcuts
 
 `make build test test-race vet fmt fmt-check integration integration-race
-migrate-up migrate-down migrate-version up down`
+multiinstance migrate-up migrate-down migrate-version up down`

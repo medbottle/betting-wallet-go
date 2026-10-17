@@ -1,5 +1,6 @@
 # Local stack: `docker compose up --build` works from a clean checkout.
-# Every variable has a local default; copy .env.example to .env to override.
+# Interpolated variables have local defaults; .env overrides them (README,
+# "Local stack"). Other settings go in the app service's environment.
 name: wager-wallet
 
 services:
