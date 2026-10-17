@@ -488,6 +488,24 @@ docker run --rm -v "$PWD:/src" -w /src \
   golang:1.27.2-bookworm go test -race -tags=integration -count=1 ./...
 ```
 
+That command is for a POSIX shell (Linux, macOS, WSL). On Windows, use one
+line. In PowerShell, `${PWD}` needs the braces:
+
+```powershell
+docker run --rm -v "${PWD}:/src" -w /src -v /var/run/docker.sock:/var/run/docker.sock -e TESTCONTAINERS_HOST_OVERRIDE=host.docker.internal --add-host=host.docker.internal:host-gateway golang:1.27.2-bookworm go test -race -tags=integration -count=1 ./...
+```
+
+In Git Bash, stop MSYS from rewriting the container paths (`-w /src`
+would become `C:/Program Files/Git/src`) and pass the Windows path:
+
+```sh
+MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/src" -w /src -v /var/run/docker.sock:/var/run/docker.sock -e TESTCONTAINERS_HOST_OVERRIDE=host.docker.internal --add-host=host.docker.internal:host-gateway golang:1.27.2-bookworm go test -race -tags=integration -count=1 ./...
+```
+
+`MSYS_NO_PATHCONV=1` is also needed in Git Bash for the other `docker`
+commands in this README that pass a container path, such as
+`--entrypoint /app/dlqredrive`.
+
 Build tags:
 
 - `integration`: tests under `test/integration` that start real containers.

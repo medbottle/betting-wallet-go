@@ -561,17 +561,18 @@ Há dois corpos de resposta:
 
 ## 14. Módulos Fx, lifecycle e shutdown
 
-**Módulos** (`internal/bootstrap`): `ConfigModule`, `LoggingModule`, `MetricsModule`, `PostgresModule`, `SQSModule`, `AuthModule`, `RepositoryModule`, `AppModule`, `HTTPModule`, `ConsumerModule`, `OutboxRelayModule`, `ReferenceWorkerModule`, `HealthModule`.
+**Módulos** (`internal/bootstrap`): `ConfigModule`, `LoggingModule`, `MetricsModule`, `PostgresModule`, `SQSModule`, `AuthModule`, `RepositoryModule`, `AppModule`, `HTTPModule`, `ConsumerModule`, `OutboxRelayModule`, `ReferenceWorkerModule`, `HealthModule` e `RunnersModule` (o hook "runners", por último).
 - `fx.Provide` registra apenas construtores, e os hooks são registrados via `fx.Invoke`.
 - Papéis ativáveis por env (`RUN_HTTP`, `RUN_CONSUMER`, `RUN_OUTBOX`, `RUN_REFERENCE_WORKER`), todos ligados por padrão, em um binário único.
 
 **OnStart** (ordem de registro):
 1. Validar a configuração (fail fast).
 2. Ping no pool e verificação da versão do schema.
-3. Primeiro fetch do JWKS.
-4. Resolver as URLs das filas.
-5. Iniciar o loop de readiness.
-6. Iniciar o hook "runners": reference worker, outbox relay, consumidor e servidor HTTP.
+3. Abrir o listener de métricas (`METRICS_ADDR`, seção 25).
+4. Primeiro fetch do JWKS.
+5. Resolver as URLs das filas.
+6. Iniciar o loop de readiness.
+7. Iniciar o hook "runners" (`RunnersModule`, registrado por último): reference worker, outbox relay, consumidor e servidor HTTP.
 
 Workers usam o seu próprio `context.WithCancel(context.Background())`, não o contexto do OnStart.
 
@@ -673,7 +674,7 @@ Versão do Go: a última estável no momento da implementação, fixada em `go.m
 - revoga os privilégios de `PUBLIC` no banco e no schema;
 - define `ALTER DEFAULT PRIVILEGES FOR ROLE wallet_owner ... GRANT SELECT ON TABLES TO wallet_app`. O único privilégio padrão é `SELECT`, de que o app precisa para checar a versão do schema. `INSERT`/`UPDATE` são concedidos tabela a tabela pelas migrations de schema.
 
-**Migrations embutidas**: `migrations/embed.go` embute os `.sql` via `go:embed`. `cmd/migrate` (fonte `iofs`, driver `pgx5://`) e a checagem de startup usam o mesmo conjunto. `cmd/migrate down [N]` reverte N passos (padrão 1). `force` não é exposto: reparar uma migration suja é um procedimento manual documentado no README. A `0001_init` cria apenas `schema_info` (uma linha) para provar `up` e `down`; o schema real começa na `0002`.
+**Migrations embutidas**: `migrations/embed.go` embute os `.sql` via `go:embed`. `cmd/migrate` (fonte `iofs`, driver `pgx5://`) e a checagem de startup usam o mesmo conjunto. `cmd/migrate down [N]` reverte N passos (padrão 1). `force` não é exposto: reparar uma migration suja é um procedimento manual documentado no README. A `0001_init` cria apenas `schema_info` (uma linha) para provar `up` e `down`; o schema real começa na `0002`. O golang-migrate não aceita `context.Context`: `NewMigrator` (que conecta) e `Version` ficam sem contexto, e `Up`/`Down` recebem um contexto que o código liga ao `GracefulStop` da biblioteca (para depois da migration em curso). É a única exceção à regra de I/O com contexto da seção 6 do desafio, e só no `cmd/migrate` (seção 27, L-5).
 
 **Checagem da versão do schema no startup** (passo 2 da seção 14): o app lê `schema_migrations` e falha se a tabela não existir, se estiver `dirty` ou se a versão for **menor** que a última migration embutida. Uma versão **maior** é aceita e logada, para que instâncias antigas continuem rodando durante um deploy com migrations expand/contract.
 
@@ -1141,6 +1142,14 @@ Uma revisão independente, feita como um avaliador estrito a partir de um clone 
 **L-2, `messageId` compartilhado entre provedores na inbox** (seção 6.5 do desafio): com um `consumer_name` fixo, a mensagem `msg-123` de um provedor bloqueava a `msg-123` de outro, que ia para a DLQ como hash divergente e nunca era aplicada. Agora o `consumer_name` é `wager-transactions:<providerId>`, com o provedor que o consumidor já autenticou pelo `SenderId` antes de qualquer acesso ao banco. A chave continua `(consumerName, messageId)`, sem migration. Linhas antigas com `consumer_name = wager-transactions` só importariam para mensagens reentregues durante a troca de versão; numa implantação nova não existem. Teste: `TestConsumerInboxIsPerProvider` (provider-b e provider-a com o mesmo `messageId`, as duas operações aplicadas, nada na DLQ); falha com o `consumer_name` fixo.
 
 **L-3, 503 do handler timeout fora do contrato** (seção 13): o `http.TimeoutHandler` escrevia o próprio 503 sem `Retry-After` e com `Content-Type` detectado como texto, enquanto a seção 13 promete `Retry-After` em todo 503. Dá para chegar lá: as leituras do pool (registro de provedores, pré-leitura, GETs) não têm `statement_timeout`, e o `statement_timeout` da transação (10s) é igual ao `HTTP_HANDLER_TIMEOUT`. Um writer em volta do `TimeoutHandler` acrescenta `Content-Type: application/json` e `Retry-After: 2` ao único 503 escrito sem `Content-Type`, o do timeout; as respostas dos handlers sempre definem `Content-Type` e passam inalteradas. Teste: `TestHandlerTimeoutKeepsThe503Contract`.
+
+**L-4, comando de `-race` do README no Windows**: o comando no container Linux, indicado para "Windows sem gcc", não rodava como escrito: no Git Bash o MSYS reescrevia `-w /src`, e no PowerShell `"$PWD:/src"` é erro de sintaxe e `\` não continua linha. O README traz agora as variantes de PowerShell (`${PWD}`) e de Git Bash (`MSYS_NO_PATHCONV=1` e `$(pwd -W)`), conferidas montando o checkout e o socket do Docker, e avisa que o Git Bash precisa de `MSYS_NO_PATHCONV=1` nos outros comandos `docker` com caminho de container.
+
+**L-5, I/O sem contexto no migrator**: `NewMigrator` e `Version` não recebem `context.Context` porque o golang-migrate não aceita um; a exceção, restrita ao `cmd/migrate`, está registrada na seção 15.
+
+**Documentação**: a ordem do `OnStart` da seção 14 ganhou o listener de métricas, que o código abre entre o pool e o JWKS (`internal/bootstrap/bootstrap.go`), e a lista de módulos ganhou o `RunnersModule`.
+
+**Fora destas correções**: autenticar no MiniStack a identidade do produtor (modo `AUTH=true`, com chaves provisionadas para cada papel) continua como limitação (premissas A12 e A22, "Trabalho não concluído"): a revisão confirmou que, localmente, qualquer segredo com a chave de 12 dígitos de um provedor age por ele; na AWS isso é papel do IAM.
 
 ---
 
