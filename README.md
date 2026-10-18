@@ -104,3 +104,7 @@ migrations/     migrations SQL versionadas
 deploy/         Keycloak, MiniStack, Postgres e políticas da AWS
 test/           testes de integração, de múltiplas instâncias e de arquitetura
 ```
+
+## Licença
+
+Todos os direitos reservados. O código pode ser visto, clonado, compilado e executado somente para a avaliação do processo seletivo; qualquer outro uso exige autorização por escrito do autor. Termos completos em [LICENSE](LICENSE).
