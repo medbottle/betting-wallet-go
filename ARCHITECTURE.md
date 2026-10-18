@@ -6,7 +6,7 @@ Especificação de referência: [docs/CHALLENGE.md](docs/CHALLENGE.md).
 
 ## Resumo (uma página)
 
-As decisões principais e onde cada uma está detalhada. As seções 1 a 14 são o desenho; as 15 a 25 registram o que cada slice decidiu; as 26 a 28, as correções das revisões independentes.
+As decisões principais e onde cada uma está detalhada. As seções 1 a 14 são o desenho; as 15 a 25, as decisões de implementação de cada parte; as 26 a 28, as correções das revisões independentes.
 
 | Tema (desafio) | Decisão | Onde |
 | --- | --- | --- |
@@ -197,7 +197,7 @@ flowchart LR
 
   Como cada operação toca uma única carteira, não há ciclo. `40P01` continua classificado como transitório, como rede de segurança.
 
-**Por que `FOR NO KEY UPDATE` e não `FOR UPDATE`** (corrigido no slice 6): o `INSERT` da própria linha no passo 1 verifica a FK `wager_transactions → wallets`, e essa verificação toma `FOR KEY SHARE` na linha da carteira até o fim da transação. `FOR UPDATE` conflita com `FOR KEY SHARE`; `FOR NO KEY UPDATE` não. Com `FOR UPDATE`, duas operações diferentes na mesma carteira inseriam suas linhas (cada uma com `KEY SHARE` na carteira) e depois esperavam uma pela outra no passo 2: deadlock em 35 de 40 disputas medidas, com uma das apostas do caso 100.00 vs. 2 x 80.00 recebendo 503 em vez de `INSUFFICIENT_FUNDS`. O argumento acima, de que inserts antes do lock só disputam índices únicos, ignorava esse lock da FK. `FOR NO KEY UPDATE` continua sendo lock pessimista por carteira (conflita consigo mesmo, então escritores da mesma carteira entram em fila) e é o lock que o próprio Postgres toma num `UPDATE` de colunas que não são chave, como o do saldo. O que `FOR UPDATE` acrescentaria é proteção contra `DELETE` ou alteração de chave da carteira, já proibidos por trigger. O teste `TestNoDeadlockBetweenOperationsOnOneWallet` disputa duas operações na mesma carteira 40 vezes e exige zero `40P01`; ele falha se o lock voltar a ser `FOR UPDATE`.
+**Por que `FOR NO KEY UPDATE` e não `FOR UPDATE`** (corrigido na implementação da API HTTP, seção 20): o `INSERT` da própria linha no passo 1 verifica a FK `wager_transactions → wallets`, e essa verificação toma `FOR KEY SHARE` na linha da carteira até o fim da transação. `FOR UPDATE` conflita com `FOR KEY SHARE`; `FOR NO KEY UPDATE` não. Com `FOR UPDATE`, duas operações diferentes na mesma carteira inseriam suas linhas (cada uma com `KEY SHARE` na carteira) e depois esperavam uma pela outra no passo 2: deadlock em 35 de 40 disputas medidas, com uma das apostas do caso 100.00 vs. 2 x 80.00 recebendo 503 em vez de `INSUFFICIENT_FUNDS`. O argumento acima, de que inserts antes do lock só disputam índices únicos, ignorava esse lock da FK. `FOR NO KEY UPDATE` continua sendo lock pessimista por carteira (conflita consigo mesmo, então escritores da mesma carteira entram em fila) e é o lock que o próprio Postgres toma num `UPDATE` de colunas que não são chave, como o do saldo. O que `FOR UPDATE` acrescentaria é proteção contra `DELETE` ou alteração de chave da carteira, já proibidos por trigger. O teste `TestNoDeadlockBetweenOperationsOnOneWallet` disputa duas operações na mesma carteira 40 vezes e exige zero `40P01`; ele falha se o lock voltar a ser `FOR UPDATE`.
 
 **Timeouts**: `lock_timeout = 5s` e `statement_timeout = 10s` (padrão de toda transação, seção 24). Os códigos `55P03`, `40P01`, `40001`, `57014` (comando cancelado, seção 24), `57P01`/`57P02`/`57P03` e a classe `53` (servidor encerrando a conexão ou sem recursos, seção 27), erro de conexão e deadline de contexto são tratados como transitórios: rollback e retry.
 
@@ -727,7 +727,7 @@ Versão do Go: a última estável no momento da implementação, fixada em `go.m
 
 ---
 
-## 15. Decisões do slice 1 (esqueleto e infraestrutura)
+## 15. Esqueleto e infraestrutura: decisões de implementação
 
 **Versões fixadas** (verificadas em 2026-10-16):
 
@@ -769,11 +769,11 @@ Versão do Go: a última estável no momento da implementação, fixada em `go.m
 - `/health/live` responde sempre 200, sem tocar dependências.
 - `/health/ready` serve o snapshot de um loop em background (`READINESS_INTERVAL=2s`, timeout de 1s por check). Antes da primeira rodada o estado é `pending` (503). Durante o draining a resposta é 503 com `status: "draining"`.
 - O corpo expõe só `ok`/`fail`/`pending` por check; o detalhe do erro vai para o log, porque o endpoint é público.
-- O check de SQS entra no slice de SQS.
+- O check de SQS entrou com a publicação no SQS (seção 22).
 
 **Roteador**: `net/http.ServeMux` com padrões de método (`GET /health/live`), envolvido por `http.TimeoutHandler` com o handler timeout; a resposta de timeout sai em JSON com `Retry-After`, como todo 503 (seção 27, L-3).
 
-**Hook "runners"**: no slice 1 ele só contém o servidor HTTP. O listen é síncrono no `OnStart`, então porta ocupada falha o start. Os papéis `RUN_CONSUMER`, `RUN_OUTBOX` e `RUN_REFERENCE_WORKER` existiam na config e só logavam "not implemented yet" (implementados nos slices 7, 8 e 9).
+**Hook "runners"**: na primeira versão ele só continha o servidor HTTP. O listen é síncrono no `OnStart`, então porta ocupada falha o start. Os papéis `RUN_CONSUMER`, `RUN_OUTBOX` e `RUN_REFERENCE_WORKER` existiam na config e só logavam "not implemented yet" (implementados depois, nas seções 23, 22 e 21).
 
 **Falha no start**: o Fx não chama `OnStop` de um hook cujo `OnStart` falhou. Por isso o hook do Postgres fecha o pool no próprio caminho de erro. O teste de integração verifica isso com `goleak`.
 
@@ -781,7 +781,7 @@ Versão do Go: a última estável no momento da implementação, fixada em `go.m
 
 ---
 
-## 16. Decisões do slice 2 (schema)
+## 16. Schema: decisões de implementação
 
 **Uma migration por tabela**, na ordem das dependências de FK: `0002_providers`, `0003_wallets`, `0004_wager_transactions`, `0005_wallet_ledger_entries`, `0006_inbox_messages`, `0007_outbox_events`. A `0001` (`schema_info`) é mantida. O seed de `provider-a`/`provider-b` fica na própria `0002`.
 
@@ -823,7 +823,7 @@ Versão do Go: a última estável no momento da implementação, fixada em `go.m
 
 ---
 
-## 17. Decisões do slice 3 (domínio)
+## 17. Domínio: decisões de implementação
 
 **Pacotes e dependências**: `money` ← `wallet` ← `wager` → `event` (`event` depende só de `money` e `uuid`). O domínio importa apenas a stdlib, `google/uuid` e os próprios pacotes; um teste de arquitetura usa allow-list para isso.
 
@@ -871,9 +871,9 @@ Versão do Go: a última estável no momento da implementação, fixada em `go.m
 
 ---
 
-## 18. Decisões do slice 4 (adapter de persistência)
+## 18. Adapter de persistência: decisões de implementação
 
-Tudo abaixo segue as seções 3, 4, 6, 8 e 9; os pontos que os documentos não decidiam (Q1 e Q2) não foram decididos no código naquele slice; foram decididos depois, na seção 24.
+Tudo abaixo segue as seções 3, 4, 6, 8 e 9; os pontos que os documentos não decidiam (Q1 e Q2) não foram decididos no código nesta etapa; foram decididos depois, na seção 24.
 
 **Ports** (`internal/app`, só depende do domínio): `TxRunner.InTx(ctx, TxOptions, func(ctx, Repos) error)` como na seção 3; `Repos` com `Wallets()`, `Transactions()`, `Ledger()`, `Inbox()` e `Outbox()`; `WalletReader` para a pré-leitura; `Clock`; `IDGenerator`. Sentinelas: `ErrNotFound`, `ErrWalletAlreadyExists`, `ErrTransient` (categoria E), `ErrInvariantViolation` (categoria D). O erro original continua embrulhado, para os logs.
 
@@ -895,7 +895,7 @@ Tudo abaixo segue as seções 3, 4, 6, 8 e 9; os pontos que os documentos não d
 - Outbox: `Insert` recusa envelope não `Valid()`. Como a coluna é `JSONB` (seção 9), o conteúdo do payload é preservado, mas não a ordem das chaves nem os espaços; os testes comparam o JSON semanticamente.
 - Linhas só voltam ao domínio pelos `Rehydrate`; uma linha que não reidrata é `ErrInvariantViolation`.
 
-**Fora deste slice** (com seus workers): o claim do worker de referências (`ClaimDue`) e as consultas do relay da outbox (claim por lease, publicado, reagendar, estacionar). Também ficam para depois as leituras dos endpoints GET (Q4) e o registro de provedores (Q3).
+**Implementado com os workers** (seções 21 e 22): o claim do worker de referências (`ClaimDue`) e as consultas do relay da outbox (claim por lease, publicado, reagendar, estacionar). Também ficaram para depois as leituras dos endpoints GET (Q4) e o registro de provedores (Q3).
 
 **Relógios**: timestamps do domínio vêm do `Clock` da aplicação; o nudge usa o `now()` do banco, como no SQL da seção 8. `idgen.UUIDv7` gera os IDs (seção 9); uma falha da fonte aleatória do sistema encerra o processo, porque nada mais pode funcionar sem ela.
 
@@ -903,7 +903,7 @@ Tudo abaixo segue as seções 3, 4, 6, 8 e 9; os pontos que os documentos não d
 
 ---
 
-## 19. Decisões do slice 5 (autenticação e autorização)
+## 19. Autenticação e autorização: decisões de implementação
 
 **Realm provisionado** (`deploy/keycloak/realm-wagering.json`, importado com `start-dev --import-realm` no compose e nos testes):
 - Cliente `wallet-api` só como recurso (`bearerOnly`), com os client roles `provider` e `wallet-internal`.
@@ -929,7 +929,7 @@ Tudo abaixo segue as seções 3, 4, 6, 8 e 9; os pontos que os documentos não d
 - `CanSubmitTransaction(bodyProviderID)`: só `provider`; `providerId` do corpo diferente da claim → `PROVIDER_MISMATCH` (403).
 - `CanReadProviderTransaction(pathProviderID)` e `CanReadTransaction(txProviderID)`: o provedor lê só as próprias, e qualquer outra resposta é 404; o serviço interno lê qualquer uma. Antes da busca por id, `CanLookUpTransactions()` recusa com 403 quem não tem nenhum dos dois papéis, para a resposta não depender da existência da transação (seção 26, I1). Interpretação: "leitura de qualquer transação" (seção 11) vale para as duas rotas de leitura, inclusive a do caminho do provedor. Um `OPENING` (sem provedor) é 404 para provedores.
 - `CanUseWalletOperations()`: só `wallet-internal`; provedores recebem 403 (`FORBIDDEN`).
-- As rotas que chamam essas regras chegam com o slice HTTP.
+- As rotas que chamam essas regras chegaram com a API HTTP (seção 20).
 
 **Middleware HTTP**: `RequireAuth` exige `Authorization: Bearer` (esquema sem diferenciar maiúsculas) e responde 401 com `WWW-Authenticate: Bearer error="invalid_token"` e `{"error":{"code":"UNAUTHENTICATED",...,"retryable":false}}`, inclusive quando o header falta. `/health/*` continua público. Nenhuma rota de negócio existe ainda; todas usarão o middleware.
 
@@ -941,7 +941,7 @@ Tudo abaixo segue as seções 3, 4, 6, 8 e 9; os pontos que os documentos não d
 
 ---
 
-## 20. Decisões do slice 6 (casos de uso e API HTTP)
+## 20. Casos de uso e API HTTP: decisões de implementação
 
 **Respostas às questões em aberto** (aprovadas):
 - **Q3, registro de provedores**: como diz a seção 11, a tabela `providers` é consultada e provedor desconhecido ou inativo é rejeitado. No HTTP, a rejeição é `403 FORBIDDEN` (o código de autorização da seção 12), sem efeitos. A consulta usa o leitor do pool (Q4); o SQS usará o mesmo caso de uso.
@@ -955,7 +955,7 @@ Tudo abaixo segue as seções 3, 4, 6, 8 e 9; os pontos que os documentos não d
 - `wallets.Open`: valida `playerId` e `initialBalance`, roda `wager.OpenWallet` e grava carteira, `OPENING`, lançamento e eventos numa transação. Duplicata → `WALLET_ALREADY_EXISTS`.
 - `wagering.Submit`: o fluxo da seção 4. Fora de transação: `NewRequest`, registro de provedores, pré-leitura. Na transação: `InsertPending`; se não inseriu, busca por chave e depois por ID externo e aplica `CheckReplay` (replay ou conflito); senão lock da carteira, referência, `Apply`, gravação de saldo, ledger, linha e outbox, e nudge dos dependentes quando terminal. Erro de invariante → rollback e `FAILED` numa transação separada com lock da carteira (seção 5); se outra chamada já gravou a operação, essa é reproduzida.
 - O `NextAttemptAt` usado ao entrar em `PENDING_REFERENCE` segue o backoff da seção 8 (`REFERENCE_BACKOFF_BASE=1s`, `REFERENCE_BACKOFF_MAX=60s`, jitter total); o TTL é `REFERENCE_TTL=10m`.
-- `wallets.Reconcile`: carteira e fold do ledger no mesmo snapshot; `difference = armazenado − calculado`; divergência vai na resposta e num log de erro com os valores (a métrica `reconciliation_divergences_total` veio no slice 10, seção 25).
+- `wallets.Reconcile`: carteira e fold do ledger no mesmo snapshot; `difference = armazenado − calculado`; divergência vai na resposta e num log de erro com os valores (a métrica `reconciliation_divergences_total` veio com as métricas, seção 25).
 
 **HTTP** (seção 13):
 - Ordem no `POST /wagering/transactions`: corpo JSON → `providerId` do corpo contra a claim (403 sem efeitos) → `money` como strings → caso de uso (validação, registro de provedores, pré-leitura, idempotência). Status: 200 `PROCESSED`, 422 `REJECTED` (com o saldo observado), 202 `PENDING_REFERENCE` com `Location` para o GET do provedor, 500 `FAILED`; o replay devolve o mesmo status com `idempotentReplay: true`.
@@ -972,7 +972,7 @@ Tudo abaixo segue as seções 3, 4, 6, 8 e 9; os pontos que os documentos não d
 
 ---
 
-## 21. Decisões do slice 7 (worker de referências)
+## 21. Worker de referências: decisões de implementação
 
 **Seguido da seção 8, sem mudança**: claim com `FOR UPDATE SKIP LOCKED` em uma transação por linha (o lock da linha é o claim, sem coluna de lease); lock da carteira (`FOR NO KEY UPDATE`, seção 4); releitura da referência com statement novo; `Apply` processa, rejeita após o deadline ou reagenda; gravação, nudge e commit. Ordem de locks: linha reivindicada, depois carteira. `REFERENCE_WORKER_CONCURRENCY=4` goroutines por instância, ligadas por `RUN_REFERENCE_WORKER`.
 
@@ -999,7 +999,7 @@ Tudo abaixo segue as seções 3, 4, 6, 8 e 9; os pontos que os documentos não d
 
 ---
 
-## 22. Decisões do slice 8 (relay da outbox e publicação no SQS)
+## 22. Relay da outbox e publicação no SQS: decisões de implementação
 
 **Seguido da seção 9, sem mudança**: claim por lease numa transação curta que comita antes de qualquer envio (`locked_until = now() + 30s`, `attempts + 1`, até 10 linhas, `FOR UPDATE SKIP LOCKED`); `SendMessageBatch` fora de qualquer transação com timeout de 5s; por entrada, `published_at` só se este dono ainda detém a linha, ou reagendamento com `last_error`; falha da chamada inteira reagenda o lote; `parked_at` ao atingir `OUTBOX_MAX_ATTEMPTS = 20`; nada é removido. Lease expirado volta a ser elegível e a republicação mantém o `eventId`. Todos os valores são configuráveis por env com os padrões da seção 9, para os testes poderem encurtar lease e limite.
 
@@ -1012,9 +1012,9 @@ Tudo abaixo segue as seções 3, 4, 6, 8 e 9; os pontos que os documentos não d
 **Interpretações**:
 - O "+ jitter" da fórmula de backoff é aditivo e sorteado em `[0, base)`: `now + min(1s·2^attempts, 5m) + U[0, 1s)` (premissa A10). `attempts` já inclui o claim atual.
 - O corpo publicado é o `payload` lido do banco. Como a coluna é `JSONB` (seção 9), o conteúdo é idêntico ao snapshot do evento, mas a ordem das chaves e os espaços são os do Postgres (premissa A11).
-- Um evento estacionado gera log de erro com `eventId`, tipo, tentativas, `senderFault` e erro; `outbox_parked_total` veio no slice 10 (seção 25).
+- Um evento estacionado gera log de erro com `eventId`, tipo, tentativas, `senderFault` e erro; `outbox_parked_total` veio com as métricas (seção 25).
 
-**Credenciais do broker** (seção 10): o publisher usa só as suas, sem ler arquivos de configuração da AWS nem o ambiente; o consumidor ganhou as suas no slice 9 (seção 23). Desde a seção 28 elas vêm do arquivo de credenciais (`SQS_CREDENTIALS_FILE`) quando as variáveis não estão definidas, e o MiniStack roda com `AUTH=true`: o teste negativo (`TestBrokerCredentialSeparation`) roda e passa.
+**Credenciais do broker** (seção 10): o publisher usa só as suas, sem ler arquivos de configuração da AWS nem o ambiente; o consumidor ganhou as suas com o consumidor (seção 23). Desde a seção 28 elas vêm do arquivo de credenciais (`SQS_CREDENTIALS_FILE`) quando as variáveis não estão definidas, e o MiniStack roda com `AUTH=true`: o teste negativo (`TestBrokerCredentialSeparation`) roda e passa.
 
 **Readiness e startup**: a readiness agora checa PostgreSQL e SQS (`GetQueueAttributes` na fila de eventos, timeout de 1s por checagem, a cada 2s). A URL da fila é resolvida no `OnStart` (passo 4 da seção 14); fila ausente faz o start falhar. Nesse caminho de erro as conexões ociosas do cliente HTTP do SQS são fechadas no próprio `OnStart` (o Fx não chama o `OnStop` de um hook que falhou; o `goleak` pegou isso).
 
@@ -1028,7 +1028,7 @@ Tudo abaixo segue as seções 3, 4, 6, 8 e 9; os pontos que os documentos não d
 | `MessageGroupId` | `aggregateId` = `walletId`: ordem por carteira dentro de um publisher |
 | `MessageDeduplicationId` | `eventId`: republicações dentro de 5 min são colapsadas pelo SQS |
 | Atributos | `eventType`, `eventVersion` |
-| Corpo | o envelope: `eventId`, `eventType`, `aggregateId`, `correlationId`, `causationId` (opcional), `occurredAt` (RFC 3339 UTC, ms), `version`, `data` tipado (seção 9 e slice 3) |
+| Corpo | o envelope: `eventId`, `eventType`, `aggregateId`, `correlationId`, `causationId` (opcional), `occurredAt` (RFC 3339 UTC, ms), `version`, `data` tipado (seções 9 e 17) |
 | Tipos | `WagerTransactionProcessed`, `WagerTransactionRejected`, `WalletBalanceChanged` (com `walletId`, `transactionId`, `direction`, `money`, `balanceBefore`, `balanceAfter`, `walletVersion`), `WagerTransactionPendingReference` |
 
 Regras para consumidores: a entrega é at-least-once, então deduplicar por `eventId`; a ordem entre publishers ou após falha parcial não é garantida, então ordenar o que é por carteira pelo `walletVersion` (`WalletBalanceChanged`) e tratar cada evento como idempotente; valores monetários são strings decimais; ignorar campos desconhecidos dentro da mesma `version`.
@@ -1044,7 +1044,7 @@ Regras para consumidores: a entrega é at-least-once, então deduplicar por `eve
 
 ---
 
-## 23. Decisões do slice 9 (consumidor SQS, inbox, DLQ e redrive)
+## 23. Consumidor SQS, inbox, DLQ e redrive: decisões de implementação
 
 **Seguido das seções 4, 9, 10 e 14, sem mudança**: long poll com `WaitTimeSeconds = 20`, `MaxNumberOfMessages = 10` e os atributos `MessageGroupId` e `ApproximateReceiveCount`; mensagens do mesmo grupo em sequência e grupos diferentes em paralelo; deadline de 15s por mensagem; `DeleteMessage` só depois do commit; rejeição de negócio commitada e removida; falha transitória com `ChangeMessageVisibility(min(2^ApproximateReceiveCount, 60))` e liberação (visibility 0) das mensagens seguintes do mesmo grupo no lote; mensagem inválida ou erro permanente com `SendMessage` explícito para a DLQ (grupo = `MessageGroupId` recebido, fallback `invalid-messages`; dedup = `MessageId` do SQS; atributos `failureClass=PERMANENT`, `failureCode`, `originalMessageId`, `envelopeMessageId` quando legível) e depois `DeleteMessage`; polling pausado enquanto a readiness falha, com rechecagem imediata após erro transitório de banco; no SIGTERM, para de buscar, os handlers em voo terminam dentro do deadline e as mensagens não iniciadas são liberadas com visibility 0. O insert da inbox é o primeiro comando da transação (antes do insert da própria linha e do lock da carteira), e a conclusão da inbox é gravada no mesmo commit das mudanças de domínio, do ledger e da outbox.
 
@@ -1087,7 +1087,7 @@ Regras para consumidores: a entrega é at-least-once, então deduplicar por `eve
 
 ## 24. Decisões das questões em aberto (Q1, Q2, Q5 e premissa A5)
 
-Aprovadas depois do slice 9, todas com a recomendação proposta. Nenhuma muda as garantias do desafio; elas fecham comportamentos que os documentos deixavam abertos.
+Aprovadas depois da implementação do consumidor SQS (seção 23), todas com a recomendação proposta. Nenhuma muda as garantias do desafio; elas fecham comportamentos que os documentos deixavam abertos.
 
 **Q1, `statement_timeout` padrão**: toda transação aplica `SET LOCAL statement_timeout`, com padrão `DB_STATEMENT_TIMEOUT = 10s` (o dobro do `lock_timeout` de 5s, igual à iteração do worker de referências da seção 14). `TxOptions.StatementTimeout` positivo continua sobrescrevendo. **Por quê**: sem limite, um comando travado (plano ruim, I/O lento) seguraria o lock de uma carteira até o fim do contexto do chamador, e o worker e a outbox não têm deadline de requisição HTTP. Com 10s, o `lock_timeout` (5s) continua sendo o primeiro a disparar numa espera de lock, e nenhum comando legítimo do serviço chega perto disso. A reconciliação (`REPEATABLE READ READ ONLY`) usa o mesmo limite por comando.
 
@@ -1101,7 +1101,7 @@ Aprovadas depois do slice 9, todas com a recomendação proposta. Nenhuma muda a
 
 ---
 
-## 25. Decisões do slice 10 (métricas, múltiplas instâncias e simulações de falha)
+## 25. Métricas, múltiplas instâncias e simulações de falha: decisões de implementação
 
 **Seguido dos documentos, sem mudança**: as métricas cobrem a lista da seção 12 do desafio (resultados por status, duplicatas, retries, DLQ, conflitos de concorrência, atraso da outbox, latência de processamento e divergências de reconciliação); o atraso da outbox é `now() - min(occurred_at)` dos não publicados (seção 9); `outbox_parked_total` (seção 9) e o alerta de `FAILED` via métrica (seção 5) passam a existir; a divergência de reconciliação vai para resposta, log e métrica (seção 9 do desafio). `MetricsModule` fica em `internal/bootstrap` e o registro em `internal/platform/metrics` (seções 1 e 14). O domínio não importa nada de métricas: a camada de aplicação depende de uma porta `app.Metrics` com chamadas simples, e a implementação Prometheus fica em `platform`. Os testes de múltiplas instâncias ficam em `test/multiinstance` com a build tag `multiinstance`, três processos via compose (árvore de diretórios), cobrindo os itens 1 a 8 da seção 13 do desafio e as falhas da seção 3.
 
