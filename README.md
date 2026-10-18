@@ -42,7 +42,25 @@ Para parar e apagar os dados: `docker compose down -v`.
 
 ## Configuração
 
-O Compose já traz todos os valores locais. As variáveis de ambiente estão documentadas, com valores de exemplo, no [.env.example](.env.example) e na tabela do [guia](docs/GUIA.md#10-variáveis-de-ambiente). O script `deploy/ministack/init-queues.sh` cria as filas SQS (`wager-transactions.fifo`, a DLQ dela e `wallet-events.fifo`) e as identidades do broker no start do MiniStack, e o Keycloak importa o realm com os clients de teste (`provider-a`, `provider-b`, `wallet-internal`); detalhes no [guia](docs/GUIA.md#3-filas-e-identidades-do-broker).
+O Compose já traz todos os valores locais; para mudar algum, copie `.env.example` para `.env`. As principais variáveis:
+
+| Variável | Para quê |
+| --- | --- |
+| `DATABASE_URL` / `MIGRATE_DATABASE_URL` | Postgres da aplicação (papel `wallet_app`) e das migrations (papel `wallet_owner`) |
+| `OIDC_ISSUER`, `OIDC_JWKS_URL`, `OIDC_AUDIENCE` | validação dos tokens do Keycloak |
+| `SQS_ENDPOINT`, `SQS_CREDENTIALS_FILE` | endpoint do MiniStack e arquivo com as chaves que ele gera |
+| `SQS_PROVIDER_SENDERS`, `SQS_OPERATOR_SENDER_ID` | identidades do broker em que o consumidor confia |
+| `RUN_HTTP`, `RUN_CONSUMER`, `RUN_OUTBOX`, `RUN_REFERENCE_WORKER` | quais papéis a instância executa |
+
+Todas as variáveis, com padrões e valores de exemplo, estão no [.env.example](.env.example) e na tabela do [guia](docs/GUIA.md#10-variáveis-de-ambiente). O script `deploy/ministack/init-queues.sh` cria as filas SQS (`wager-transactions.fifo`, a DLQ dela e `wallet-events.fifo`) e as identidades do broker no start do MiniStack, e o Keycloak importa o realm `wagering` com as identidades de teste (detalhes no [guia](docs/GUIA.md#3-filas-e-identidades-do-broker)):
+
+| Client (`client_credentials`) | Segredo (valor local de teste) | Papel |
+| --- | --- | --- |
+| `provider-a` | `provider-a-local-secret` | `provider` (age por `provider-a`) |
+| `provider-b` | `provider-b-local-secret` | `provider` (age por `provider-b`) |
+| `wallet-internal` | `wallet-internal-local-secret` | `wallet-internal` (operações de carteira) |
+
+Os fluxos autenticados usam um token desses clients como `Authorization: Bearer <token>`, como no início rápido; mais exemplos no [guia, seção 8](docs/GUIA.md#8-exemplos-de-chamadas-da-api).
 
 ## Migrations
 
@@ -58,13 +76,14 @@ docker compose run --rm migrate version   # versão atual
 
 ```sh
 go test ./...                                              # unitários, grafo do Fx, regras de arquitetura
+go test -race ./...                                        # o mesmo com o detector de corrida (precisa de gcc)
 go vet ./...
 gofmt -l .                                                 # não deve imprimir nada
 go test -tags=integration -count=1 ./test/integration/...  # Postgres, Keycloak e MiniStack reais (Docker)
 go test -tags=multiinstance -count=1 -v -timeout 40m ./test/multiinstance/  # três instâncias e simulações de falha
 ```
 
-`go test -race` precisa de gcc; sem ele, rode-o num container Linux (comandos no guia).
+Sem gcc (por exemplo, no Windows), rode o `-race` num container Linux: os comandos, a preparação das dependências dos testes, as build tags (`integration`, `multiinstance`) e as simulações de falha estão no [guia, seção 11](docs/GUIA.md#11-testes).
 
 ## Documentação
 
