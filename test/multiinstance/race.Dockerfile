@@ -1,4 +1,4 @@
-# Runs the multiinstance suite with the race detector (README, "Multi-instance
+# Runs the multiinstance suite with the race detector (docs/GUIA.md, "Multi-instance
 # tests and failure simulations"; ARCHITECTURE §25). -race needs cgo, so the
 # suite runs in the Debian Go image, which has gcc, plus the Docker CLI with
 # its Compose and Buildx plugins to drive the stack through the mounted

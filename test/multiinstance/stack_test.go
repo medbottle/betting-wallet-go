@@ -49,7 +49,7 @@ const (
 
 // stackHost is where the stack's published ports are reached: localhost
 // from the host, or MULTIINSTANCE_HOST (host.docker.internal) when the
-// suite runs in a container, as for -race (README). Tokens carry the fixed
+// suite runs in a container, as for -race (docs/GUIA.md). Tokens carry the fixed
 // issuer whatever host they are fetched from (ARCHITECTURE §11).
 var stackHost = func() string {
 	if h := os.Getenv("MULTIINSTANCE_HOST"); h != "" {

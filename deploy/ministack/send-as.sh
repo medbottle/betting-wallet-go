@@ -1,7 +1,7 @@
 #!/bin/sh
 # Sends one message to the inbound queue as a provider's producer, the way
 # a provider does (ARCHITECTURE §28): its IAM user assumes the provider's
-# role, and the role sends. Runs inside the MiniStack container (README,
+# role, and the role sends. Runs inside the MiniStack container (docs/GUIA.md,
 # "Inbound operations"):
 #
 #   send-as.sh PROVIDER MESSAGE_GROUP_ID MESSAGE_DEDUPLICATION_ID BODY

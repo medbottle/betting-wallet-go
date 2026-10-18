@@ -1,4 +1,4 @@
 # Local copies of generated secrets, such as the broker credentials file
-# copied out of MiniStack (README, "Queues"). Never committed.
+# copied out of MiniStack (docs/GUIA.md, seção 3). Never committed.
 *
 !.gitignore

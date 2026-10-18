@@ -52,7 +52,7 @@ down:
 	docker compose down -v
 
 # The multiinstance suite under -race, from a Linux container with gcc and
-# the Docker CLI; the checkout is mounted at its own path (README).
+# the Docker CLI; the checkout is mounted at its own path (docs/GUIA.md).
 multiinstance-race:
 	docker build -t wager-wallet-race-harness - < test/multiinstance/race.Dockerfile
 	docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$(CURDIR):$(CURDIR)" -w "$(CURDIR)" \

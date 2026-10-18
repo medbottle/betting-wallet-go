@@ -355,7 +355,7 @@ stateDiagram-v2
   4. **Esgotamento**: com `attempts >= OUTBOX_MAX_ATTEMPTS` (padrão 20), ou com `SenderFault=true` repetido até esse limite, a entrada recebe `parked_at = now()`.
      - A entrada nunca é removida.
      - A métrica `outbox_parked_total` é incrementada e há alerta.
-     - O reprocessamento é manual, zerando `parked_at` e `attempts` (comando no README, "Outbound events").
+     - O reprocessamento é manual, zerando `parked_at` e `attempts` (comando em docs/GUIA.md, seção 4).
   5. **Broker indisponível**: enquanto a checagem de readiness do SQS falha, o relay não reivindica nada, então uma queda não consome tentativas nem estaciona eventos (seção 27, M-1).
 - **Trabalho abandonado**:
   - Lease expirado volta a ser elegível para claim.
@@ -425,7 +425,7 @@ stateDiagram-v2
 
 **Rejeição de negócio**: é commitada como `REJECTED`, e a mensagem é removida.
 
-**Procedimento de redrive da DLQ** (documentado no README):
+**Procedimento de redrive da DLQ** (documentado em docs/GUIA.md, seção 5):
 1. Confirmar que a causa foi resolvida (readiness ok).
 2. Mensagens com `failureClass=PERMANENT` exigem correção pelo produtor. **Não** são reenviadas como estão.
 3. Mensagens sem esse atributo (vindas do redrive por esgotamento transitório) são reenviadas com a ferramenta `cmd/dlqredrive`:
@@ -660,7 +660,7 @@ deploy/
 test/
   integration/       # //go:build integration — testcontainers (PG, Keycloak, MiniStack)
   multiinstance/     # //go:build multiinstance — 3 processos via compose (docker-compose.multi.yml, seção 25)
-docker-compose.yml  Dockerfile  .env.example  README.md  ARCHITECTURE.md
+docker-compose.yml  Dockerfile  .env.example  README.md  ARCHITECTURE.md  docs/GUIA.md
 ```
 
 Versão do Go: a última estável no momento da implementação, fixada em `go.mod` e no Dockerfile (seção 15).
@@ -697,7 +697,7 @@ Versão do Go: a última estável no momento da implementação, fixada em `go.m
 - revoga os privilégios de `PUBLIC` no banco e no schema;
 - define `ALTER DEFAULT PRIVILEGES FOR ROLE wallet_owner ... GRANT SELECT ON TABLES TO wallet_app`. O único privilégio padrão é `SELECT`, de que o app precisa para checar a versão do schema. `INSERT`/`UPDATE` são concedidos tabela a tabela pelas migrations de schema.
 
-**Migrations embutidas**: `migrations/embed.go` embute os `.sql` via `go:embed`. `cmd/migrate` (fonte `iofs`, driver `pgx5://`) e a checagem de startup usam o mesmo conjunto. `cmd/migrate down [N]` reverte N passos (padrão 1). `force` não é exposto: reparar uma migration suja é um procedimento manual documentado no README. A `0001_init` cria apenas `schema_info` (uma linha) para provar `up` e `down`; o schema real começa na `0002`. O golang-migrate não aceita `context.Context`: `NewMigrator` (que conecta) e `Version` ficam sem contexto, e `Up`/`Down` recebem um contexto que o código liga ao `GracefulStop` da biblioteca (para depois da migration em curso). É a única exceção à regra de I/O com contexto da seção 6 do desafio, e só no `cmd/migrate` (seção 27, L-5).
+**Migrations embutidas**: `migrations/embed.go` embute os `.sql` via `go:embed`. `cmd/migrate` (fonte `iofs`, driver `pgx5://`) e a checagem de startup usam o mesmo conjunto. `cmd/migrate down [N]` reverte N passos (padrão 1). `force` não é exposto: reparar uma migration suja é um procedimento manual documentado em docs/GUIA.md (seção 9). A `0001_init` cria apenas `schema_info` (uma linha) para provar `up` e `down`; o schema real começa na `0002`. O golang-migrate não aceita `context.Context`: `NewMigrator` (que conecta) e `Version` ficam sem contexto, e `Up`/`Down` recebem um contexto que o código liga ao `GracefulStop` da biblioteca (para depois da migration em curso). É a única exceção à regra de I/O com contexto da seção 6 do desafio, e só no `cmd/migrate` (seção 27, L-5).
 
 **Checagem da versão do schema no startup** (passo 2 da seção 14): o app lê `schema_migrations` e falha se a tabela não existir, se estiver `dirty` ou se a versão for **menor** que a última migration embutida. Uma versão **maior** é aceita e logada, para que instâncias antigas continuem rodando durante um deploy com migrations expand/contract.
 
@@ -847,7 +847,7 @@ Tudo abaixo segue as seções 3, 4, 6, 8 e 9; os pontos que os documentos não d
 
 **Realm provisionado** (`deploy/keycloak/realm-wagering.json`, importado com `start-dev --import-realm` no compose e nos testes):
 - Cliente `wallet-api` só como recurso (`bearerOnly`), com os client roles `provider` e `wallet-internal`.
-- Clientes confidenciais `provider-a`, `provider-b` e `wallet-internal`, só com `client_credentials` (service accounts; outros fluxos desligados). Segredos locais de teste (`<client>-local-secret`), documentados no README e no `.env.example`; não são segredos reais.
+- Clientes confidenciais `provider-a`, `provider-b` e `wallet-internal`, só com `client_credentials` (service accounts; outros fluxos desligados). Segredos locais de teste (`<client>-local-secret`), documentados em docs/GUIA.md (seção 7) e no `.env.example`; não são segredos reais.
 - Mapper de claim fixo `provider_id` nos clientes de provedor e mapper de audiência `wallet-api` em todos. Conferido num token real: `iss` fixo em `http://localhost:8080/realms/wagering`, `aud=wallet-api`, `azp`, `provider_id` (ausente no interno) e `resource_access.wallet-api.roles`. O Keycloak não emite `nbf`.
 
 **Verificador** (`internal/adapters/oidc`):
@@ -1095,7 +1095,7 @@ Séries para alertar: `wager_transactions_total{status="FAILED"}`, `outbox_parke
 
 Todo teste termina com os invariantes: nenhuma operação pendente, reconciliação consistente com o saldo esperado, um lançamento por operação processada que move dinheiro, outbox esvaziada sem estacionados e cada `eventId` commitado recebido em `wallet-events.fifo` (repetições são permitidas e logadas).
 
-**`-race`**: a suíte roda no host, sem `-race` se o host não tem gcc. Para o detector de corrida ela roda num container Linux com gcc e o CLI do Docker (`test/multiinstance/race.Dockerfile`, comando no README e `make multiinstance-race`), que dirige a mesma pilha pelo socket do Docker, alcança as portas por `host.docker.internal` (`MULTIINSTANCE_HOST`) e monta o checkout no próprio caminho para os bind mounts do compose resolverem no host do Docker. Verificado em 2026-10-17 no Docker Desktop (checkout montado no caminho da VM, `/run/desktop/mnt/host/c/...`): os 10 testes passam com `-race` e nenhum data race. O detector instrumenta o processo de teste (clientes HTTP, SQS e Postgres e as goroutines dos cenários concorrentes); os três processos da aplicação são os binários da imagem, sem `-race` (premissa N7), a menos que se ligue o extra `MULTIINSTANCE_RACE=1` da seção 26.
+**`-race`**: a suíte roda no host, sem `-race` se o host não tem gcc. Para o detector de corrida ela roda num container Linux com gcc e o CLI do Docker (`test/multiinstance/race.Dockerfile`, comando em docs/GUIA.md e `make multiinstance-race`), que dirige a mesma pilha pelo socket do Docker, alcança as portas por `host.docker.internal` (`MULTIINSTANCE_HOST`) e monta o checkout no próprio caminho para os bind mounts do compose resolverem no host do Docker. Verificado em 2026-10-17 no Docker Desktop (checkout montado no caminho da VM, `/run/desktop/mnt/host/c/...`): os 10 testes passam com `-race` e nenhum data race. O detector instrumenta o processo de teste (clientes HTTP, SQS e Postgres e as goroutines dos cenários concorrentes); os três processos da aplicação são os binários da imagem, sem `-race` (premissa N7), a menos que se ligue o extra `MULTIINSTANCE_RACE=1` da seção 26.
 
 ---
 
@@ -1134,7 +1134,7 @@ Uma revisão independente contra o desafio apontou um risco eliminatório (H1, "
 - **`PENDING` commitado retomado** (seções 6.3 e 13 item 8 do desafio): o caminho síncrono nunca commita `PENDING` (seção 5), então o teste grava a linha como faria um processo que morreu depois do commit; o worker de outra instância (pool próprio) a aplica uma vez, com um lançamento e os dois eventos, e o replay devolve o resultado persistido.
 - **Contexto cancelado** (seção 6 do desafio): um contexto cancelado no meio da transação de negócio, depois das gravações de saldo e ledger, desfaz tudo (`503` retryable, nenhuma linha, lançamento ou evento, carteira intacta); um contexto já cancelado antes da chamada também não grava nada; o retry aplica a operação uma vez.
 
-**M1, `-race` no caminho de múltiplos processos** (seção 13 do desafio: `-race` nos testes aplicáveis): a suíte `multiinstance` só rodava sem o detector, porque o host não tem gcc e a imagem Go usada para `-race` não tinha o CLI do Docker. Agora `test/multiinstance/race.Dockerfile` acrescenta o CLI do Docker e os plugins Compose e Buildx à imagem `golang:1.27.2-bookworm` (que tem gcc), e a suíte lê o host das portas publicadas de `MULTIINSTANCE_HOST` (padrão `localhost`). O comando do README (`make multiinstance-race`) roda a suíte com `-race` dentro desse container; verificado: 10 testes passam, sem data race (seção 25).
+**M1, `-race` no caminho de múltiplos processos** (seção 13 do desafio: `-race` nos testes aplicáveis): a suíte `multiinstance` só rodava sem o detector, porque o host não tem gcc e a imagem Go usada para `-race` não tinha o CLI do Docker. Agora `test/multiinstance/race.Dockerfile` acrescenta o CLI do Docker e os plugins Compose e Buildx à imagem `golang:1.27.2-bookworm` (que tem gcc), e a suíte lê o host das portas publicadas de `MULTIINSTANCE_HOST` (padrão `localhost`). O comando de docs/GUIA.md (`make multiinstance-race`) roda a suíte com `-race` dentro desse container; verificado: 10 testes passam, sem data race (seção 25).
 
 **Extra, não exigido pelo desafio: processos da aplicação com `-race`**. O `-race` da seção 13 do desafio vale para os testes aplicáveis e está atendido pelos unitários, pela integração e pela suíte de múltiplas instâncias acima (M1). Como extra, feito depois da verificação final, os três processos da aplicação também podem rodar instrumentados sob carga:
 - o Dockerfile ganhou os estágios `build-race` (`golang:1.27.2-bookworm`, `CGO_ENABLED=1`, `go build -race`) e `race` (`debian:12.15-slim`, mesma glibc 2.36, usuário 65532), construídos só quando pedidos; o alvo padrão continua sendo a imagem distroless de produção;
@@ -1157,7 +1157,7 @@ Uma revisão independente, feita como um avaliador estrito a partir de um clone 
 
 **M-1, a outbox consumia tentativas durante uma queda do SQS** (seção 3 do desafio, indisponibilidade temporária do SQS): o relay reivindicava e tentava publicar mesmo com o broker fora, e cada claim somava uma tentativa; uma queda de mais de cerca de 64 minutos estacionava todo evento commitado, que só voltava com SQL manual.
 - O relay agora só reivindica quando a checagem `sqs` da readiness está `ok`, como o consumidor pausa o polling (seção 10). Vale só a checagem do SQS: o draining não interrompe a publicação, e uma queda do Postgres já faz o claim falhar sem consumir tentativas. A transição é logada (`outbox relay paused`/`resumed`).
-- O estacionamento continua como proteção para falhas por entrada (por exemplo `SenderFault`) e o README traz o comando que devolve os eventos estacionados à fila, zerando `parked_at` e `attempts`; o `eventId` não muda.
+- O estacionamento continua como proteção para falhas por entrada (por exemplo `SenderFault`) e docs/GUIA.md traz o comando que devolve os eventos estacionados à fila, zerando `parked_at` e `attempts`; o `eventId` não muda.
 - Testes: unitário `TestRelayPausesWhileBrokerNotReady`; na suíte de múltiplas instâncias, `TestSQSOutage` agora exige que nenhum evento da carteira tenha tentativa consumida durante a queda.
 
 **L-1, `WIN` pago sobre `BET` revertida** (seção 7 do desafio, coerência financeira): `BET` 25.00, `ROLLBACK` dela e depois um `WIN` referenciando a mesma `BET` creditava o prêmio de uma aposta desfeita; a seção 7 tratava `ROLLBACK` depois de `WIN`, não o contrário. Agora o `WIN` é rejeitado com `REFERENCE_NOT_PROCESSED` (código existente; o CHECK do schema já o aceita, nenhuma migration). `WIN` sobre `BET` que continua valendo não muda. Testes: dois casos em `TestApplyReferenceRejections` (inclusive a precedência da concordância de rodada) e `TestAPIWinOfReversedBet` (depois de `REFUND` e de `ROLLBACK`, saldo inalterado, e um `WIN` válido ainda pago).
@@ -1166,7 +1166,7 @@ Uma revisão independente, feita como um avaliador estrito a partir de um clone 
 
 **L-3, 503 do handler timeout fora do contrato** (seção 13): o `http.TimeoutHandler` escrevia o próprio 503 sem `Retry-After` e com `Content-Type` detectado como texto, enquanto a seção 13 promete `Retry-After` em todo 503. Dá para chegar lá: as leituras do pool (registro de provedores, pré-leitura, GETs) não têm `statement_timeout`, e o `statement_timeout` da transação (10s) é igual ao `HTTP_HANDLER_TIMEOUT`. Um writer em volta do `TimeoutHandler` acrescenta `Content-Type: application/json` e `Retry-After: 2` ao único 503 escrito sem `Content-Type`, o do timeout; as respostas dos handlers sempre definem `Content-Type` e passam inalteradas. Teste: `TestHandlerTimeoutKeepsThe503Contract`.
 
-**L-4, comando de `-race` do README no Windows**: o comando no container Linux, indicado para "Windows sem gcc", não rodava como escrito: no Git Bash o MSYS reescrevia `-w /src`, e no PowerShell `"$PWD:/src"` é erro de sintaxe e `\` não continua linha. O README traz agora as variantes de PowerShell (`${PWD}`) e de Git Bash (`MSYS_NO_PATHCONV=1` e `$(pwd -W)`), conferidas montando o checkout e o socket do Docker, e avisa que o Git Bash precisa de `MSYS_NO_PATHCONV=1` nos outros comandos `docker` com caminho de container.
+**L-4, comando de `-race` do README no Windows**: o comando no container Linux, indicado para "Windows sem gcc", não rodava como escrito: no Git Bash o MSYS reescrevia `-w /src`, e no PowerShell `"$PWD:/src"` é erro de sintaxe e `\` não continua linha. O guia (hoje docs/GUIA.md, seção 11) traz agora as variantes de PowerShell (`${PWD}`) e de Git Bash (`MSYS_NO_PATHCONV=1` e `$(pwd -W)`), conferidas montando o checkout e o socket do Docker, e avisa que o Git Bash precisa de `MSYS_NO_PATHCONV=1` nos outros comandos `docker` com caminho de container.
 
 **L-5, I/O sem contexto no migrator**: `NewMigrator` e `Version` não recebem `context.Context` porque o golang-migrate não aceita um; a exceção, restrita ao `cmd/migrate`, está registrada na seção 15.
 
@@ -1204,8 +1204,8 @@ A revisão do avaliador (seção 27) mostrou que, com o MiniStack no modo padrã
 **Chaves geradas e o arquivo de credenciais**: com `AUTH=true` o MiniStack gera as chaves, então o script as grava em `/var/lib/wager-credentials/sqs-credentials.json` (volume `sqs-credentials`), com o formato `{consumer, publisher, operator: {accessKeyId, secretAccessKey, roleArn?}, providers: {<id>: {...}}}`.
 - A aplicação lê o arquivo por `SQS_CREDENTIALS_FILE` (`config.ReadBrokerCredentials`) e preenche as chaves do publisher e do consumidor que as variáveis `SQS_*_ACCESS_KEY_ID` deixam vazias; as variáveis continuam valendo na AWS. A leitura acontece uma vez no start, como a do ambiente, por isso não recebe contexto.
 - O `dlqredrive` lê a chave e a role do operador do mesmo arquivo (ou de `SQS_OPERATOR_ACCESS_KEY_ID`/`SECRET` e `SQS_OPERATOR_ROLE_ARN`) e assume a role por STS (`aws-sdk-go-v2/service/sts`, `credentials/stscreds`), com a sessão renovada antes de expirar. `sqspublisher.NewClient` ganhou `RoleARN` para isso; o consumidor e o publisher continuam com chave estática.
-- `deploy/ministack/send-as.sh` faz o mesmo para um produtor (usuário → role → envio), para os exemplos do README.
-- Para rodar os binários no host, o arquivo é copiado para `deploy/local/`, cujo `.gitignore` ignora tudo menos ele mesmo, então as chaves copiadas não entram no git (README, "Queues"). O README lista as limitações locais em "Known limitations".
+- `deploy/ministack/send-as.sh` faz o mesmo para um produtor (usuário → role → envio), para os exemplos de docs/GUIA.md.
+- Para rodar os binários no host, o arquivo é copiado para `deploy/local/`, cujo `.gitignore` ignora tudo menos ele mesmo, então as chaves copiadas não entram no git (docs/GUIA.md, seção 3). As limitações locais estão em docs/GUIA.md, seção 12.
 - Os testes leem o arquivo de dentro do container (integração: `CopyFileFromContainer`; múltiplas instâncias: `docker compose exec`). As filas de cada teste de integração usam nomes dentro dos padrões das políticas locais (`wager-transactions-in-*`, `wager-transactions-dlq-*`, `wallet-events-t-*`) e recebem as mesmas políticas de fila pelo modo `queue-policies` do script.
 
 **Testes**: `TestConsumerCredentialSeparation` (o consumidor não publica eventos nem envia à entrada; a role de um provedor não lê a entrada nem envia à DLQ; a raiz `111111111111` com qualquer segredo é recusada pela política da fila; segredo errado e chave desconhecida são recusados; os caminhos permitidos funcionam) e `TestBrokerCredentialSeparation` (o publisher não lê a entrada nem a fila de eventos; segredo errado é recusado) deixaram de ser pulados. Todos os testes de consumidor, outbox e Fx rodam com as chaves geradas; o teste de lifecycle do Fx carrega as chaves pelo `SQS_CREDENTIALS_FILE`, como no compose.
@@ -1330,7 +1330,7 @@ Pontos que os documentos deixam abertos e como foram lidos. As seções citadas 
 
 **Notas de teste**:
 - **N4.** A liberação do restante do grupo após falha transitória é testada só com SQS falso (quais mensagens vêm num lote é decisão do broker); os caminhos com broker real (DLQ, redrive, queda antes do delete, pausa, parada) são testes de integração.
-- **N6.** O `dlqredrive` pode deixar mensagens posteriores de um grupo para uma segunda execução, porque as `PERMANENT` ignoradas ficam em voo até o visibility timeout da DLQ (seção 23 e README).
+- **N6.** O `dlqredrive` pode deixar mensagens posteriores de um grupo para uma segunda execução, porque as `PERMANENT` ignoradas ficam em voo até o visibility timeout da DLQ (seção 23 e docs/GUIA.md, seção 5).
 - **N7.** A suíte `multiinstance` roda com `-race` no container Linux da seção 25. Os processos da aplicação testados são os binários da imagem de produção, sem `-race`, a menos que se ligue o extra `MULTIINSTANCE_RACE=1` (seção 26), que usa imagens compiladas com o detector.
 
 ## Premissas e limitações
@@ -1342,7 +1342,7 @@ Pontos que os documentos deixam abertos e como foram lidos. As seções citadas 
 - **Precedência de erros**: erro de entrada prevalece sobre conflito de idempotência (seção 6).
 - **Ordem dos eventos de saída**: não é garantida entre publishers. Os consumidores usam `walletVersion`.
 - **Chave raiz no emulador**: mesmo com `AUTH=true`, o MiniStack nunca confere o segredo da chave raiz de uma conta (`test` ou um id de 12 dígitos; verificado no código e na prática com a imagem 1.5.27). A política da fila de entrada recusa a raiz das contas dos provedores, o que barra o envio direto com `111111111111` e qualquer segredo; mas quem conhece essa raiz pode mudar o IAM da conta (por exemplo a política de confiança da role) e então agir pela role. Na AWS as credenciais raiz são secretas. É uma limitação do emulador que nenhum modo dele fecha (seção 28).
-- **Chaves do broker mudam a cada start do MiniStack**: ele guarda o estado em memória, como as filas; depois de reiniciar o `ministack`, reinicie a aplicação para ela ler as chaves novas (README, "Queues").
+- **Chaves do broker mudam a cada start do MiniStack**: ele guarda o estado em memória, como as filas; depois de reiniciar o `ministack`, reinicie a aplicação para ela ler as chaves novas (docs/GUIA.md, seção 3).
 - **`messageId` por provedor na inbox**: a seção 6.5 do desafio fixa a unicidade em `(consumerName, messageId)`; o `consumer_name` leva o provedor autenticado (seção 27, L-2), então provedores diferentes podem usar o mesmo `messageId`. Dentro de um provedor, reutilizar um `messageId` para outra operação continua indo para a DLQ como `INVALID_REQUEST`.
 - **`StartMessageMoveTask`**: o suporte a FIFO no emulador não é garantido. Usamos `cmd/dlqredrive`.
 - **Retenção**: sem limpeza de `inbox_messages` e `outbox_events` publicados neste escopo, já que a aplicação não tem `DELETE`. Uma rotina de retenção ficaria para trabalho futuro, executada com outro papel.
@@ -1359,4 +1359,4 @@ Pontos que os documentos deixam abertos e como foram lidos. As seções citadas 
 - **Raiz das contas no emulador**: o MiniStack não autentica a chave raiz de uma conta; ver "Premissas e limitações" e a seção 28.
 - **Retenção de `inbox_messages` e `outbox_events`**: sem rotina de limpeza (ver acima).
 - **Ledger de partidas dobradas** (opcional na seção 6.4 do desafio): não adotado; o ledger é de lançamentos simples por carteira.
-- **Integração contínua**: o repositório não tem pipeline. gofmt, vet, testes unitários, integração e múltiplas instâncias, com e sem `-race`, rodam pelos comandos do README.
+- **Integração contínua**: o repositório não tem pipeline. gofmt, vet, testes unitários, integração e múltiplas instâncias, com e sem `-race`, rodam pelos comandos de docs/GUIA.md (seção 11).
