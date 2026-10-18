@@ -78,6 +78,9 @@ var hardRuleAllowList = map[string]map[string]string{
 	"internal/platform/metrics": {
 		"float": "Prometheus records durations in seconds and counts as float64 (histogram buckets, gauge values)",
 	},
+	"cmd/loadtest": {
+		"float": "parses Prometheus samples and prints throughput and latency; amounts are integer cents",
+	},
 	"internal/adapters/postgres": {
 		"panic": "the TxRunner re-panics a recovered panic after rolling the transaction back; no rejection panics",
 	},

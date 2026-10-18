@@ -1,0 +1,9 @@
+# Optional override for the load test (docs/CARGA.md, run B): eight outbox
+# relay goroutines per instance instead of the default one.
+services:
+  app:
+    environment: {OUTBOX_RELAY_CONCURRENCY: "8"}
+  app-2:
+    environment: {OUTBOX_RELAY_CONCURRENCY: "8"}
+  app-3:
+    environment: {OUTBOX_RELAY_CONCURRENCY: "8"}
