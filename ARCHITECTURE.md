@@ -1395,29 +1395,36 @@ Pontos que os documentos deixam abertos e como foram lidos. As seções citadas 
 
 ## Premissas e limitações
 
-- **`FAILED` é terminal e bloqueia o `externalTransactionId`** (seção 5). Exige intervenção operacional.
+Primeiro os limites deliberados da solução, cada um com o motivo; depois as particularidades do ambiente local (emulador e testes), que não existem na AWS.
+
+### Da solução
+
+- **`FAILED` é terminal e bloqueia o `externalTransactionId`** (seção 5). Só uma violação de invariante grava `FAILED` (premissa A9, seção 27 H-1), o que nenhuma requisição válida provoca; falhas transitórias fazem rollback e são tentadas de novo. Se acontecer, exige intervenção operacional.
 - **Existência de carteira observável por provedores**: `WALLET_NOT_FOUND` (404) e `PLAYER_WALLET_MISMATCH` permitem que um provedor autenticado descubra se um `walletId` existe. O risco é aceito porque os IDs são UUIDv7 não sequenciais e o provedor já precisa conhecer a carteira para operar.
-- **Vários `WIN` podem referenciar a mesma `BET`**, e o valor do `WIN` não é comparado ao da aposta.
+- **Vários `WIN` podem referenciar a mesma `BET`**, e o valor do `WIN` não é comparado ao da aposta: na seção 7 do desafio a referência do `WIN` é opcional e nenhuma regra liga o prêmio ao valor apostado. Um `WIN` sobre uma `BET` já revertida é rejeitado (seção 27, L-1).
 - **Resposta perdida de `POST /wallets`**: se o `201` se perde, um novo envio recebe `409 WALLET_ALREADY_EXISTS` sem o id da carteira existente, e não há busca por `(playerId, currency)`. A seção 9 do desafio só exige o conflito; recuperar a resposta perdida fica fora do escopo.
-- **Precedência de erros**: erro de entrada prevalece sobre conflito de idempotência (seção 6).
 - **Ordem dos eventos de saída**: não é garantida entre publishers. Os consumidores usam `walletVersion`.
+
+### Do ambiente local
+
 - **Chave raiz no emulador**: mesmo com `AUTH=true`, o MiniStack nunca confere o segredo da chave raiz de uma conta (`test` ou um id de 12 dígitos; verificado no código e na prática com a imagem 1.5.27). A política da fila de entrada recusa a raiz das contas dos provedores, o que barra o envio direto com `111111111111` e qualquer segredo; mas quem conhece essa raiz pode mudar o IAM da conta (por exemplo a política de confiança da role) e então agir pela role. Na AWS as credenciais raiz são secretas. É uma limitação do emulador que nenhum modo dele fecha (seção 28).
 - **Chaves do broker mudam a cada start do MiniStack**: ele guarda o estado em memória, como as filas; depois de reiniciar o `ministack`, reinicie a aplicação para ela ler as chaves novas (docs/GUIA.md, seção 3).
-- **`messageId` por provedor na inbox**: a seção 6.5 do desafio fixa a unicidade em `(consumerName, messageId)`; o `consumer_name` leva o provedor autenticado (seção 27, L-2), então provedores diferentes podem usar o mesmo `messageId`. Dentro de um provedor, reutilizar um `messageId` para outra operação continua indo para a DLQ como `INVALID_REQUEST`.
 - **`StartMessageMoveTask`**: o suporte a FIFO no emulador não é garantido. Usamos `cmd/dlqredrive`.
-- **Retenção**: sem limpeza de `inbox_messages` e `outbox_events` publicados neste escopo, já que a aplicação não tem `DELETE`. Uma rotina de retenção ficaria para trabalho futuro, executada com outro papel.
 - **Keycloak em testcontainers**: o issuer é a URL mapeada no host, sem `KC_HOSTNAME` fixo.
-- **SQS indisponível no emulador**: simulado com `docker compose pause`, porque reiniciar o MiniStack apaga as filas em memória (seção 25).
-- **`-race` nos processos da aplicação**: a suíte de múltiplas instâncias roda com `-race` num container Linux (seção 25); por padrão os três processos testados são os binários da imagem de produção, sem o detector, e só o extra `MULTIINSTANCE_RACE=1` (seção 26) os instrumenta.
-- **Atraso da outbox**: valor global, igual em todas as instâncias; agregue com `max` (seção 25).
+
+Registrados em outras seções: precedência do erro de entrada sobre o conflito de idempotência (seção 6); `messageId` por provedor na inbox (seção 27, L-2); SQS indisponível simulado com pausa (A18); `-race` nos processos da aplicação (N7); atraso da outbox global (A19); retenção (em "Trabalho não concluído").
 
 ## Trabalho não concluído
 
-O teste de carga (diferencial da seção 14 do desafio), antes listado aqui, foi feito: comando, ambiente, metodologia e resultados em [docs/CARGA.md](docs/CARGA.md).
+Nenhum requisito obrigatório do desafio ficou pendente. Os itens abaixo são diferenciais opcionais (seções 6.4, 12 e 14 do desafio) ou extensões fora do escopo pedido. O teste de carga, também diferencial da seção 14, foi feito: comando, ambiente, metodologia e resultados em [docs/CARGA.md](docs/CARGA.md).
 
-- **Tracing com OpenTelemetry** (diferencial da seção 12): não implementado. Os dashboards foram feitos como override opcional (Prometheus e Grafana provisionados, docs/GUIA.md seção 6). Os logs JSON carregam `correlationId`, `messageId`, `transactionId`, `walletId` e `providerId`.
+### Diferenciais opcionais não adotados
+
+- **Tracing com OpenTelemetry** (seção 12): não implementado. Os dashboards foram feitos como override opcional (Prometheus e Grafana provisionados, docs/GUIA.md seção 6). Os logs JSON carregam `correlationId`, `messageId`, `transactionId`, `walletId` e `providerId`.
+- **Ledger de partidas dobradas** (seção 6.4): não adotado; o ledger é de lançamentos simples por carteira.
+
+### Fora do escopo
+
 - **Regras de alerta**: as séries a alertar estão na seção 25 e em docs/GUIA.md seção 6; o Prometheus do override opcional de observabilidade só coleta e não tem regras de alerta nem Alertmanager.
-- **Raiz das contas no emulador**: o MiniStack não autentica a chave raiz de uma conta; ver "Premissas e limitações" e a seção 28.
-- **Retenção de `inbox_messages` e `outbox_events`**: sem rotina de limpeza (ver acima).
-- **Ledger de partidas dobradas** (opcional na seção 6.4 do desafio): não adotado; o ledger é de lançamentos simples por carteira.
+- **Retenção de `inbox_messages` e `outbox_events`**: sem rotina de limpeza, já que a aplicação não tem `DELETE`; uma rotina de retenção rodaria com outro papel do banco.
 - **Integração contínua**: o repositório não tem pipeline. gofmt, vet, testes unitários, integração e múltiplas instâncias, com e sem `-race`, rodam pelos comandos de docs/GUIA.md (seção 11).
