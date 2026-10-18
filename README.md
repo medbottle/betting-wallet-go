@@ -90,6 +90,7 @@ Sem gcc (por exemplo, no Windows), rode o `-race` num container Linux: os comand
 | Documento | Conteúdo |
 | --- | --- |
 | [docs/GUIA.md](docs/GUIA.md) | execução e operação: ambiente local, filas e identidades do broker, SQS, métricas, Keycloak, exemplos da API, migrations, variáveis de ambiente, testes e limitações conhecidas |
+| [docs/CARGA.md](docs/CARGA.md) | teste de carga nas três instâncias: comando, ambiente, metodologia, throughput, latências, erros, conflitos e atraso da outbox |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | decisões de arquitetura, com um resumo de uma página no início |
 | [docs/CHALLENGE.md](docs/CHALLENGE.md) | especificação do desafio |
 | [.env.example](.env.example) | todas as variáveis de ambiente com valores locais de exemplo |
@@ -97,7 +98,7 @@ Sem gcc (por exemplo, no Windows), rode o `-race` num container Linux: os comand
 ## Estrutura
 
 ```
-cmd/            binários: wallet (aplicação), migrate, dlqredrive
+cmd/            binários: wallet (aplicação), migrate, dlqredrive, loadtest (teste de carga)
 internal/       domain, app (casos de uso), adapters (HTTP, Postgres, SQS, OIDC), platform, bootstrap (Fx)
 migrations/     migrations SQL versionadas
 deploy/         Keycloak, MiniStack, Postgres e políticas da AWS
