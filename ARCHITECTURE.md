@@ -1415,7 +1415,7 @@ Pontos que os documentos deixam abertos e como foram lidos. As seções citadas 
 
 O teste de carga (diferencial da seção 14 do desafio), antes listado aqui, foi feito: comando, ambiente, metodologia e resultados em [docs/CARGA.md](docs/CARGA.md).
 
-- **Tracing com OpenTelemetry e dashboards** (diferenciais da seção 12): não implementados. Os logs JSON carregam `correlationId`, `messageId`, `transactionId`, `walletId` e `providerId`.
+- **Tracing com OpenTelemetry** (diferencial da seção 12): não implementado. Os dashboards foram feitos como override opcional (Prometheus e Grafana provisionados, docs/GUIA.md seção 6). Os logs JSON carregam `correlationId`, `messageId`, `transactionId`, `walletId` e `providerId`.
 - **Regras de alerta**: as séries a alertar estão na seção 25; as regras dependem de uma stack de monitoramento fora do escopo.
 - **Raiz das contas no emulador**: o MiniStack não autentica a chave raiz de uma conta; ver "Premissas e limitações" e a seção 28.
 - **Retenção de `inbox_messages` e `outbox_events`**: sem rotina de limpeza (ver acima).

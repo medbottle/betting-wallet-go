@@ -212,6 +212,16 @@ curl -s http://localhost:9090/metrics | grep -E '^(wager_|outbox_|sqs_|retries_|
 
 Alerte em `wager_transactions_total{status="FAILED"}`, `outbox_parked_total`, `outbox_lag_seconds`, `sqs_dlq_messages_total` e `reconciliation_divergences_total`. Os rótulos nunca levam ids de carteira, transação ou provedor. Detalhes: ARCHITECTURE §25.
 
+### Prometheus e Grafana (opcional)
+
+`docker-compose.observability.yml` acrescenta um Prometheus (`prom/prometheus:v3.5.0`, coleta a cada 5 s `app:9090`, `app-2:9090` e `app-3:9090` pela rede do compose) e um Grafana (`grafana/grafana:12.1.1`) com o datasource e o painel "Wager wallet" provisionados de `deploy/observability/`. Nada muda na aplicação; o override só lê os listeners de métricas.
+
+```sh
+docker compose -f docker-compose.yml -f docker-compose.multi.yml -f docker-compose.observability.yml up -d --build
+```
+
+Grafana em http://localhost:3000 (leitura anônima; `admin`/`admin` para editar) e Prometheus em http://localhost:9095. Sem `docker-compose.multi.yml`, só `app` existe e os alvos `app-2` e `app-3` aparecem como `down`. O painel mostra instâncias no ar, `wager_transactions_total` por status e por `failure_code`, p50/p95/p99 de `http_request_duration_seconds` (também p99 por rota) e de `wager_processing_duration_seconds` por transporte, `db_concurrency_conflicts_total` por `sqlstate`, `retries_total` por componente, `sqs_dlq_messages_total`, `outbox_lag_seconds`, `outbox_unpublished` e `reconciliation_divergences_total`. Contadores com rótulos só existem depois do primeiro incremento, então "No data" em conflitos, retries ou DLQ significa zero ocorrências. Para gerar tráfego, use o teste de carga ([docs/CARGA.md](CARGA.md)). Derrube com o mesmo `-f` e `down -v`.
+
 ## 7. Keycloak e identidades de teste
 
 O Keycloak (console de administração `admin`/`admin` em http://localhost:8080) importa o realm `wagering` de `deploy/keycloak/realm-wagering.json` no start. Todo token tem `iss=http://localhost:8080/realms/wagering` e `aud=wallet-api`.
