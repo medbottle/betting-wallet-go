@@ -27,6 +27,66 @@ As decisões principais e onde cada uma está detalhada. As seções 1 a 14 são
 
 Limitações, interpretações e o que ficou de fora: "Premissas e limitações", "Interpretações adotadas" e "Trabalho não concluído", no fim do documento.
 
+## Requisitos e evidências
+
+Cada requisito verificável do desafio, onde ele é imposto e o teste que o prova. Testes unitários rodam com `go test ./...`; os de `test/integration` com `-tags=integration`; os de `test/multiinstance` com `-tags=multiinstance` (comandos em docs/GUIA.md, seção 11).
+
+### Garantias obrigatórias (desafio §5)
+
+| # | Requisito | Onde é imposto | Testes |
+| --- | --- | --- | --- |
+| 1 | Dinheiro sem `float32`/`float64` | `internal/domain/money/money.go` (`int64` em unidades mínimas, parser manual); DTOs com `json.RawMessage`; `BIGINT` no banco | `TestParseValid`, `TestParseRejects`, `TestOverflow`, `FuzzParseRoundTrip` (`internal/domain/money`); `TestHardRules` (AST, `test/architecture`) |
+| 2 | Idempotência persistente, sobrevive a reinícios | `UNIQUE (provider_id, idempotency_key)` e `(provider_id, external_transaction_id)` (`migrations/0004`); inbox `PRIMARY KEY (consumer_name, message_id)` (`migrations/0006`) | `TestAPISubmit`, `TestConsumerDuplicateDeliveries`, `TestConcurrentDuplicateInsert`; `TestRestartAllInstances` |
+| 3 | Invariantes no banco, independentes de locks e do FIFO | CHECKs, uniques e triggers de `migrations/0003`–`0008`, incluindo `wallets_ledger_link` | `TestSchemaWallets`, `TestSchemaWagerTransactions`, `TestSchemaLedger`, `TestSchemaWalletLedgerLink` |
+| 4 | Publicação só depois do commit | outbox na transação de negócio; relay com claim curto e publicação fora de transação (`internal/app/messaging/relay.go`) | `TestOutboxNeverPublishesBeforeCommit`, `TestOutboxRecoversBetweenPublishAndConfirm` |
+| 5 | Ledger append-only | triggers `BEFORE UPDATE OR DELETE` e `BEFORE TRUNCATE`; `wallet_app` só com `SELECT, INSERT` (`migrations/0005`) | `TestSchemaLedger`, `TestSchemaGrants` |
+| 6 | Carteiras em paralelo, sem lock global | lock por linha `FOR NO KEY UPDATE` (`internal/adapters/postgres/wallets.go`) | `TestWalletLocking`, `TestDistinctWalletsInParallel` |
+| 7 | Sem lost update | lock da carteira + `UPDATE ... WHERE version = $esperada` + regra de versão no trigger | `TestTwoBetsOf80AcrossInstances`, `TestAPIConcurrency`, `TestNoDeadlockBetweenOperationsOnOneWallet` |
+| 8 | Unicidade, não negatividade e imutabilidade no schema | `CHECK (balance_minor >= 0)`, uniques do ledger, triggers de imutabilidade | `TestSchemaWallets`, `TestSchemaLedger`, `TestFinancialAtomicity` |
+
+### Verificação obrigatória (desafio §13)
+
+| Item | Testes |
+| --- | --- |
+| Money: parsing, escala, limites, entradas inválidas, moedas incompatíveis | `TestParseValid`, `TestParseRejects`, `TestParseAmountOverflowCheck`, `TestCurrencyMismatch`, `TestArithmetic`, `TestJSON` |
+| Invariantes da carteira | `TestDebitAndCredit`, `TestInsufficientFundsLeavesWalletUntouched`, `TestCreditOverflow`, `TestLedgerEntryInvariants` (`internal/domain/wallet`) |
+| Transições de estado | `TestStateMachine`, `TestTransitionGuards`, `TestTransitionEffects` (`internal/domain/wager`) |
+| Regras dos cinco tipos externos e valores zero | `TestApplyBet`, `TestApplyWinAndLoss`, `TestApplyReversals`, `TestApplyReferenceRejections`, `TestNewRequestRejects` |
+| Conflito de payload para a mesma chave | `TestCheckReplay`, `TestHashEquivalence`; `TestAPISubmit` |
+| Abertura interna com metadados e eventos | `TestOpenWallet`, `TestOpenWalletZeroBalance`; `TestAPIWallets` |
+| Integração real: migrations, constraints, imutabilidade, atomicidade | `TestMigrationsUpDownUp`, `TestSchema*`, `TestFinancialAtomicity` |
+| Inbox, reentrega, outbox concorrente, retry, DLQ | `TestConsumerDuplicateDeliveries`, `TestOutboxTwoRelaysContend`, `TestConsumerTransientRetriesThenRedrive`, `TestConsumerDeadLetters` |
+| Composição Fx, start e stop com liberação dos workers | `TestFxLifecycle` (com `goleak`), `TestFxStartFails*` |
+| IdP real; credenciais ausentes, inválidas ou expiradas | `TestKeycloakTokens`, `TestAuthMiddlewareWithKeycloak`, `TestAPIAuthentication` |
+| Isolamento entre provedores, consultas e replays; operações internas restritas | `TestAPIReadsAndIsolation`, `TestConsumerProviderIsTheSender`, `TestConsumerInboxIsPerProvider` |
+| Sem efeitos nem exposição em acesso não autorizado | `TestAPIAuthentication`, `TestGetTransactionRefusesBeforeTheLookup`, `TestConsumerCredentialSeparation`, `TestBrokerCredentialSeparation` |
+| 1. Mesma aposta 50 vezes em paralelo, um débito | `TestAPIConcurrency`, `TestSameBet50TimesAcrossInstances` |
+| 2. Duas apostas de 80.00 sobre 100.00 | `TestTwoBetsOnOneHundred`, `TestAPIConcurrency`, `TestTwoBetsOf80AcrossInstances` |
+| 3. Carteiras distintas simultaneamente | `TestWalletLocking`, `TestDistinctWalletsInParallel` |
+| 4. Três instâncias independentes | toda a suíte `test/multiinstance` |
+| 5. Consumidor interrompido depois do commit e antes da remoção | `TestConsumerCommitThenDieBeforeDelete`, `TestConsumerKilledUnderLoad` |
+| 6. Dois publishers disputando a outbox | `TestOutboxTwoRelaysContend`, `TestOutboxRelaysKilledUnderLoad` |
+| 7. Reversão antes da referência: resolução ou expiração | `TestWorkerResolvesLateReference`, `TestWorkerExpiresReference`, `TestReferenceResolvedAfterInstanceKill` |
+| 8. Reinício preserva idempotência, pendências e consistência; `PENDING` retomado | `TestRestartAllInstances`, `TestFxReferenceWorkerResumesAfterRestart`, `TestWorkerResumesCommittedPending` |
+| Saldo contra créditos menos débitos; cruzamento HTTP e SQS | `assertConsistent` em cada cenário; `TestHTTPAndSQSCrossover`, `TestHTTPAndSQSCrossoverAcrossInstances` |
+| Falhas transitórias e indisponibilidade de Postgres e SQS | `TestWorkerRetriesTerminatedConnection`, `TestPostgresOutage`, `TestSQSOutage` |
+| `go test -race` | unitários e integração no container Linux, e a suíte `multiinstance` sob `-race` (docs/GUIA.md, seção 11) |
+
+### Itens eliminatórios (desafio §14)
+
+| Item | Por que não ocorre | Evidência |
+| --- | --- | --- |
+| Endpoints de negócio sem autenticação efetiva | toda rota de negócio passa por `RequireAuth` (`internal/adapters/httpapi/router.go`); no SQS, o provedor vem do `SenderId` autenticado pelo broker (seções 10 e 28) | `TestAPIAuthentication`, `TestAuthMiddlewareWithKeycloak`, `TestConsumerCredentialSeparation` |
+| Acesso não autorizado a operações ou transações | `providerId` só da claim (HTTP) ou do remetente (SQS); buscas escopadas por provedor (`internal/app/authz`) | `TestAPIReadsAndIsolation`, `TestConsumerProviderIsTheSender` |
+| Cálculo monetário em ponto flutuante | `Money` em `int64`; guarda de AST | `TestHardRules` |
+| Saldo negativo por concorrência | `CHECK (balance_minor >= 0)` e lock por carteira | `TestTwoBetsOf80AcrossInstances` |
+| Movimentação duplicada | uniques de operação, chave, lançamento e reversão | `TestSameBet50TimesAcrossInstances`, `TestHTTPAndSQSCrossoverAcrossInstances` |
+| Idempotência só em memória | toda deduplicação é índice único ou PK no Postgres | `TestRestartAllInstances` |
+| Dependência de uma única instância | claims com `SKIP LOCKED`, lease da outbox, reentrega do SQS | `TestReferenceResolvedAfterInstanceKill`, `TestOutboxRelaysKilledUnderLoad`, `TestConsumerKilledUnderLoad` |
+| Publicação anterior ao commit | outbox transacional | `TestOutboxNeverPublishesBeforeCommit` |
+| Ausência de ledger auditável | ledger append-only, `GET /wallets/{id}/ledger` e reconciliação | `TestAPILedgerAndReconciliation`, `TestSchemaLedger` |
+| Infraestrutura toda substituída por mocks | Postgres, Keycloak e MiniStack reais via testcontainers e compose | `test/integration`, `test/multiinstance` |
+
 ---
 
 ## 1. Layout de pacotes e direção das dependências
